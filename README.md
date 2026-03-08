@@ -23,9 +23,11 @@ the entire archive from the beginning.
 ## Quick Start
 
 ```rust
-use supertar::SyncArchive;
+use supertar::sync::Archive;
+use std::fs::File;
 
-let archive = SyncArchive::open("data.tar.gz")?;
+let file = File::open("data.tar.gz")?;
+let mut archive = Archive::new(file)?;
 
 // List all entries
 for entry in archive.list() {
@@ -39,7 +41,7 @@ let contents = archive.read_file("path/to/file.txt")?;
 let header = archive.read_file_range("big.bin", 0, 1024)?;
 
 // Save the index for next time
-archive.save_index("data.tar.gz.idx")?;
+std::fs::write("data.tar.gz.idx", archive.index().to_bytes()?)?;
 # Ok::<(), supertar::SupertarError>(())
 ```
 
@@ -81,10 +83,14 @@ let index = engine.finish();
 ## Progress Tracking and Cancellation
 
 ```rust
-use supertar::SyncArchive;
+use supertar::sync::Archive;
+use std::fs::File;
 
-let index = SyncArchive::build_index_with_progress(
-    "large.tar.gz",
+let mut file = File::open("large.tar.gz")?;
+let file_size = file.metadata()?.len();
+let index = Archive::build_index_with_progress(
+    &mut file,
+    file_size,
     1024 * 1024,
     |progress| {
         if let Some(pct) = progress.fraction() {

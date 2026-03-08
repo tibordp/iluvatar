@@ -1,8 +1,8 @@
 //! # supertar
 //!
-//! Efficient random access to files within compressed tar archives.
+//! Efficient random access to files within compressed tar/cpio archives.
 //!
-//! supertar builds an index of a compressed tar archive, including periodic
+//! supertar builds an index of a compressed archive, including periodic
 //! decompressor state checkpoints, enabling fast random access to any file
 //! without decompressing the entire archive from the beginning.
 //!
@@ -18,9 +18,11 @@
 //! ## Quick Start (Sync)
 //!
 //! ```no_run
-//! use supertar::SyncArchive;
+//! use supertar::sync::Archive;
+//! use std::fs::File;
 //!
-//! let archive = SyncArchive::open("data.tar.gz").unwrap();
+//! let file = File::open("data.tar.gz").unwrap();
+//! let mut archive = Archive::new(file).unwrap();
 //! for entry in archive.list() {
 //!     println!("{} ({} bytes)", entry.path, entry.size);
 //! }
@@ -60,8 +62,11 @@ pub mod cpio;
 pub mod engine;
 pub mod error;
 pub mod index;
-pub mod sync_io;
+pub mod sync;
 pub mod tar;
+
+#[cfg(feature = "tokio")]
+pub mod tokio;
 
 // Re-exports for convenience
 pub use archive::{ArchiveFormat, EntryType};
@@ -72,4 +77,3 @@ pub use engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_I
 pub use error::{Result, SupertarError};
 pub use index::entry::IndexEntry;
 pub use index::store::ArchiveIndex;
-pub use sync_io::SyncArchive;

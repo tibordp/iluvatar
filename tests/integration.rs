@@ -1,10 +1,11 @@
+use std::fs::File;
 use std::io::Write;
 use supertar::archive::ArchiveFormat;
 use supertar::compress::CompressionFormat;
 use supertar::engine::request::EngineRequest;
 use supertar::engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
 use supertar::index::store::ArchiveIndex;
-use supertar::SyncArchive;
+use supertar::sync::Archive;
 use tempfile::NamedTempFile;
 
 // ─── Helpers ───
@@ -326,7 +327,7 @@ fn test_sync_archive_gzip() {
     let compressed = create_tar_gz(&refs);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(archive.list().len(), files.len());
 
     for (path, expected) in &files {
@@ -342,7 +343,7 @@ fn test_sync_archive_bzip2() {
     let compressed = create_tar_bz2(&refs);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(archive.list().len(), files.len());
 
     for (path, expected) in &files {
@@ -358,7 +359,7 @@ fn test_sync_archive_xz() {
     let compressed = create_tar_xz(&refs);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(archive.list().len(), files.len());
 
     for (path, expected) in &files {
@@ -374,7 +375,7 @@ fn test_sync_archive_zstd() {
     let compressed = create_tar_zst(&refs);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(archive.list().len(), files.len());
 
     for (path, expected) in &files {
@@ -390,7 +391,7 @@ fn test_sync_archive_uncompressed() {
     let tar_data = create_tar_bytes(&refs);
     let tmp = write_temp(&tar_data);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(archive.list().len(), files.len());
 
     for (path, expected) in &files {
@@ -408,14 +409,15 @@ fn test_index_save_and_load() {
     let compressed = create_tar_gz(&refs);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
 
     // Save index
     let index_file = NamedTempFile::new().unwrap();
-    archive.save_index(index_file.path()).unwrap();
+    std::fs::write(index_file.path(), archive.index().to_bytes().unwrap()).unwrap();
 
     // Load index
-    let loaded_index = SyncArchive::load_index(index_file.path()).unwrap();
+    let bytes = std::fs::read(index_file.path()).unwrap();
+    let loaded_index = ArchiveIndex::from_bytes(&bytes).unwrap();
 
     assert_eq!(loaded_index.entries.len(), files.len());
     for (path, expected) in &files {
@@ -424,7 +426,7 @@ fn test_index_save_and_load() {
     }
 
     // Use loaded index to read files
-    let archive2 = SyncArchive::open_with_index(tmp.path(), loaded_index);
+    let mut archive2 = Archive::from_parts(File::open(tmp.path()).unwrap(), loaded_index);
     for (path, expected) in &files {
         let content = archive2.read_file(path).unwrap();
         assert_eq!(&content, expected, "content mismatch for {}", path);
@@ -491,7 +493,7 @@ fn test_checkpoint_with_sync_archive() {
     let tmp = write_temp(&compressed);
 
     // Small checkpoint interval
-    let archive = SyncArchive::open_with_interval(tmp.path(), 1024).unwrap();
+    let mut archive = Archive::new_with_interval(File::open(tmp.path()).unwrap(), 1024).unwrap();
 
     assert!(archive.index().checkpoints.len() > 1);
 
@@ -509,7 +511,7 @@ fn test_empty_archive() {
     let tar_data = create_tar_bytes(&[]);
     let tmp = write_temp(&tar_data);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(archive.list().len(), 0);
 }
 
@@ -518,7 +520,7 @@ fn test_single_file_archive() {
     let compressed = create_tar_gz(&[("only.txt", b"only file")]);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(archive.list().len(), 1);
     assert_eq!(archive.read_file("only.txt").unwrap(), b"only file");
 }
@@ -528,7 +530,7 @@ fn test_file_not_found() {
     let compressed = create_tar_gz(&[("exists.txt", b"data")]);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     let result = archive.read_file("nonexistent.txt");
     assert!(result.is_err());
 }
@@ -540,7 +542,7 @@ fn test_large_file_in_archive() {
     let compressed = create_tar_gz(&[("large.bin", &large_content)]);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     let content = archive.read_file("large.bin").unwrap();
     assert_eq!(content, large_content);
 }
@@ -555,7 +557,7 @@ fn test_many_files() {
     let compressed = create_tar_gz(&refs);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(archive.list().len(), 100);
 
     for (path, expected) in &files {
@@ -571,7 +573,7 @@ fn test_auto_detect_gzip() {
     let compressed = create_tar_gz(&[("test.txt", b"hello")]);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(
         archive.index().metadata.compression,
         CompressionFormat::Gzip
@@ -583,7 +585,7 @@ fn test_auto_detect_bzip2() {
     let compressed = create_tar_bz2(&[("test.txt", b"hello")]);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(
         archive.index().metadata.compression,
         CompressionFormat::Bzip2
@@ -595,7 +597,7 @@ fn test_auto_detect_xz() {
     let compressed = create_tar_xz(&[("test.txt", b"hello")]);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(
         archive.index().metadata.compression,
         CompressionFormat::Xz
@@ -607,7 +609,7 @@ fn test_auto_detect_zstd() {
     let compressed = create_tar_zst(&[("test.txt", b"hello")]);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
     assert_eq!(
         archive.index().metadata.compression,
         CompressionFormat::Zstd
@@ -1113,7 +1115,7 @@ fn test_sync_archive_range_read() {
     let compressed = create_tar_gz(&[("data.bin", content.as_slice())]);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
 
     // Read a range
     let range = archive.read_file_range("data.bin", 5000, 2000).unwrap();
@@ -1128,6 +1130,154 @@ fn test_sync_archive_range_read() {
     let full_range = archive.read_file_range("data.bin", 0, 10_000).unwrap();
     let full = archive.read_file("data.bin").unwrap();
     assert_eq!(full_range, full);
+}
+
+// ─── Streaming Reader Tests ───
+
+#[test]
+fn test_open_read_to_end() {
+    let files = test_files();
+    let refs = test_files_refs(&files);
+    let compressed = create_tar_gz(&refs);
+    let tmp = write_temp(&compressed);
+
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
+
+    for (path, expected) in &files {
+        let mut reader = archive.open(path).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut buf).unwrap();
+        assert_eq!(&buf, expected, "content mismatch for {}", path);
+    }
+}
+
+#[test]
+fn test_open_small_reads() {
+    let content: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+    let compressed = create_tar_gz(&[("data.bin", content.as_slice())]);
+    let tmp = write_temp(&compressed);
+
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
+
+    // Read in tiny chunks to exercise the buffering
+    let mut reader = archive.open("data.bin").unwrap();
+    let mut result = Vec::new();
+    let mut small_buf = [0u8; 7]; // intentionally odd size
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut small_buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        result.extend_from_slice(&small_buf[..n]);
+    }
+    assert_eq!(result, content);
+}
+
+#[test]
+fn test_open_matches_read_file() {
+    let content: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+    let compressed = create_tar_gz(&[("big.bin", content.as_slice())]);
+    let tmp = write_temp(&compressed);
+
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
+
+    let via_read_file = archive.read_file("big.bin").unwrap();
+
+    let mut via_open = Vec::new();
+    {
+        let mut reader = archive.open("big.bin").unwrap();
+        std::io::Read::read_to_end(&mut reader, &mut via_open).unwrap();
+    }
+
+    assert_eq!(via_read_file, via_open);
+}
+
+#[test]
+fn test_open_file_not_found() {
+    let compressed = create_tar_gz(&[("exists.txt", b"data")]);
+    let tmp = write_temp(&compressed);
+
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
+    let result = archive.open("nonexistent.txt");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_open_with_io_copy() {
+    let content = b"hello from the archive";
+    let compressed = create_tar_gz(&[("msg.txt", &content[..])]);
+    let tmp = write_temp(&compressed);
+
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
+    let mut reader = archive.open("msg.txt").unwrap();
+    let mut dest = Vec::new();
+    std::io::copy(&mut reader, &mut dest).unwrap();
+    assert_eq!(dest, content);
+}
+
+// ─── Forward-only (Read, no Seek) Tests ───
+
+#[test]
+fn test_from_reader_builds_index() {
+    let files = test_files();
+    let refs = test_files_refs(&files);
+    let compressed = create_tar_gz(&refs);
+
+    // Use a Cursor to prove no seeking is required for indexing
+    let cursor = std::io::Cursor::new(compressed.clone());
+    let archive = Archive::from_reader(cursor, compressed.len() as u64).unwrap();
+
+    assert_eq!(archive.list().len(), files.len());
+    for (path, expected) in &files {
+        let entry = archive.entry(path).unwrap();
+        assert_eq!(entry.size, expected.len() as u64);
+    }
+}
+
+#[test]
+fn test_from_reader_unknown_size() {
+    let compressed = create_tar_gz(&[("hello.txt", b"world")]);
+
+    // file_size=0 means unknown — indexing still works
+    let cursor = std::io::Cursor::new(compressed);
+    let archive = Archive::from_reader(cursor, 0).unwrap();
+
+    assert_eq!(archive.list().len(), 1);
+    assert_eq!(archive.entry("hello.txt").unwrap().size, 5);
+}
+
+#[test]
+fn test_from_reader_then_read_with_seekable() {
+    let files = test_files();
+    let refs = test_files_refs(&files);
+    let compressed = create_tar_gz(&refs);
+
+    // Build index from forward-only reader
+    let cursor = std::io::Cursor::new(compressed.clone());
+    let archive = Archive::from_reader(cursor, compressed.len() as u64).unwrap();
+    let index = archive.index().clone();
+
+    // Attach index to a seekable reader for file reads
+    let mut archive = Archive::from_parts(std::io::Cursor::new(compressed), index);
+    for (path, expected) in &files {
+        let content = archive.read_file(path).unwrap();
+        assert_eq!(&content, expected, "content mismatch for {}", path);
+    }
+}
+
+#[test]
+fn test_from_reader_all_formats() {
+    for (label, data) in [
+        ("gzip", create_tar_gz(&[("f.txt", b"gzip")])),
+        ("bzip2", create_tar_bz2(&[("f.txt", b"bzip2")])),
+        ("xz", create_tar_xz(&[("f.txt", b"xz")])),
+        ("zstd", create_tar_zst(&[("f.txt", b"zstd")])),
+        ("none", create_tar_bytes(&[("f.txt", b"none")])),
+    ] {
+        let cursor = std::io::Cursor::new(data.clone());
+        let archive = Archive::from_reader(cursor, data.len() as u64).unwrap();
+        assert_eq!(archive.list().len(), 1, "failed for {}", label);
+    }
 }
 
 // ─── CPIO Helpers ───
@@ -1303,7 +1453,7 @@ fn test_cpio_sync_archive() {
     let compressed = create_cpio_gz(files);
     let tmp = write_temp(&compressed);
 
-    let archive = SyncArchive::open(tmp.path()).unwrap();
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
 
     let entries = archive.list();
     assert_eq!(entries.len(), 3);
