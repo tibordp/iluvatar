@@ -71,5 +71,5 @@ pub use engine::request::EngineRequest;
 pub use engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
 pub use error::{Result, SupertarError};
 pub use index::entry::IndexEntry;
-pub use index::store::TarIndex;
+pub use index::store::ArchiveIndex;
 pub use sync_io::SyncArchive;

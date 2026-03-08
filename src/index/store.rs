@@ -42,7 +42,7 @@ fn default_archive_format() -> ArchiveFormat {
 /// Contains all the information needed to efficiently seek to and read
 /// any file within the archive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TarIndex {
+pub struct ArchiveIndex {
     /// Archive metadata.
     pub metadata: IndexMetadata,
     /// Sorted list of decompressor checkpoints by uncompressed offset.
@@ -51,7 +51,7 @@ pub struct TarIndex {
     pub entries: HashMap<String, IndexEntry>,
 }
 
-impl TarIndex {
+impl ArchiveIndex {
     /// Look up a file by its path.
     pub fn get(&self, path: &str) -> Option<&IndexEntry> {
         self.entries.get(path).or_else(|| {
@@ -120,7 +120,7 @@ mod tests {
     use crate::archive::EntryType;
     use crate::compress::checkpoint::CheckpointState;
 
-    fn make_test_index() -> TarIndex {
+    fn make_test_index() -> ArchiveIndex {
         let mut entries = HashMap::new();
         entries.insert(
             "file1.txt".into(),
@@ -168,7 +168,7 @@ mod tests {
             },
         );
 
-        TarIndex {
+        ArchiveIndex {
             metadata: IndexMetadata {
                 version: INDEX_VERSION,
                 compression: CompressionFormat::Gzip,

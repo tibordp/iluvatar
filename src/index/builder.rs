@@ -2,7 +2,7 @@ use crate::archive::{ArchiveEntry, ArchiveFormat};
 use crate::compress::checkpoint::Checkpoint;
 use crate::compress::CompressionFormat;
 use crate::index::entry::IndexEntry;
-use crate::index::store::{IndexMetadata, TarIndex, INDEX_VERSION};
+use crate::index::store::{IndexMetadata, ArchiveIndex, INDEX_VERSION};
 use std::collections::HashMap;
 
 /// Accumulates entries and checkpoints during the indexing pass.
@@ -75,11 +75,11 @@ impl IndexBuilder {
         self.last_entry_path.as_deref()
     }
 
-    /// Clone the current state into a usable partial `TarIndex`.
+    /// Clone the current state into a usable partial `ArchiveIndex`.
     ///
     /// The engine continues to be usable for further indexing.
-    pub fn snapshot(&self, uncompressed_size: u64) -> TarIndex {
-        TarIndex {
+    pub fn snapshot(&self, uncompressed_size: u64) -> ArchiveIndex {
+        ArchiveIndex {
             metadata: IndexMetadata {
                 version: INDEX_VERSION,
                 compression: self.compression,
@@ -93,9 +93,9 @@ impl IndexBuilder {
         }
     }
 
-    /// Consume the builder into a partial `TarIndex`.
-    pub fn finish_partial(self, uncompressed_size: u64) -> TarIndex {
-        TarIndex {
+    /// Consume the builder into a partial `ArchiveIndex`.
+    pub fn finish_partial(self, uncompressed_size: u64) -> ArchiveIndex {
+        ArchiveIndex {
             metadata: IndexMetadata {
                 version: INDEX_VERSION,
                 compression: self.compression,
@@ -109,9 +109,9 @@ impl IndexBuilder {
         }
     }
 
-    /// Consume the builder and produce a complete `TarIndex`.
-    pub fn finish(self, uncompressed_size: u64) -> TarIndex {
-        TarIndex {
+    /// Consume the builder and produce a complete `ArchiveIndex`.
+    pub fn finish(self, uncompressed_size: u64) -> ArchiveIndex {
+        ArchiveIndex {
             metadata: IndexMetadata {
                 version: INDEX_VERSION,
                 compression: self.compression,

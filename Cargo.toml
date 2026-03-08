@@ -2,7 +2,7 @@
 name = "supertar"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.73"
 description = "Efficient random access to compressed tar and cpio archives via indexing and decompression checkpoints"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/user/supertar"

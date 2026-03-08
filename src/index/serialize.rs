@@ -1,10 +1,10 @@
 use crate::error::{Result, SupertarError};
-use crate::index::store::{TarIndex, INDEX_VERSION};
+use crate::index::store::{ArchiveIndex, INDEX_VERSION};
 
 /// Magic bytes for the supertar index file format.
 const INDEX_MAGIC: &[u8; 8] = b"STRIDX\x00\x01";
 
-impl TarIndex {
+impl ArchiveIndex {
     /// Serialize the index to bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
@@ -24,7 +24,7 @@ impl TarIndex {
             return Err(SupertarError::IndexError("invalid index magic".into()));
         }
 
-        let index: TarIndex = bincode::deserialize(&data[INDEX_MAGIC.len()..])
+        let index: ArchiveIndex = bincode::deserialize(&data[INDEX_MAGIC.len()..])
             .map_err(|e| SupertarError::Serialization(e.to_string()))?;
 
         if index.metadata.version != INDEX_VERSION {
@@ -48,7 +48,7 @@ mod tests {
     use crate::index::store::IndexMetadata;
     use std::collections::HashMap;
 
-    fn make_test_index() -> TarIndex {
+    fn make_test_index() -> ArchiveIndex {
         let mut entries = HashMap::new();
         entries.insert(
             "test.txt".into(),
@@ -66,7 +66,7 @@ mod tests {
             },
         );
 
-        TarIndex {
+        ArchiveIndex {
             metadata: IndexMetadata {
                 version: INDEX_VERSION,
                 compression: CompressionFormat::Gzip,
@@ -101,7 +101,7 @@ mod tests {
     fn test_roundtrip() {
         let index = make_test_index();
         let bytes = index.to_bytes().unwrap();
-        let restored = TarIndex::from_bytes(&bytes).unwrap();
+        let restored = ArchiveIndex::from_bytes(&bytes).unwrap();
 
         assert_eq!(restored.metadata.version, index.metadata.version);
         assert_eq!(restored.metadata.compression, index.metadata.compression);
@@ -120,13 +120,13 @@ mod tests {
 
     #[test]
     fn test_invalid_magic() {
-        let result = TarIndex::from_bytes(b"INVALID\x00data");
+        let result = ArchiveIndex::from_bytes(b"INVALID\x00data");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_too_short() {
-        let result = TarIndex::from_bytes(b"SHORT");
+        let result = ArchiveIndex::from_bytes(b"SHORT");
         assert!(result.is_err());
     }
 

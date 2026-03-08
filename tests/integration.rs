@@ -3,7 +3,7 @@ use supertar::archive::ArchiveFormat;
 use supertar::compress::CompressionFormat;
 use supertar::engine::request::EngineRequest;
 use supertar::engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
-use supertar::index::store::TarIndex;
+use supertar::index::store::ArchiveIndex;
 use supertar::SyncArchive;
 use tempfile::NamedTempFile;
 
@@ -69,7 +69,7 @@ fn write_temp(data: &[u8]) -> NamedTempFile {
 }
 
 /// Drive indexing engine with in-memory data.
-fn index_in_memory(data: &[u8], format: CompressionFormat) -> TarIndex {
+fn index_in_memory(data: &[u8], format: CompressionFormat) -> ArchiveIndex {
     let mut engine =
         IndexingEngine::new(format, None, DEFAULT_CHECKPOINT_INTERVAL, data.len() as u64).unwrap();
     let mut offset = 0;
@@ -96,7 +96,7 @@ fn index_in_memory(data: &[u8], format: CompressionFormat) -> TarIndex {
 }
 
 /// Read a file using read engine with in-memory data.
-fn read_in_memory(data: &[u8], index: &TarIndex, path: &str) -> Vec<u8> {
+fn read_in_memory(data: &[u8], index: &ArchiveIndex, path: &str) -> Vec<u8> {
     let mut engine = ReadEngine::new(index, path).unwrap();
     let mut result = Vec::new();
     let mut offset = 0;
@@ -144,7 +144,7 @@ fn read_in_memory(data: &[u8], index: &TarIndex, path: &str) -> Vec<u8> {
 /// Read a byte range from a file using read engine with in-memory data.
 fn read_range_in_memory(
     data: &[u8],
-    index: &TarIndex,
+    index: &ArchiveIndex,
     path: &str,
     file_offset: u64,
     len: u64,
@@ -730,7 +730,7 @@ fn test_index_bytes_roundtrip() {
 
     let index = index_in_memory(&compressed, CompressionFormat::Gzip);
     let bytes = index.to_bytes().unwrap();
-    let restored = TarIndex::from_bytes(&bytes).unwrap();
+    let restored = ArchiveIndex::from_bytes(&bytes).unwrap();
 
     assert_eq!(restored.entries.len(), index.entries.len());
     assert_eq!(restored.checkpoints.len(), index.checkpoints.len());
@@ -940,7 +940,7 @@ fn test_partial_index_serialization_roundtrip() {
 
     // Serialize and deserialize — complete field should survive
     let bytes = index.to_bytes().unwrap();
-    let restored = TarIndex::from_bytes(&bytes).unwrap();
+    let restored = ArchiveIndex::from_bytes(&bytes).unwrap();
     assert!(restored.metadata.complete);
 }
 

@@ -4,7 +4,7 @@ use crate::engine::request::EngineRequest;
 use crate::engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
 use crate::error::{Result, SupertarError};
 use crate::index::entry::IndexEntry;
-use crate::index::store::TarIndex;
+use crate::index::store::ArchiveIndex;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -18,7 +18,7 @@ const BUF_SIZE: usize = 64 * 1024;
 /// uses `std::fs::File` for I/O.
 pub struct SyncArchive {
     path: std::path::PathBuf,
-    index: TarIndex,
+    index: ArchiveIndex,
 }
 
 impl SyncArchive {
@@ -46,7 +46,7 @@ impl SyncArchive {
     }
 
     /// Open with a pre-built index.
-    pub fn open_with_index(path: impl AsRef<Path>, index: TarIndex) -> Self {
+    pub fn open_with_index(path: impl AsRef<Path>, index: ArchiveIndex) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
             index,
@@ -62,7 +62,7 @@ impl SyncArchive {
         path: impl AsRef<Path>,
         checkpoint_interval: u64,
         mut on_progress: F,
-    ) -> Result<TarIndex>
+    ) -> Result<ArchiveIndex>
     where
         F: FnMut(&IndexProgress) -> bool,
     {
@@ -105,7 +105,7 @@ impl SyncArchive {
     }
 
     /// Build an index by scanning the entire archive.
-    pub fn build_index(path: impl AsRef<Path>, checkpoint_interval: u64) -> Result<TarIndex> {
+    pub fn build_index(path: impl AsRef<Path>, checkpoint_interval: u64) -> Result<ArchiveIndex> {
         let path = path.as_ref();
         let mut file = File::open(path)?;
         let file_size = file.metadata()?.len();
@@ -142,7 +142,7 @@ impl SyncArchive {
     }
 
     /// Get a reference to the index.
-    pub fn index(&self) -> &TarIndex {
+    pub fn index(&self) -> &ArchiveIndex {
         &self.index
     }
 
@@ -263,8 +263,8 @@ impl SyncArchive {
     }
 
     /// Load a pre-built index from a file.
-    pub fn load_index(path: impl AsRef<Path>) -> Result<TarIndex> {
+    pub fn load_index(path: impl AsRef<Path>) -> Result<ArchiveIndex> {
         let bytes = std::fs::read(path)?;
-        TarIndex::from_bytes(&bytes)
+        ArchiveIndex::from_bytes(&bytes)
     }
 }

@@ -7,7 +7,7 @@ use crate::engine::progress::IndexProgress;
 use crate::engine::request::EngineRequest;
 use crate::error::{Result, SupertarError};
 use crate::index::builder::IndexBuilder;
-use crate::index::store::TarIndex;
+use crate::index::store::ArchiveIndex;
 
 /// Default checkpoint interval: 1 MiB of uncompressed data.
 pub const DEFAULT_CHECKPOINT_INTERVAL: u64 = 1024 * 1024;
@@ -328,7 +328,7 @@ impl IndexingEngine {
     }
 
     /// Consume the engine and return the built index.
-    pub fn finish(self) -> TarIndex {
+    pub fn finish(self) -> ArchiveIndex {
         self.index_builder.finish(self.uncompressed_pos)
     }
 
@@ -349,13 +349,13 @@ impl IndexingEngine {
 
     /// Snapshot the current state as a usable partial index.
     ///
-    /// The returned `TarIndex` contains all entries and checkpoints
+    /// The returned `ArchiveIndex` contains all entries and checkpoints
     /// discovered so far and can be used with `ReadEngine` to read
     /// any file that has been indexed. Its `metadata.complete` field
     /// will be `false`.
     ///
     /// The engine continues to be usable for further indexing.
-    pub fn snapshot_index(&self) -> TarIndex {
+    pub fn snapshot_index(&self) -> ArchiveIndex {
         self.index_builder.snapshot(self.uncompressed_pos)
     }
 
@@ -363,7 +363,7 @@ impl IndexingEngine {
     ///
     /// Like `finish()`, this consumes the engine. Unlike `finish()`,
     /// the returned index has `metadata.complete = false`.
-    pub fn cancel(self) -> TarIndex {
+    pub fn cancel(self) -> ArchiveIndex {
         self.index_builder.finish_partial(self.uncompressed_pos)
     }
 }
@@ -415,7 +415,7 @@ impl ReadEngine {
     /// Create a read engine for a specific file.
     ///
     /// Looks up the file in the index and prepares to read it.
-    pub fn new(index: &TarIndex, path: &str) -> Result<Self> {
+    pub fn new(index: &ArchiveIndex, path: &str) -> Result<Self> {
         let entry = index
             .get(path)
             .ok_or_else(|| SupertarError::FileNotFound(path.into()))?;
@@ -453,7 +453,7 @@ impl ReadEngine {
     /// If `file_offset >= file size`, the engine completes immediately
     /// with zero output.
     pub fn new_range(
-        index: &TarIndex,
+        index: &ArchiveIndex,
         path: &str,
         file_offset: u64,
         len: u64,
@@ -773,7 +773,7 @@ mod tests {
     use crate::compress::CompressionFormat;
 
     /// Helper: drive indexing engine with in-memory data.
-    fn index_from_bytes(data: &[u8], format: CompressionFormat) -> TarIndex {
+    fn index_from_bytes(data: &[u8], format: CompressionFormat) -> ArchiveIndex {
         let mut engine =
             IndexingEngine::new(format, None, DEFAULT_CHECKPOINT_INTERVAL, data.len() as u64)
                 .unwrap();
@@ -801,7 +801,7 @@ mod tests {
     }
 
     /// Helper: read a file from in-memory compressed archive using read engine.
-    fn read_file_from_bytes(data: &[u8], index: &TarIndex, path: &str) -> Vec<u8> {
+    fn read_file_from_bytes(data: &[u8], index: &ArchiveIndex, path: &str) -> Vec<u8> {
         let mut engine = ReadEngine::new(index, path).unwrap();
         let mut result = Vec::new();
         let mut offset = 0;

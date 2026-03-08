@@ -22,6 +22,6 @@ pub struct IndexEntry {
     pub link_target: Option<String>,
     /// Byte offset in the uncompressed stream where file data starts.
     pub uncompressed_offset: u64,
-    /// Index into `TarIndex::checkpoints` for the nearest preceding checkpoint.
+    /// Index into `ArchiveIndex::checkpoints` for the nearest preceding checkpoint.
     pub checkpoint_index: usize,
 }
