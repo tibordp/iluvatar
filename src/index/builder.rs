@@ -2,7 +2,7 @@ use crate::archive::{ArchiveEntry, ArchiveFormat};
 use crate::compress::checkpoint::Checkpoint;
 use crate::compress::CompressionFormat;
 use crate::index::entry::IndexEntry;
-use crate::index::store::{IndexMetadata, ArchiveIndex, INDEX_VERSION};
+use crate::index::store::{ArchiveIndex, IndexMetadata, INDEX_VERSION};
 use std::collections::HashMap;
 
 /// Accumulates entries and checkpoints during the indexing pass.

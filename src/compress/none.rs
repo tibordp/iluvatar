@@ -59,11 +59,6 @@ impl Decompressor for NoneDecompressor {
         self.total_out = checkpoint.uncompressed_offset;
         Ok(())
     }
-
-    fn reset(&mut self) {
-        self.total_in = 0;
-        self.total_out = 0;
-    }
 }
 
 #[cfg(test)]

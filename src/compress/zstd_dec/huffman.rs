@@ -55,11 +55,7 @@ pub(crate) fn read_huffman_table(data: &[u8]) -> Result<(HuffmanTable, usize), S
         let mut weights = Vec::with_capacity(num_weights);
         for i in 0..num_weights {
             let byte = data[1 + i / 2];
-            let w = if i % 2 == 0 {
-                byte >> 4
-            } else {
-                byte & 0x0F
-            };
+            let w = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
             weights.push(w);
         }
         (weights, num_weights, 1 + num_bytes)
@@ -129,13 +125,7 @@ pub(crate) fn read_huffman_table(data: &[u8]) -> Result<(HuffmanTable, usize), S
             };
             table_size
         ];
-        return Ok((
-            HuffmanTable {
-                entries,
-                table_log,
-            },
-            bytes_consumed,
-        ));
+        return Ok((HuffmanTable { entries, table_log }, bytes_consumed));
     }
 
     // Compute rank starting positions (ascending weight order).
@@ -174,13 +164,7 @@ pub(crate) fn read_huffman_table(data: &[u8]) -> Result<(HuffmanTable, usize), S
         rank_start[w as usize] += num_entries as u32;
     }
 
-    Ok((
-        HuffmanTable {
-            entries,
-            table_log,
-        },
-        bytes_consumed,
-    ))
+    Ok((HuffmanTable { entries, table_log }, bytes_consumed))
 }
 
 /// Decompress Huffman weights from FSE-compressed data.
@@ -476,13 +460,16 @@ mod tests {
         // Exact bytes from block 472 of mitmproxy.tar.zst
         // Header byte 0x2D = 45 means 45 bytes of FSE-compressed weights
         let huf_desc: [u8; 46] = [
-            0x2D, 0x10, 0x48, 0x7B, 0xC6, 0xDA, 0xFB, 0xED, 0xE8, 0x27,
-            0xC8, 0xAE, 0xB1, 0x22, 0x5D, 0xD0, 0xF3, 0xF9, 0x35, 0x87,
-            0x7C, 0xBE, 0x9B, 0x15, 0x7F, 0x08, 0x89, 0xBA, 0xE2, 0x72,
-            0x01, 0x5B, 0x2E, 0xA2, 0xC9, 0x99, 0x0C, 0x8C, 0xFD, 0xE1,
-            0x51, 0x18, 0x2B, 0xEC, 0xDE, 0x29,
+            0x2D, 0x10, 0x48, 0x7B, 0xC6, 0xDA, 0xFB, 0xED, 0xE8, 0x27, 0xC8, 0xAE, 0xB1, 0x22,
+            0x5D, 0xD0, 0xF3, 0xF9, 0x35, 0x87, 0x7C, 0xBE, 0x9B, 0x15, 0x7F, 0x08, 0x89, 0xBA,
+            0xE2, 0x72, 0x01, 0x5B, 0x2E, 0xA2, 0xC9, 0x99, 0x0C, 0x8C, 0xFD, 0xE1, 0x51, 0x18,
+            0x2B, 0xEC, 0xDE, 0x29,
         ];
         let result = read_huffman_table(&huf_desc);
-        assert!(result.is_ok(), "read_huffman_table failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "read_huffman_table failed: {:?}",
+            result.err()
+        );
     }
 }

@@ -1,8 +1,12 @@
 use crate::compress::detect;
+use crate::compress::CompressionFormat;
+use crate::engine::checkpoint_strategy::{
+    default_interval_for_format, CheckpointStrategy, FixedInterval,
+};
 use crate::engine::progress::IndexProgress;
 use crate::engine::request::EngineRequest;
-use crate::engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
-use crate::error::{Result, Error};
+use crate::engine::state_machine::{IndexingEngine, ReadEngine};
+use crate::error::{Error, Result};
 use crate::index::entry::IndexEntry;
 use crate::index::store::ArchiveIndex;
 use ::tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, ReadBuf};
@@ -16,7 +20,8 @@ const BUF_SIZE: usize = 64 * 1024;
 /// High-level asynchronous API for reading compressed tar/cpio archives.
 ///
 /// This is the async equivalent of [`crate::sync::Archive`], using
-/// Tokio's [`AsyncRead`] and [`AsyncSeek`] traits.
+/// Tokio's [`AsyncRead`] and [`AsyncSeek`] traits. See the
+/// [module docs](crate::tokio) for usage examples.
 pub struct Archive<R> {
     reader: R,
     index: ArchiveIndex,
@@ -26,6 +31,8 @@ pub struct Archive<R> {
 
 impl<R> Archive<R> {
     /// Create from a reader with a pre-built index.
+    ///
+    /// See [`crate::sync::Archive::from_parts`] for details.
     pub fn from_parts(reader: R, index: ArchiveIndex) -> Self {
         Self { reader, index }
     }
@@ -35,7 +42,7 @@ impl<R> Archive<R> {
         (self.reader, self.index)
     }
 
-    /// Get a reference to the index.
+    /// Get a reference to the underlying index.
     pub fn index(&self) -> &ArchiveIndex {
         &self.index
     }
@@ -50,7 +57,7 @@ impl<R> Archive<R> {
         self.index.list(Some(prefix))
     }
 
-    /// Get metadata for a specific file.
+    /// Get metadata for a specific file without reading its contents.
     pub fn entry(&self, path: &str) -> Option<&IndexEntry> {
         self.index.get(path)
     }
@@ -61,92 +68,85 @@ impl<R> Archive<R> {
 impl<R: AsyncRead + Unpin> Archive<R> {
     /// Index a compressed archive from a forward-only async reader.
     ///
-    /// `file_size` is used for progress reporting; pass 0 if unknown.
+    /// Uses the default checkpoint strategy for the detected compression
+    /// format. `file_size` is used for progress reporting; pass 0 if unknown.
     pub async fn from_reader(reader: R, file_size: u64) -> Result<Self> {
-        Self::from_reader_with_interval(reader, file_size, DEFAULT_CHECKPOINT_INTERVAL).await
+        let mut reader = reader;
+        let index = Self::build_index_with_progress(&mut reader, file_size, |_| true).await?;
+        Ok(Self { reader, index })
     }
 
     /// Index a compressed archive from a forward-only async reader with a
-    /// specific checkpoint interval.
+    /// custom checkpoint strategy.
     ///
     /// `file_size` is used for progress reporting; pass 0 if unknown.
-    pub async fn from_reader_with_interval(
-        mut reader: R,
+    pub async fn from_reader_with_strategy<S: CheckpointStrategy>(
+        reader: R,
         file_size: u64,
-        checkpoint_interval: u64,
+        strategy: S,
     ) -> Result<Self> {
-        let index = Self::build_index_with_progress(
-            &mut reader,
-            file_size,
-            checkpoint_interval,
-            |_| true,
-        )
-        .await?;
+        let mut reader = reader;
+        let index =
+            Self::build_index_with_strategy(&mut reader, file_size, strategy, |_| true).await?;
         Ok(Self { reader, index })
     }
 
     /// Build an index with progress reporting via a callback.
     ///
-    /// `file_size` is used for progress reporting; pass 0 if unknown.
+    /// Uses the default checkpoint strategy for the detected compression
+    /// format. `file_size` is used for progress reporting; pass 0 if unknown.
+    ///
     /// The callback receives an `IndexProgress` after each engine step.
     /// Return `false` from the callback to cancel indexing early and
     /// receive a partial index.
     pub async fn build_index_with_progress<F>(
         reader: &mut R,
         file_size: u64,
-        checkpoint_interval: u64,
-        mut on_progress: F,
+        on_progress: F,
     ) -> Result<ArchiveIndex>
     where
         F: FnMut(&IndexProgress) -> bool,
     {
-        // Read header for compression format detection.
-        // Loop because read() may return partial results.
-        let mut header = [0u8; 512];
-        let mut header_len = 0;
-        while header_len < header.len() {
-            let n = reader.read(&mut header[header_len..]).await?;
-            if n == 0 {
-                break;
-            }
-            header_len += n;
-        }
-        let format = detect::detect_format(&header[..header_len])
-            .ok_or(Error::UnsupportedFormat)?;
+        let (format, header, header_len) = detect_format_from_reader(reader).await?;
+        let strategy = FixedInterval::new(default_interval_for_format(format));
+        drive_indexing(
+            reader,
+            file_size,
+            format,
+            &header[..header_len],
+            strategy,
+            on_progress,
+        )
+        .await
+    }
 
-        let mut engine = IndexingEngine::new(format, None, checkpoint_interval, file_size)?;
-        let mut buf = vec![0u8; BUF_SIZE];
-
-        // Feed the header bytes we already read as the first input
-        let mut header_fed = false;
-
-        loop {
-            match engine.step() {
-                EngineRequest::NeedInput => {
-                    if !header_fed {
-                        engine.provide_data(&header[..header_len]);
-                        header_fed = true;
-                    } else {
-                        let n = reader.read(&mut buf).await?;
-                        if n == 0 {
-                            engine.signal_eof();
-                        } else {
-                            engine.provide_data(&buf[..n]);
-                        }
-                    }
-                }
-                EngineRequest::Done => break,
-                EngineRequest::Error(e) => return Err(e),
-                _ => {}
-            }
-
-            let progress = engine.progress();
-            if !on_progress(&progress) {
-                return Ok(engine.cancel());
-            }
-        }
-
-        Ok(engine.finish())
+    /// Build an index with a custom checkpoint strategy and progress reporting.
+    ///
+    /// `file_size` is used for progress reporting; pass 0 if unknown.
+    ///
+    /// The callback receives an `IndexProgress` after each engine step.
+    /// Return `false` from the callback to cancel indexing early and
+    /// receive a partial index.
+    pub async fn build_index_with_strategy<S, F>(
+        reader: &mut R,
+        file_size: u64,
+        strategy: S,
+        on_progress: F,
+    ) -> Result<ArchiveIndex>
+    where
+        S: CheckpointStrategy,
+        F: FnMut(&IndexProgress) -> bool,
+    {
+        let (format, header, header_len) = detect_format_from_reader(reader).await?;
+        drive_indexing(
+            reader,
+            file_size,
+            format,
+            &header[..header_len],
+            strategy,
+            on_progress,
+        )
+        .await
     }
 }
 
@@ -156,25 +156,46 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Archive<R> {
     /// Index a compressed archive and build an `Archive`.
     ///
     /// Detects the compression format and archive size automatically
-    /// by seeking.
+    /// by seeking. Uses the default checkpoint strategy for the detected
+    /// compression format.
+    ///
+    /// ```no_run
+    /// # async fn example() -> iluvatar::Result<()> {
+    /// use iluvatar::tokio::Archive;
+    ///
+    /// let file = tokio::fs::File::open("data.tar.gz").await?;
+    /// let mut archive = Archive::new(file).await?;
+    /// let data = archive.read_file("README.md").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn new(reader: R) -> Result<Self> {
-        Self::new_with_interval(reader, DEFAULT_CHECKPOINT_INTERVAL).await
+        let mut reader = reader;
+        let file_size = reader.seek(SeekFrom::End(0)).await?;
+        reader.seek(SeekFrom::Start(0)).await?;
+        let index = Self::build_index_with_progress(&mut reader, file_size, |_| true).await?;
+        reader.seek(SeekFrom::Start(0)).await?;
+        Ok(Self { reader, index })
     }
 
-    /// Index a compressed archive with a specific checkpoint interval.
+    /// Index a compressed archive with a custom checkpoint strategy.
     ///
     /// Detects the compression format and archive size automatically
     /// by seeking.
-    pub async fn new_with_interval(mut reader: R, checkpoint_interval: u64) -> Result<Self> {
+    pub async fn with_strategy<S: CheckpointStrategy>(reader: R, strategy: S) -> Result<Self> {
+        let mut reader = reader;
         let file_size = reader.seek(SeekFrom::End(0)).await?;
         reader.seek(SeekFrom::Start(0)).await?;
-        let mut archive =
-            Self::from_reader_with_interval(reader, file_size, checkpoint_interval).await?;
-        archive.reader.seek(SeekFrom::Start(0)).await?;
-        Ok(archive)
+        let index =
+            Self::build_index_with_strategy(&mut reader, file_size, strategy, |_| true).await?;
+        reader.seek(SeekFrom::Start(0)).await?;
+        Ok(Self { reader, index })
     }
 
-    /// Read a file's contents from the archive.
+    /// Read a file's entire contents from the archive into memory.
+    ///
+    /// For large files, consider [`read_file_range()`](Self::read_file_range)
+    /// or [`open()`](Self::open) to avoid loading everything at once.
     pub async fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
         self.reader.seek(SeekFrom::Start(0)).await?;
         let mut engine = ReadEngine::new(&self.index, path)?;
@@ -224,12 +245,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Archive<R> {
     /// Reads `len` bytes starting at byte `offset` within the file.
     /// Seeks to the best checkpoint for that position, so reading
     /// from the middle of a large file is efficient.
-    pub async fn read_file_range(
-        &mut self,
-        path: &str,
-        offset: u64,
-        len: u64,
-    ) -> Result<Vec<u8>> {
+    pub async fn read_file_range(&mut self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         self.reader.seek(SeekFrom::Start(0)).await?;
         let mut engine = ReadEngine::new_range(&self.index, path, offset, len)?;
         let mut result = Vec::new();
@@ -280,6 +296,19 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Archive<R> {
     ///
     /// The returned reader mutably borrows this archive, so only one
     /// file can be open at a time.
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use iluvatar::tokio::Archive;
+    ///
+    /// let file = tokio::fs::File::open("data.tar.gz").await?;
+    /// let mut archive = Archive::new(file).await?;
+    ///
+    /// let mut reader = archive.open("large-file.bin").await?;
+    /// tokio::io::copy(&mut reader, &mut tokio::io::stdout()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn open(&mut self, path: &str) -> Result<EntryReader<'_, R>> {
         self.reader.seek(SeekFrom::Start(0)).await?;
         let engine = ReadEngine::new(&self.index, path)?;
@@ -291,6 +320,73 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Archive<R> {
         })
     }
 }
+
+// ─── Private helpers ───
+
+/// Read the header from an async reader and detect the compression format.
+async fn detect_format_from_reader<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<(CompressionFormat, [u8; 512], usize)> {
+    let mut header = [0u8; 512];
+    let mut header_len = 0;
+    while header_len < header.len() {
+        let n = reader.read(&mut header[header_len..]).await?;
+        if n == 0 {
+            break;
+        }
+        header_len += n;
+    }
+    let format = detect::detect_format(&header[..header_len]).ok_or(Error::UnsupportedFormat)?;
+    Ok((format, header, header_len))
+}
+
+/// Drive the indexing engine to completion with the given strategy.
+async fn drive_indexing<
+    R: AsyncRead + Unpin,
+    S: CheckpointStrategy,
+    F: FnMut(&IndexProgress) -> bool,
+>(
+    reader: &mut R,
+    file_size: u64,
+    format: CompressionFormat,
+    header: &[u8],
+    strategy: S,
+    mut on_progress: F,
+) -> Result<ArchiveIndex> {
+    let mut engine = IndexingEngine::with_strategy(format, None, strategy, file_size)?;
+    let mut buf = vec![0u8; BUF_SIZE];
+    let mut header_fed = false;
+
+    loop {
+        match engine.step() {
+            EngineRequest::NeedInput => {
+                if !header_fed {
+                    engine.provide_data(header);
+                    header_fed = true;
+                } else {
+                    let n = reader.read(&mut buf).await?;
+                    if n == 0 {
+                        engine.signal_eof();
+                    } else {
+                        engine.provide_data(&buf[..n]);
+                    }
+                }
+            }
+            EngineRequest::Done => break,
+            EngineRequest::Error(e) => return Err(e),
+            _ => {}
+        }
+
+        let progress = engine.progress();
+        if !on_progress(&progress) {
+            return Ok(engine.cancel());
+        }
+    }
+
+    Ok(engine.finish())
+}
+
+// ─── EntryReader ───
 
 /// Internal state for the poll-based [`EntryReader`].
 #[derive(Clone, Copy)]
@@ -310,7 +406,20 @@ enum PollState {
 /// Streaming async reader for a single file within an archive.
 ///
 /// Created by [`Archive::open`]. Implements [`AsyncRead`] so it can be
-/// used with `read_to_end`, `tokio::io::copy`, etc.
+/// used with `tokio::io::copy`, `read_to_end`, etc.
+///
+/// ```no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// use iluvatar::tokio::Archive;
+///
+/// let file = tokio::fs::File::open("data.tar.gz").await?;
+/// let mut archive = Archive::new(file).await?;
+/// let mut reader = archive.open("file.txt").await?;
+/// let mut out = tokio::io::stdout();
+/// tokio::io::copy(&mut reader, &mut out).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct EntryReader<'a, R> {
     reader: &'a mut R,
     engine: ReadEngine,

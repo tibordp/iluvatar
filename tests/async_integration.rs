@@ -37,8 +37,14 @@ async fn test_async_new_and_read() {
     let mut archive = Archive::new(cursor).await.unwrap();
 
     assert_eq!(archive.list().len(), 2);
-    assert_eq!(archive.read_file("hello.txt").await.unwrap(), b"hello world");
-    assert_eq!(archive.read_file("data.bin").await.unwrap(), &[1, 2, 3, 4, 5]);
+    assert_eq!(
+        archive.read_file("hello.txt").await.unwrap(),
+        b"hello world"
+    );
+    assert_eq!(
+        archive.read_file("data.bin").await.unwrap(),
+        &[1, 2, 3, 4, 5]
+    );
 }
 
 #[tokio::test]
@@ -62,7 +68,10 @@ async fn test_async_read_file_range() {
 
     let mut archive = Archive::new(cursor).await.unwrap();
 
-    let range = archive.read_file_range("data.bin", 5000, 2000).await.unwrap();
+    let range = archive
+        .read_file_range("data.bin", 5000, 2000)
+        .await
+        .unwrap();
     assert_eq!(range.len(), 2000);
     assert_eq!(&range, &content[5000..7000]);
 }

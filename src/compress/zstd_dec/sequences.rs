@@ -7,7 +7,7 @@
 use super::bits::BackwardBitReader;
 use super::fse::{
     build_fse_table, build_rle_fse_table, read_ncount, FseTable, LL_BASE, LL_BITS, LL_FSE_LOG,
-    MAX_LL, MAX_ML, MAX_OFF, ML_BASE, ML_BITS, ML_FSE_LOG, OF_BASE, OF_BITS, OFF_FSE_LOG,
+    MAX_LL, MAX_ML, MAX_OFF, ML_BASE, ML_BITS, ML_FSE_LOG, OFF_FSE_LOG, OF_BASE, OF_BITS,
 };
 
 /// Compression mode for symbol types in the sequences section.
@@ -83,8 +83,7 @@ pub(crate) fn parse_sequences_header(
         if pos + 2 > data.len() {
             return Err("sequences header truncated".into());
         }
-        num_sequences =
-            u16::from_le_bytes([data[pos], data[pos + 1]]) as usize + 0x7F00;
+        num_sequences = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize + 0x7F00;
         pos += 2;
     } else {
         // 128..254
@@ -189,10 +188,7 @@ fn build_seq_table(
             }
             let symbol = data[0];
             if symbol as u32 > max_symbol {
-                return Err(format!(
-                    "RLE symbol {} exceeds max {}",
-                    symbol, max_symbol
-                ));
+                return Err(format!("RLE symbol {} exceeds max {}", symbol, max_symbol));
             }
             *pos += 1;
             Ok(build_rle_fse_table(
@@ -219,11 +215,9 @@ fn build_seq_table(
             *pos += header_size;
             Ok(table)
         }
-        SymbolCompressionMode::Repeat => {
-            prev_table
-                .cloned()
-                .ok_or_else(|| "Repeat mode but no previous table".into())
-        }
+        SymbolCompressionMode::Repeat => prev_table
+            .cloned()
+            .ok_or_else(|| "Repeat mode but no previous table".into()),
     }
 }
 
@@ -527,13 +521,11 @@ mod tests {
 
     #[test]
     fn test_execute_simple() {
-        let sequences = vec![
-            Sequence {
-                literal_length: 3,
-                offset: 0,
-                match_length: 0,
-            },
-        ];
+        let sequences = vec![Sequence {
+            literal_length: 3,
+            offset: 0,
+            match_length: 0,
+        }];
         let literals = b"abc";
         let mut output = Vec::new();
         // offset 0, match_length 0 is fine (no match copy)

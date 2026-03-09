@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use crate::compress::checkpoint::{Checkpoint, CheckpointState, XzFullCheckpointState};
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
 use crate::compress::lzma::Lzma2Decompressor;
-use crate::error::{Result, Error};
+use crate::error::{Error, Result};
 
 /// XZ stream header magic bytes.
 const XZ_MAGIC: [u8; 6] = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
@@ -206,17 +206,18 @@ impl XzDecompressor {
         if pos >= header_data.len() {
             return Err("block header truncated at filter".into());
         }
-        let (filter_id, id_len) =
-            decode_vli(&header_data[pos..]).ok_or("bad filter ID VLI")?;
+        let (filter_id, id_len) = decode_vli(&header_data[pos..]).ok_or("bad filter ID VLI")?;
         pos += id_len;
 
         if filter_id != 0x21 {
-            return Err(format!("unsupported filter ID: 0x{:x} (expected LZMA2 0x21)", filter_id));
+            return Err(format!(
+                "unsupported filter ID: 0x{:x} (expected LZMA2 0x21)",
+                filter_id
+            ));
         }
 
         // Properties size (should be 1 for LZMA2)
-        let (props_size, ps_len) =
-            decode_vli(&header_data[pos..]).ok_or("bad props size VLI")?;
+        let (props_size, ps_len) = decode_vli(&header_data[pos..]).ok_or("bad props size VLI")?;
         pos += ps_len;
 
         if props_size != 1 {
@@ -277,11 +278,10 @@ impl Decompressor for XzDecompressor {
                         break;
                     }
                     if self.buffer[pos..pos + 6] != XZ_MAGIC {
-                        return Err(Error::DecompressionError(
-                            "invalid XZ magic".into(),
-                        ));
+                        return Err(Error::DecompressionError("invalid XZ magic".into()));
                     }
-                    self.stream_header.copy_from_slice(&self.buffer[pos..pos + 12]);
+                    self.stream_header
+                        .copy_from_slice(&self.buffer[pos..pos + 12]);
                     self.check_size = check_size_for_id(self.stream_header[7] & 0x0F);
                     pos += 12;
                     self.phase = XzPhase::BlockStart;
@@ -322,9 +322,10 @@ impl Decompressor for XzDecompressor {
                 }
 
                 XzPhase::Lzma2Data => {
-                    let lzma2 = self.lzma2.as_mut().ok_or_else(|| {
-                        Error::DecompressionError("no LZMA2 decoder".into())
-                    })?;
+                    let lzma2 = self
+                        .lzma2
+                        .as_mut()
+                        .ok_or_else(|| Error::DecompressionError("no LZMA2 decoder".into()))?;
 
                     let available = &self.buffer[pos..];
                     if available.is_empty() {
@@ -376,9 +377,7 @@ impl Decompressor for XzDecompressor {
                         if padding == 0 {
                             self.phase = XzPhase::BlockStart;
                         } else {
-                            self.phase = XzPhase::Padding {
-                                remaining: padding,
-                            };
+                            self.phase = XzPhase::Padding { remaining: padding };
                         }
                     } else {
                         self.phase = XzPhase::Check {
@@ -444,15 +443,13 @@ impl Decompressor for XzDecompressor {
 
     fn checkpoint(&self, compressed_offset: u64, uncompressed_offset: u64) -> Result<Checkpoint> {
         let lzma2_checkpoint = self.lzma2.as_ref().and_then(|dec| {
-            dec.checkpoint(0, 0)
-                .ok()
-                .and_then(|cp| {
-                    if let CheckpointState::Lzma2(state) = cp.state {
-                        Some(state)
-                    } else {
-                        None
-                    }
-                })
+            dec.checkpoint(0, 0).ok().and_then(|cp| {
+                if let CheckpointState::Lzma2(state) = cp.state {
+                    Some(state)
+                } else {
+                    None
+                }
+            })
         });
 
         let state = XzFullCheckpointState {
@@ -469,16 +466,15 @@ impl Decompressor for XzDecompressor {
             compressed_offset,
             bit_offset: 0,
             uncompressed_offset,
-            state: CheckpointState::XzFull(state),
+            state: CheckpointState::Xz(state),
         })
     }
 
     fn restore(&mut self, checkpoint: &Checkpoint) -> Result<()> {
         match &checkpoint.state {
-            CheckpointState::XzFull(state) => {
-                self.phase = bincode::deserialize(&state.phase).map_err(|e| {
-                    Error::CheckpointError(format!("deserialize xz phase: {}", e))
-                })?;
+            CheckpointState::Xz(state) => {
+                self.phase = bincode::deserialize(&state.phase)
+                    .map_err(|e| Error::CheckpointError(format!("deserialize xz phase: {}", e)))?;
                 if state.stream_header.len() == 12 {
                     self.stream_header.copy_from_slice(&state.stream_header);
                 }
@@ -495,13 +491,10 @@ impl Decompressor for XzDecompressor {
                 // Restore LZMA2 decoder if we were in the middle of LZMA2 data
                 if let Some(ref lzma2_bytes) = state.lzma2_state {
                     use crate::compress::checkpoint::Lzma2FullCheckpointState;
-                    let lzma2_state: Lzma2FullCheckpointState =
-                        bincode::deserialize(lzma2_bytes).map_err(|e| {
-                            Error::CheckpointError(format!(
-                                "deserialize lzma2 state: {}",
-                                e
-                            ))
-                        })?;
+                    let lzma2_state: Lzma2FullCheckpointState = bincode::deserialize(lzma2_bytes)
+                        .map_err(|e| {
+                        Error::CheckpointError(format!("deserialize lzma2 state: {}", e))
+                    })?;
                     let mut dec = Lzma2Decompressor::new(1 << 24); // Will be overwritten by restore
                     dec.restore(&Checkpoint {
                         compressed_offset: lzma2_state.total_in,
@@ -525,7 +518,9 @@ impl Decompressor for XzDecompressor {
             )),
         }
     }
+}
 
+impl XzDecompressor {
     fn reset(&mut self) {
         self.phase = XzPhase::StreamHeader;
         self.buffer.clear();
@@ -579,7 +574,10 @@ mod tests {
 
             if result.bytes_consumed == 0 && result.bytes_produced == 0 {
                 stall_count += 1;
-                assert!(stall_count < 100, "decompressor stalled: no progress after 100 calls");
+                assert!(
+                    stall_count < 100,
+                    "decompressor stalled: no progress after 100 calls"
+                );
             } else {
                 stall_count = 0;
             }
@@ -601,7 +599,7 @@ mod tests {
 
     /// Create a multi-block XZ stream using the multithreaded encoder with a small block size.
     fn compress_xz_multiblock(data: &[u8], block_size: u64) -> Vec<u8> {
-        use xz2::stream::{MtStreamBuilder, Check};
+        use xz2::stream::{Check, MtStreamBuilder};
         let stream = MtStreamBuilder::new()
             .threads(1)
             .block_size(block_size)
@@ -669,8 +667,10 @@ mod tests {
             offset += result.bytes_consumed;
 
             if all_output.len() >= 10000 && checkpoint_saved.is_none() {
-                checkpoint_saved =
-                    Some(dec.checkpoint(offset as u64, all_output.len() as u64).unwrap());
+                checkpoint_saved = Some(
+                    dec.checkpoint(offset as u64, all_output.len() as u64)
+                        .unwrap(),
+                );
             }
 
             if result.status == DecompressStatus::StreamEnd {
@@ -725,7 +725,8 @@ mod tests {
 
             let expected_tail = &original[cp.uncompressed_offset as usize..];
             assert_eq!(
-                restored_output, expected_tail,
+                restored_output,
+                expected_tail,
                 "restored output ({} bytes) doesn't match expected ({} bytes)",
                 restored_output.len(),
                 expected_tail.len()
@@ -746,7 +747,9 @@ mod tests {
         let mut state = seed;
         (0..size)
             .map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (state >> 33) as u8
             })
             .collect()
@@ -842,12 +845,17 @@ mod tests {
         while offset < compressed.len() {
             let end = (offset + 4096).min(compressed.len());
             let mut output = vec![0u8; 256 * 1024];
-            let result = dec.decompress(&compressed[offset..end], &mut output).unwrap();
+            let result = dec
+                .decompress(&compressed[offset..end], &mut output)
+                .unwrap();
             all_output.extend_from_slice(&output[..result.bytes_produced]);
             offset += result.bytes_consumed;
 
             if all_output.len() >= 30_000 && checkpoint_saved.is_none() {
-                checkpoint_saved = Some(dec.checkpoint(offset as u64, all_output.len() as u64).unwrap());
+                checkpoint_saved = Some(
+                    dec.checkpoint(offset as u64, all_output.len() as u64)
+                        .unwrap(),
+                );
                 output_at_checkpoint = all_output.len();
             }
 
@@ -878,7 +886,9 @@ mod tests {
         while off2 < compressed.len() {
             let end = (off2 + 4096).min(compressed.len());
             let mut output = vec![0u8; 256 * 1024];
-            let result = dec2.decompress(&compressed[off2..end], &mut output).unwrap();
+            let result = dec2
+                .decompress(&compressed[off2..end], &mut output)
+                .unwrap();
             restored_output.extend_from_slice(&output[..result.bytes_produced]);
             off2 += result.bytes_consumed;
             if result.status == DecompressStatus::StreamEnd {
@@ -915,9 +925,7 @@ mod tests {
     /// Decompress a golden file, compare against reference xz2 crate output.
     fn verify_xz_golden(compressed: &[u8], chunk_size: usize) {
         let expected = xz2::read::XzDecoder::new(compressed);
-        let expected: Vec<u8> = std::io::Read::bytes(expected)
-            .map(|b| b.unwrap())
-            .collect();
+        let expected: Vec<u8> = std::io::Read::bytes(expected).map(|b| b.unwrap()).collect();
         let output = full_decompress(compressed, chunk_size);
         assert_eq!(output.len(), expected.len(), "length mismatch");
         assert_eq!(output, expected);
@@ -945,7 +953,9 @@ mod tests {
             if result.status == DecompressStatus::StreamEnd {
                 break;
             }
-            if result.bytes_consumed == 0 && result.bytes_produced == 0 && offset >= compressed.len()
+            if result.bytes_consumed == 0
+                && result.bytes_produced == 0
+                && offset >= compressed.len()
             {
                 let result = dec.decompress(&[], &mut output)?;
                 all_output.extend_from_slice(&output[..result.bytes_produced]);
@@ -1073,11 +1083,26 @@ mod tests {
     fn test_xzvec_good_small_chunks() {
         // Good files fed in small chunks.
         let files: &[(&str, &[u8])] = &[
-            ("check-crc64", include_bytes!("../../tests/vectors/xz/good/good-1-check-crc64.xz")),
-            ("lzma2-1", include_bytes!("../../tests/vectors/xz/good/good-1-lzma2-1.xz")),
-            ("lzma2-4", include_bytes!("../../tests/vectors/xz/good/good-1-lzma2-4.xz")),
-            ("2-lzma2", include_bytes!("../../tests/vectors/xz/good/good-2-lzma2.xz")),
-            ("block_header-1", include_bytes!("../../tests/vectors/xz/good/good-1-block_header-1.xz")),
+            (
+                "check-crc64",
+                include_bytes!("../../tests/vectors/xz/good/good-1-check-crc64.xz"),
+            ),
+            (
+                "lzma2-1",
+                include_bytes!("../../tests/vectors/xz/good/good-1-lzma2-1.xz"),
+            ),
+            (
+                "lzma2-4",
+                include_bytes!("../../tests/vectors/xz/good/good-1-lzma2-4.xz"),
+            ),
+            (
+                "2-lzma2",
+                include_bytes!("../../tests/vectors/xz/good/good-2-lzma2.xz"),
+            ),
+            (
+                "block_header-1",
+                include_bytes!("../../tests/vectors/xz/good/good-1-block_header-1.xz"),
+            ),
         ];
         for (name, compressed) in files {
             verify_xz_golden(compressed, 1);
@@ -1135,11 +1160,26 @@ mod tests {
     #[test]
     fn test_xzvec_bad_lzma2_corrupt() {
         let must_reject: &[(&str, &[u8])] = &[
-            ("lzma2-1", include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-1.xz")),
-            ("lzma2-3", include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-3.xz")),
-            ("lzma2-4", include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-4.xz")),
-            ("lzma2-5", include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-5.xz")),
-            ("lzma2-6", include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-6.xz")),
+            (
+                "lzma2-1",
+                include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-1.xz"),
+            ),
+            (
+                "lzma2-3",
+                include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-3.xz"),
+            ),
+            (
+                "lzma2-4",
+                include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-4.xz"),
+            ),
+            (
+                "lzma2-5",
+                include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-5.xz"),
+            ),
+            (
+                "lzma2-6",
+                include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-6.xz"),
+            ),
         ];
         for (name, data) in must_reject {
             assert!(
@@ -1151,9 +1191,10 @@ mod tests {
 
     #[test]
     fn test_xzvec_bad_block_headers() {
-        let must_reject: &[(&str, &[u8])] = &[
-            ("block_header-2", include_bytes!("../../tests/vectors/xz/bad/bad-1-block_header-2.xz")),
-        ];
+        let must_reject: &[(&str, &[u8])] = &[(
+            "block_header-2",
+            include_bytes!("../../tests/vectors/xz/bad/bad-1-block_header-2.xz"),
+        )];
         for (name, data) in must_reject {
             assert!(
                 try_full_decompress(data).is_err(),

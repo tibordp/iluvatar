@@ -119,8 +119,9 @@ pub(crate) fn parse_frame_header(data: &[u8]) -> Result<FrameHeader, String> {
         let val = match fcs_size {
             1 => data[pos] as u64,
             2 => u16::from_le_bytes([data[pos], data[pos + 1]]) as u64 + 256,
-            4 => u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                as u64,
+            4 => {
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64
+            }
             8 => u64::from_le_bytes([
                 data[pos],
                 data[pos + 1],
@@ -172,8 +173,7 @@ pub(crate) fn check_skippable_frame(data: &[u8]) -> Option<usize> {
     }
     let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     if (SKIPPABLE_MAGIC_LOW..=SKIPPABLE_MAGIC_HIGH).contains(&magic) {
-        let frame_size =
-            u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        let frame_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
         Some(8 + frame_size)
     } else {
         None

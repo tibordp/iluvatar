@@ -2,6 +2,23 @@
 ///
 /// This is a plain data struct with no references back to the engine,
 /// making it safe to send across threads or store for later comparison.
+///
+/// Obtained by calling [`IndexingEngine::progress()`](crate::IndexingEngine::progress).
+///
+/// # Example
+///
+/// ```
+/// # fn show_progress(progress: &iluvatar::IndexProgress) {
+/// if let Some(pct) = progress.fraction() {
+///     println!(
+///         "{:.1}% — {} entries, {} checkpoints",
+///         pct * 100.0,
+///         progress.entries_found,
+///         progress.checkpoints_created,
+///     );
+/// }
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct IndexProgress {
     /// Number of compressed bytes consumed so far.
@@ -15,6 +32,8 @@ pub struct IndexProgress {
     pub entries_found: usize,
     /// Number of decompressor checkpoints created so far.
     pub checkpoints_created: usize,
+    /// Total bytes of checkpoint state data accumulated so far.
+    pub checkpoint_data_bytes: u64,
     /// Path of the most recently discovered entry, if any.
     pub last_entry_path: Option<String>,
     /// Whether indexing is complete.

@@ -1,20 +1,46 @@
-use crate::error::{Result, Error};
+use crate::error::{Error, Result};
 use crate::index::store::{ArchiveIndex, INDEX_VERSION};
 
 /// Magic bytes for the iluvatar index file format.
 const INDEX_MAGIC: &[u8; 8] = b"STRIDX\x00\x01";
 
 impl ArchiveIndex {
-    /// Serialize the index to bytes.
+    /// Serialize the index to bytes for persistent storage.
+    ///
+    /// The format includes a magic number and version check, so indices
+    /// built by incompatible versions are rejected on load.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn example(index: &iluvatar::ArchiveIndex) -> iluvatar::Result<()> {
+    /// let bytes = index.to_bytes()?;
+    /// std::fs::write("archive.tar.gz.idx", &bytes)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.extend_from_slice(INDEX_MAGIC);
-        bincode::serialize_into(&mut buf, self)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
+        bincode::serialize_into(&mut buf, self).map_err(|e| Error::Serialization(e.to_string()))?;
         Ok(buf)
     }
 
-    /// Deserialize an index from bytes.
+    /// Deserialize an index from bytes previously produced by [`to_bytes()`](Self::to_bytes).
+    ///
+    /// Returns [`Error::IndexVersionMismatch`] if
+    /// the index was built by an incompatible version.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn example() -> iluvatar::Result<()> {
+    /// let bytes = std::fs::read("archive.tar.gz.idx")?;
+    /// let index = iluvatar::ArchiveIndex::from_bytes(&bytes)?;
+    /// println!("{} entries", index.len());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < INDEX_MAGIC.len() {
             return Err(Error::IndexError("data too short".into()));

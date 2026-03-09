@@ -38,8 +38,8 @@
 
 pub(crate) mod bits;
 pub(crate) mod block;
-pub(crate) mod fse;
 pub(crate) mod frame;
+pub(crate) mod fse;
 pub(crate) mod huffman;
 pub(crate) mod sequences;
 
@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compress::checkpoint::{Checkpoint, CheckpointState, ZstdFullCheckpointState};
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
-use crate::error::{Result, Error};
+use crate::error::{Error, Result};
 
 use block::{
     block_compressed_size, decompress_block, parse_block_header, BlockDecoderState, BlockType,
@@ -69,9 +69,7 @@ enum DecoderPhase {
         compressed_size: usize,
     },
     /// Frame finished, may read checksum.
-    FrameChecksum {
-        has_checksum: bool,
-    },
+    FrameChecksum { has_checksum: bool },
     /// Stream is complete.
     Done,
 }
@@ -178,15 +176,14 @@ impl ZstdDecompressor {
         self.window_size = state.window_size;
         self.phase = bincode::deserialize(&state.phase)
             .map_err(|e| Error::CheckpointError(format!("deserialize phase: {}", e)))?;
-        self.frame_header = if let Some(ref fh_bytes) = state.frame_header {
-            Some(
-                bincode::deserialize(fh_bytes).map_err(|e| {
+        self.frame_header =
+            if let Some(ref fh_bytes) = state.frame_header {
+                Some(bincode::deserialize(fh_bytes).map_err(|e| {
                     Error::CheckpointError(format!("deserialize frame_header: {}", e))
-                })?,
-            )
-        } else {
-            None
-        };
+                })?)
+            } else {
+                None
+            };
         self.buffer = state.buffer.clone();
         self.staged_output = state.staged_output.clone();
         self.staged_pos = state.staged_pos;
@@ -292,9 +289,8 @@ impl Decompressor for ZstdDecompressor {
                         break;
                     }
 
-                    let header = parse_block_header(&self.buffer[pos..]).map_err(|e| {
-                        Error::DecompressionError(format!("block header: {}", e))
-                    })?;
+                    let header = parse_block_header(&self.buffer[pos..])
+                        .map_err(|e| Error::DecompressionError(format!("block header: {}", e)))?;
                     pos += 3;
 
                     let compressed_size = block_compressed_size(&header);
@@ -320,11 +316,7 @@ impl Decompressor for ZstdDecompressor {
                         0 => BlockType::Raw,
                         1 => BlockType::Rle,
                         2 => BlockType::Compressed,
-                        _ => {
-                            return Err(Error::DecompressionError(
-                                "invalid block type".into(),
-                            ))
-                        }
+                        _ => return Err(Error::DecompressionError("invalid block type".into())),
                     };
 
                     let block_header = block::BlockHeader {
@@ -343,9 +335,7 @@ impl Decompressor for ZstdDecompressor {
                         &self.window,
                         &mut block_output,
                     )
-                    .map_err(|e| {
-                        Error::DecompressionError(format!("block decompress: {}", e))
-                    })?;
+                    .map_err(|e| Error::DecompressionError(format!("block decompress: {}", e)))?;
 
                     pos += compressed_size;
 
@@ -422,13 +412,13 @@ impl Decompressor for ZstdDecompressor {
             compressed_offset,
             bit_offset: 0,
             uncompressed_offset,
-            state: CheckpointState::ZstdFull(state),
+            state: CheckpointState::Zstd(state),
         })
     }
 
     fn restore(&mut self, checkpoint: &Checkpoint) -> Result<()> {
         match &checkpoint.state {
-            CheckpointState::ZstdFull(state) => {
+            CheckpointState::Zstd(state) => {
                 self.restore_from_checkpoint_state(state)?;
                 self.total_in = checkpoint.compressed_offset;
                 self.total_out = checkpoint.uncompressed_offset;
@@ -443,7 +433,9 @@ impl Decompressor for ZstdDecompressor {
             )),
         }
     }
+}
 
+impl ZstdDecompressor {
     fn reset(&mut self) {
         self.phase = DecoderPhase::FrameHeader;
         self.buffer.clear();
@@ -502,7 +494,9 @@ mod tests {
             if result.status == DecompressStatus::StreamEnd {
                 break;
             }
-            if result.bytes_consumed == 0 && result.bytes_produced == 0 && offset >= compressed.len()
+            if result.bytes_consumed == 0
+                && result.bytes_produced == 0
+                && offset >= compressed.len()
             {
                 // Need to flush with empty input
                 let result = dec.decompress(&[], &mut output).unwrap();
@@ -599,7 +593,10 @@ mod tests {
 
             // Take checkpoint after producing some output
             if all_output.len() >= 3000 && checkpoint_saved.is_none() {
-                checkpoint_saved = Some(dec.checkpoint(offset as u64, all_output.len() as u64).unwrap());
+                checkpoint_saved = Some(
+                    dec.checkpoint(offset as u64, all_output.len() as u64)
+                        .unwrap(),
+                );
             }
 
             if result.status == DecompressStatus::StreamEnd {
@@ -654,7 +651,8 @@ mod tests {
 
             let expected_tail = &original[cp.uncompressed_offset as usize..];
             assert_eq!(
-                restored_output, expected_tail,
+                restored_output,
+                expected_tail,
                 "restored output ({} bytes) doesn't match expected ({} bytes)",
                 restored_output.len(),
                 expected_tail.len()
@@ -685,7 +683,11 @@ mod tests {
             .map(|i| {
                 // Mix of patterns to encourage Huffman coding
                 let v = ((i * 7 + 13) % 256) as u8;
-                if i % 100 < 50 { v } else { v ^ 0xFF }
+                if i % 100 < 50 {
+                    v
+                } else {
+                    v ^ 0xFF
+                }
             })
             .collect();
         let compressed = compress_zstd_level(&original, 19);
@@ -710,53 +712,47 @@ mod tests {
     #[test]
     fn test_golden_rle_first_block() {
         // 1 MiB of zeros, encoded with an RLE block as the first block.
-        let compressed = include_bytes!(
-            "../../../tests/vectors/zstd/golden-decompression/rle-first-block.zst"
-        );
+        let compressed =
+            include_bytes!("../../../tests/vectors/zstd/golden-decompression/rle-first-block.zst");
         verify_golden(compressed, 4096);
     }
 
     #[test]
     fn test_golden_empty_block() {
         // Frame containing an empty block — decompresses to 0 bytes.
-        let compressed = include_bytes!(
-            "../../../tests/vectors/zstd/golden-decompression/empty-block.zst"
-        );
+        let compressed =
+            include_bytes!("../../../tests/vectors/zstd/golden-decompression/empty-block.zst");
         verify_golden(compressed, compressed.len());
     }
 
     #[test]
     fn test_golden_block_128k() {
         // Frame with a 128 KiB block.
-        let compressed = include_bytes!(
-            "../../../tests/vectors/zstd/golden-decompression/block-128k.zst"
-        );
+        let compressed =
+            include_bytes!("../../../tests/vectors/zstd/golden-decompression/block-128k.zst");
         verify_golden(compressed, 4096);
     }
 
     #[test]
     fn test_golden_zero_seq_2b() {
         // Minimal frame with a 2-byte zero sequence section.
-        let compressed = include_bytes!(
-            "../../../tests/vectors/zstd/golden-decompression/zeroSeq_2B.zst"
-        );
+        let compressed =
+            include_bytes!("../../../tests/vectors/zstd/golden-decompression/zeroSeq_2B.zst");
         verify_golden(compressed, compressed.len());
     }
 
     #[test]
     fn test_golden_rle_first_block_incremental() {
         // Same as above but fed in tiny 64-byte chunks.
-        let compressed = include_bytes!(
-            "../../../tests/vectors/zstd/golden-decompression/rle-first-block.zst"
-        );
+        let compressed =
+            include_bytes!("../../../tests/vectors/zstd/golden-decompression/rle-first-block.zst");
         verify_golden(compressed, 64);
     }
 
     #[test]
     fn test_golden_block_128k_incremental() {
-        let compressed = include_bytes!(
-            "../../../tests/vectors/zstd/golden-decompression/block-128k.zst"
-        );
+        let compressed =
+            include_bytes!("../../../tests/vectors/zstd/golden-decompression/block-128k.zst");
         verify_golden(compressed, 64);
     }
 
@@ -767,9 +763,7 @@ mod tests {
 
     #[test]
     fn test_golden_compress_http() {
-        let original = include_bytes!(
-            "../../../tests/vectors/zstd/golden-compression/http"
-        );
+        let original = include_bytes!("../../../tests/vectors/zstd/golden-compression/http");
         for level in [1, 3, 9, 15, 19] {
             let compressed = compress_zstd_level(original, level);
             let output = full_decompress(&compressed, 4096);
@@ -799,7 +793,11 @@ mod tests {
         for level in [1, 3, 9, 19] {
             let compressed = compress_zstd_level(original, level);
             let output = full_decompress(&compressed, 4096);
-            assert_eq!(output.len(), original.len(), "length mismatch at level {level}");
+            assert_eq!(
+                output.len(),
+                original.len(),
+                "length mismatch at level {level}"
+            );
             assert_eq!(&output, &original[..], "mismatch at level {level}");
         }
     }
@@ -813,7 +811,11 @@ mod tests {
         for level in [1, 9, 19] {
             let compressed = compress_zstd_level(original, level);
             let output = full_decompress(&compressed, 4096);
-            assert_eq!(output.len(), original.len(), "length mismatch at level {level}");
+            assert_eq!(
+                output.len(),
+                original.len(),
+                "length mismatch at level {level}"
+            );
             assert_eq!(&output, &original[..], "mismatch at level {level}");
         }
     }
@@ -825,7 +827,9 @@ mod tests {
         let mut state = seed;
         (0..size)
             .map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (state >> 33) as u8
             })
             .collect()
@@ -919,12 +923,17 @@ mod tests {
         while offset < compressed.len() {
             let end = (offset + 4096).min(compressed.len());
             let mut output = vec![0u8; 256 * 1024];
-            let result = dec.decompress(&compressed[offset..end], &mut output).unwrap();
+            let result = dec
+                .decompress(&compressed[offset..end], &mut output)
+                .unwrap();
             all_output.extend_from_slice(&output[..result.bytes_produced]);
             offset += result.bytes_consumed;
 
             if all_output.len() >= 50_000 && checkpoint_saved.is_none() {
-                checkpoint_saved = Some(dec.checkpoint(offset as u64, all_output.len() as u64).unwrap());
+                checkpoint_saved = Some(
+                    dec.checkpoint(offset as u64, all_output.len() as u64)
+                        .unwrap(),
+                );
                 output_at_checkpoint = all_output.len();
             }
 
@@ -958,7 +967,9 @@ mod tests {
         while offset < compressed.len() {
             let end = (offset + 4096).min(compressed.len());
             let mut output = vec![0u8; 256 * 1024];
-            let result = dec2.decompress(&compressed[offset..end], &mut output).unwrap();
+            let result = dec2
+                .decompress(&compressed[offset..end], &mut output)
+                .unwrap();
             restored_output.extend_from_slice(&output[..result.bytes_produced]);
             offset += result.bytes_consumed;
 

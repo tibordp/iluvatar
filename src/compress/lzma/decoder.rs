@@ -44,15 +44,16 @@ const OFF_IS_REP_G1: usize = OFF_IS_REP_G0 + K_NUM_STATES; // 216
 const OFF_IS_REP_G2: usize = OFF_IS_REP_G1 + K_NUM_STATES; // 228
 const OFF_IS_REP0_LONG: usize = OFF_IS_REP_G2 + K_NUM_STATES; // 240
 const OFF_LEN_CODER: usize = OFF_IS_REP0_LONG + K_NUM_STATES * K_NUM_POS_STATES_MAX; // 432
-// LenDecoder: Choice(1) + Choice2(1) + LowCoder[16][8] + MidCoder[16][8] + HighCoder[256]
-const K_LEN_DECODER_SIZE: usize =
-    2 + K_NUM_POS_STATES_MAX * K_LEN_NUM_LOW_SYMBOLS + K_NUM_POS_STATES_MAX * K_LEN_NUM_MID_SYMBOLS + K_LEN_NUM_HIGH_SYMBOLS;
+                                                                                     // LenDecoder: Choice(1) + Choice2(1) + LowCoder[16][8] + MidCoder[16][8] + HighCoder[256]
+const K_LEN_DECODER_SIZE: usize = 2
+    + K_NUM_POS_STATES_MAX * K_LEN_NUM_LOW_SYMBOLS
+    + K_NUM_POS_STATES_MAX * K_LEN_NUM_MID_SYMBOLS
+    + K_LEN_NUM_HIGH_SYMBOLS;
 // = 2 + 128 + 128 + 256 = 514
 const OFF_REP_LEN_CODER: usize = OFF_LEN_CODER + K_LEN_DECODER_SIZE; // 946
 const OFF_POS_SLOT: usize = OFF_REP_LEN_CODER + K_LEN_DECODER_SIZE; // 1460
-const OFF_POS_DECODERS: usize =
-    OFF_POS_SLOT + K_NUM_LEN_TO_POS_STATES * (1 << 6); // 1460 + 256 = 1716
-// PosDecoders: 1 + kNumFullDistances - kEndPosModelIndex = 1 + 128 - 14 = 115
+const OFF_POS_DECODERS: usize = OFF_POS_SLOT + K_NUM_LEN_TO_POS_STATES * (1 << 6); // 1460 + 256 = 1716
+                                                                                   // PosDecoders: 1 + kNumFullDistances - kEndPosModelIndex = 1 + 128 - 14 = 115
 const K_POS_DECODERS_SIZE: usize = 1 + K_NUM_FULL_DISTANCES - K_END_POS_MODEL_INDEX;
 const OFF_ALIGN: usize = OFF_POS_DECODERS + K_POS_DECODERS_SIZE; // 1831
 const K_ALIGN_TABLE_SIZE: usize = 1 << K_NUM_ALIGN_BITS;
@@ -80,17 +81,29 @@ fn update_state_literal(state: u8) -> u8 {
 
 #[inline]
 fn update_state_match(state: u8) -> u8 {
-    if state < 7 { 7 } else { 10 }
+    if state < 7 {
+        7
+    } else {
+        10
+    }
 }
 
 #[inline]
 fn update_state_rep(state: u8) -> u8 {
-    if state < 7 { 8 } else { 11 }
+    if state < 7 {
+        8
+    } else {
+        11
+    }
 }
 
 #[inline]
 fn update_state_short_rep(state: u8) -> u8 {
-    if state < 7 { 9 } else { 11 }
+    if state < 7 {
+        9
+    } else {
+        11
+    }
 }
 
 // ─── LZMA Properties ───────────────────────────────────────────────
@@ -156,7 +169,6 @@ impl SlidingWindow {
         }
     }
 
-
     #[inline]
     pub fn get_byte(&self, dist: u32) -> u8 {
         let dist = dist as usize;
@@ -177,7 +189,11 @@ impl SlidingWindow {
 
     pub fn check_distance(&self, dist: u32) -> bool {
         let d = dist as usize;
-        if self.is_full { d < self.size } else { d < self.pos }
+        if self.is_full {
+            d < self.size
+        } else {
+            d < self.pos
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -361,13 +377,31 @@ pub(crate) struct DistDecodeState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum DistPhase {
-    PosSlot { m: usize, bits_remaining: usize },
+    PosSlot {
+        m: usize,
+        bits_remaining: usize,
+    },
     /// Direct bits: dist accumulates via (dist << 1) + bit, matching C code exactly.
-    DirectBits { dist: u32, num_bits: usize },
+    DirectBits {
+        dist: u32,
+        num_bits: usize,
+    },
     /// Reverse bit-tree decode for align bits. i tracks bit position (0..4).
-    AlignBits { dist: u32, m: usize, symbol: u32, i: usize },
+    AlignBits {
+        dist: u32,
+        m: usize,
+        symbol: u32,
+        i: usize,
+    },
     /// Reverse bit-tree decode for spec pos (posSlot 4..13). i tracks bit position.
-    SpecPosBits { dist: u32, probs_offset: usize, m: usize, symbol: u32, i: usize, num_bits: usize },
+    SpecPosBits {
+        dist: u32,
+        probs_offset: usize,
+        m: usize,
+        symbol: u32,
+        i: usize,
+        num_bits: usize,
+    },
 }
 
 impl LzmaDecoder {
@@ -436,11 +470,7 @@ impl LzmaDecoder {
     /// Decode from input into the internal window. Returns status.
     ///
     /// After calling this, use `drain_output()` to get decompressed bytes.
-    pub fn decode(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> LzmaDecodeResult {
+    pub fn decode(&mut self, input: &[u8], output: &mut [u8]) -> LzmaDecodeResult {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
@@ -529,7 +559,8 @@ impl LzmaDecoder {
                     // Check end conditions
                     if let Some(unpack) = self.unpack_size {
                         if self.decoded_size >= unpack {
-                            self.phase = DecodePhase::Finished(LzmaDecodeStatus::FinishedWithoutMark);
+                            self.phase =
+                                DecodePhase::Finished(LzmaDecodeStatus::FinishedWithoutMark);
                             continue;
                         }
                     }
@@ -538,11 +569,10 @@ impl LzmaDecoder {
 
                     // Decode IsMatch
                     let prob_idx = OFF_IS_MATCH + state2;
-                    match self.range_decoder.decode_bit(
-                        &mut self.probs[prob_idx],
-                        input,
-                        in_pos,
-                    ) {
+                    match self
+                        .range_decoder
+                        .decode_bit(&mut self.probs[prob_idx], input, in_pos)
+                    {
                         Err(_) => {
                             return LzmaDecodeResult {
                                 bytes_consumed: in_pos,
@@ -591,7 +621,8 @@ impl LzmaDecoder {
                                         continue;
                                     }
                                     // Rep match - need to decode which rep
-                                    let result = self.decode_rep_type(input, &mut in_pos, pos_state);
+                                    let result =
+                                        self.decode_rep_type(input, &mut in_pos, pos_state);
                                     match result {
                                         Ok(()) => continue,
                                         Err(_) => {
@@ -611,11 +642,10 @@ impl LzmaDecoder {
                 DecodePhase::NeedIsRep { pos_state } => {
                     // Resume: IsMatch=1 was decoded, now decode IsRep.
                     let prob_idx = OFF_IS_REP + self.state as usize;
-                    match self.range_decoder.decode_bit(
-                        &mut self.probs[prob_idx],
-                        input,
-                        in_pos,
-                    ) {
+                    match self
+                        .range_decoder
+                        .decode_bit(&mut self.probs[prob_idx], input, in_pos)
+                    {
                         Err(_) => {
                             // Still need input for IsRep
                             return LzmaDecodeResult {
@@ -718,7 +748,12 @@ impl LzmaDecoder {
 
                 DecodePhase::Literal(ref ls) => {
                     let ls = ls.clone();
-                    let result = self.continue_literal_decode(input, &mut in_pos, &mut output[out_pos..], ls);
+                    let result = self.continue_literal_decode(
+                        input,
+                        &mut in_pos,
+                        &mut output[out_pos..],
+                        ls,
+                    );
                     match result {
                         Ok(produced) => {
                             out_pos += produced;
@@ -783,13 +818,13 @@ impl LzmaDecoder {
                         Ok(dist) => {
                             if dist == 0xFFFF_FFFF {
                                 // End marker
-                                self.phase = DecodePhase::Finished(
-                                    LzmaDecodeStatus::FinishedWithMark,
-                                );
+                                self.phase =
+                                    DecodePhase::Finished(LzmaDecodeStatus::FinishedWithMark);
                                 continue;
                             }
                             if dist >= self.dict_size || !self.window.check_distance(dist) {
-                                self.phase = DecodePhase::Finished(LzmaDecodeStatus::FinishedWithMark);
+                                self.phase =
+                                    DecodePhase::Finished(LzmaDecodeStatus::FinishedWithMark);
                                 continue;
                             }
                             self.reps[0] = dist;
@@ -855,11 +890,10 @@ impl LzmaDecoder {
 
                 let prob_idx =
                     lit_probs_offset + ((1 + match_bit as usize) << 8) + ls.symbol as usize;
-                match self.range_decoder.decode_bit(
-                    &mut self.probs[prob_idx],
-                    input,
-                    *in_pos,
-                ) {
+                match self
+                    .range_decoder
+                    .decode_bit(&mut self.probs[prob_idx], input, *in_pos)
+                {
                     Err(_) => {
                         // Don't shift match_byte -- decode_bit didn't succeed
                         self.phase = DecodePhase::Literal(ls);
@@ -883,11 +917,10 @@ impl LzmaDecoder {
         // Normal literal decoding (or continuation after matched diverged)
         while ls.symbol < 0x100 {
             let prob_idx = lit_probs_offset + ls.symbol as usize;
-            match self.range_decoder.decode_bit(
-                &mut self.probs[prob_idx],
-                input,
-                *in_pos,
-            ) {
+            match self
+                .range_decoder
+                .decode_bit(&mut self.probs[prob_idx], input, *in_pos)
+            {
                 Err(_) => {
                     ls.matched = false;
                     self.phase = DecodePhase::Literal(ls);
@@ -931,14 +964,13 @@ impl LzmaDecoder {
 
         // IsRepG0
         let prob_idx = OFF_IS_REP_G0 + self.state as usize;
-        let (is_rep_g0, consumed) = self.range_decoder.decode_bit(
-            &mut self.probs[prob_idx],
-            input,
-            *in_pos,
-        ).map_err(|_| {
-            self.phase = DecodePhase::NeedRepG0 { pos_state };
-            RangeCoderStatus::NeedInput
-        })?;
+        let (is_rep_g0, consumed) = self
+            .range_decoder
+            .decode_bit(&mut self.probs[prob_idx], input, *in_pos)
+            .map_err(|_| {
+                self.phase = DecodePhase::NeedRepG0 { pos_state };
+                RangeCoderStatus::NeedInput
+            })?;
         *in_pos += consumed;
 
         if is_rep_g0 == 0 {
@@ -958,14 +990,13 @@ impl LzmaDecoder {
         // Distance is rep0; need to decode IsRep0Long
         let state2 = (self.state as usize) * K_NUM_POS_STATES_MAX + pos_state;
         let prob_idx = OFF_IS_REP0_LONG + state2;
-        let (is_long, consumed) = self.range_decoder.decode_bit(
-            &mut self.probs[prob_idx],
-            input,
-            *in_pos,
-        ).map_err(|_| {
-            self.phase = DecodePhase::NeedRep0Long { pos_state };
-            RangeCoderStatus::NeedInput
-        })?;
+        let (is_long, consumed) = self
+            .range_decoder
+            .decode_bit(&mut self.probs[prob_idx], input, *in_pos)
+            .map_err(|_| {
+                self.phase = DecodePhase::NeedRep0Long { pos_state };
+                RangeCoderStatus::NeedInput
+            })?;
         *in_pos += consumed;
 
         if is_long == 0 {
@@ -995,14 +1026,13 @@ impl LzmaDecoder {
         pos_state: usize,
     ) -> Result<(), RangeCoderStatus> {
         let prob_idx = OFF_IS_REP_G1 + self.state as usize;
-        let (is_rep_g1, consumed) = self.range_decoder.decode_bit(
-            &mut self.probs[prob_idx],
-            input,
-            *in_pos,
-        ).map_err(|_| {
-            self.phase = DecodePhase::NeedRepG1 { pos_state };
-            RangeCoderStatus::NeedInput
-        })?;
+        let (is_rep_g1, consumed) = self
+            .range_decoder
+            .decode_bit(&mut self.probs[prob_idx], input, *in_pos)
+            .map_err(|_| {
+                self.phase = DecodePhase::NeedRepG1 { pos_state };
+                RangeCoderStatus::NeedInput
+            })?;
         *in_pos += consumed;
 
         if is_rep_g1 == 0 {
@@ -1029,14 +1059,13 @@ impl LzmaDecoder {
         pos_state: usize,
     ) -> Result<(), RangeCoderStatus> {
         let prob_idx = OFF_IS_REP_G2 + self.state as usize;
-        let (is_rep_g2, consumed) = self.range_decoder.decode_bit(
-            &mut self.probs[prob_idx],
-            input,
-            *in_pos,
-        ).map_err(|_| {
-            self.phase = DecodePhase::NeedRepG2 { pos_state };
-            RangeCoderStatus::NeedInput
-        })?;
+        let (is_rep_g2, consumed) = self
+            .range_decoder
+            .decode_bit(&mut self.probs[prob_idx], input, *in_pos)
+            .map_err(|_| {
+                self.phase = DecodePhase::NeedRepG2 { pos_state };
+                RangeCoderStatus::NeedInput
+            })?;
         *in_pos += consumed;
 
         if is_rep_g2 == 0 {
@@ -1099,18 +1128,17 @@ impl LzmaDecoder {
 
         match lds.phase {
             LenPhase::Choice => {
-                let (choice, consumed) = self.range_decoder.decode_bit(
-                    &mut self.probs[choice_idx],
-                    input,
-                    *in_pos,
-                ).map_err(|_| {
-                    self.len_decode_state = Some(LenDecodeState {
-                        is_rep: lds.is_rep,
-                        pos_state: lds.pos_state,
-                        phase: LenPhase::Choice,
-                    });
-                    RangeCoderStatus::NeedInput
-                })?;
+                let (choice, consumed) = self
+                    .range_decoder
+                    .decode_bit(&mut self.probs[choice_idx], input, *in_pos)
+                    .map_err(|_| {
+                        self.len_decode_state = Some(LenDecodeState {
+                            is_rep: lds.is_rep,
+                            pos_state: lds.pos_state,
+                            phase: LenPhase::Choice,
+                        });
+                        RangeCoderStatus::NeedInput
+                    })?;
                 *in_pos += consumed;
 
                 if choice == 0 {
@@ -1134,21 +1162,23 @@ impl LzmaDecoder {
                 self.decode_length(input, in_pos)
             }
 
-            LenPhase::Low { mut m, mut bits_remaining } => {
+            LenPhase::Low {
+                mut m,
+                mut bits_remaining,
+            } => {
                 let probs_base = low_base + lds.pos_state * K_LEN_NUM_LOW_SYMBOLS;
                 while bits_remaining > 0 {
-                    let (bit, consumed) = self.range_decoder.decode_bit(
-                        &mut self.probs[probs_base + m],
-                        input,
-                        *in_pos,
-                    ).map_err(|_| {
-                        self.len_decode_state = Some(LenDecodeState {
-                            is_rep: lds.is_rep,
-                            pos_state: lds.pos_state,
-                            phase: LenPhase::Low { m, bits_remaining },
-                        });
-                        RangeCoderStatus::NeedInput
-                    })?;
+                    let (bit, consumed) = self
+                        .range_decoder
+                        .decode_bit(&mut self.probs[probs_base + m], input, *in_pos)
+                        .map_err(|_| {
+                            self.len_decode_state = Some(LenDecodeState {
+                                is_rep: lds.is_rep,
+                                pos_state: lds.pos_state,
+                                phase: LenPhase::Low { m, bits_remaining },
+                            });
+                            RangeCoderStatus::NeedInput
+                        })?;
                     *in_pos += consumed;
                     m = (m << 1) + bit as usize;
                     bits_remaining -= 1;
@@ -1157,18 +1187,17 @@ impl LzmaDecoder {
             }
 
             LenPhase::Choice2 => {
-                let (choice2, consumed) = self.range_decoder.decode_bit(
-                    &mut self.probs[choice2_idx],
-                    input,
-                    *in_pos,
-                ).map_err(|_| {
-                    self.len_decode_state = Some(LenDecodeState {
-                        is_rep: lds.is_rep,
-                        pos_state: lds.pos_state,
-                        phase: LenPhase::Choice2,
-                    });
-                    RangeCoderStatus::NeedInput
-                })?;
+                let (choice2, consumed) = self
+                    .range_decoder
+                    .decode_bit(&mut self.probs[choice2_idx], input, *in_pos)
+                    .map_err(|_| {
+                        self.len_decode_state = Some(LenDecodeState {
+                            is_rep: lds.is_rep,
+                            pos_state: lds.pos_state,
+                            phase: LenPhase::Choice2,
+                        });
+                        RangeCoderStatus::NeedInput
+                    })?;
                 *in_pos += consumed;
 
                 if choice2 == 0 {
@@ -1195,21 +1224,23 @@ impl LzmaDecoder {
                 self.decode_length(input, in_pos)
             }
 
-            LenPhase::Mid { mut m, mut bits_remaining } => {
+            LenPhase::Mid {
+                mut m,
+                mut bits_remaining,
+            } => {
                 let probs_base = mid_base + lds.pos_state * K_LEN_NUM_MID_SYMBOLS;
                 while bits_remaining > 0 {
-                    let (bit, consumed) = self.range_decoder.decode_bit(
-                        &mut self.probs[probs_base + m],
-                        input,
-                        *in_pos,
-                    ).map_err(|_| {
-                        self.len_decode_state = Some(LenDecodeState {
-                            is_rep: lds.is_rep,
-                            pos_state: lds.pos_state,
-                            phase: LenPhase::Mid { m, bits_remaining },
-                        });
-                        RangeCoderStatus::NeedInput
-                    })?;
+                    let (bit, consumed) = self
+                        .range_decoder
+                        .decode_bit(&mut self.probs[probs_base + m], input, *in_pos)
+                        .map_err(|_| {
+                            self.len_decode_state = Some(LenDecodeState {
+                                is_rep: lds.is_rep,
+                                pos_state: lds.pos_state,
+                                phase: LenPhase::Mid { m, bits_remaining },
+                            });
+                            RangeCoderStatus::NeedInput
+                        })?;
                     *in_pos += consumed;
                     m = (m << 1) + bit as usize;
                     bits_remaining -= 1;
@@ -1217,20 +1248,22 @@ impl LzmaDecoder {
                 Ok(m - K_LEN_NUM_MID_SYMBOLS + K_LEN_NUM_LOW_SYMBOLS)
             }
 
-            LenPhase::High { mut m, mut bits_remaining } => {
+            LenPhase::High {
+                mut m,
+                mut bits_remaining,
+            } => {
                 while bits_remaining > 0 {
-                    let (bit, consumed) = self.range_decoder.decode_bit(
-                        &mut self.probs[high_base + m],
-                        input,
-                        *in_pos,
-                    ).map_err(|_| {
-                        self.len_decode_state = Some(LenDecodeState {
-                            is_rep: lds.is_rep,
-                            pos_state: lds.pos_state,
-                            phase: LenPhase::High { m, bits_remaining },
-                        });
-                        RangeCoderStatus::NeedInput
-                    })?;
+                    let (bit, consumed) = self
+                        .range_decoder
+                        .decode_bit(&mut self.probs[high_base + m], input, *in_pos)
+                        .map_err(|_| {
+                            self.len_decode_state = Some(LenDecodeState {
+                                is_rep: lds.is_rep,
+                                pos_state: lds.pos_state,
+                                phase: LenPhase::High { m, bits_remaining },
+                            });
+                            RangeCoderStatus::NeedInput
+                        })?;
                     *in_pos += consumed;
                     m = (m << 1) + bit as usize;
                     bits_remaining -= 1;
@@ -1248,20 +1281,22 @@ impl LzmaDecoder {
         let dds = self.dist_decode_state.take().unwrap();
 
         match dds.phase {
-            DistPhase::PosSlot { mut m, mut bits_remaining } => {
+            DistPhase::PosSlot {
+                mut m,
+                mut bits_remaining,
+            } => {
                 let probs_base = OFF_POS_SLOT + dds.len_state * (1 << 6);
                 while bits_remaining > 0 {
-                    let (bit, consumed) = self.range_decoder.decode_bit(
-                        &mut self.probs[probs_base + m],
-                        input,
-                        *in_pos,
-                    ).map_err(|_| {
-                        self.dist_decode_state = Some(DistDecodeState {
-                            len_state: dds.len_state,
-                            phase: DistPhase::PosSlot { m, bits_remaining },
-                        });
-                        RangeCoderStatus::NeedInput
-                    })?;
+                    let (bit, consumed) = self
+                        .range_decoder
+                        .decode_bit(&mut self.probs[probs_base + m], input, *in_pos)
+                        .map_err(|_| {
+                            self.dist_decode_state = Some(DistDecodeState {
+                                len_state: dds.len_state,
+                                phase: DistPhase::PosSlot { m, bits_remaining },
+                            });
+                            RangeCoderStatus::NeedInput
+                        })?;
                     *in_pos += consumed;
                     m = (m << 1) + bit as usize;
                     bits_remaining -= 1;
@@ -1310,19 +1345,22 @@ impl LzmaDecoder {
                 self.decode_distance(input, in_pos)
             }
 
-            DistPhase::DirectBits { mut dist, mut num_bits } => {
+            DistPhase::DirectBits {
+                mut dist,
+                mut num_bits,
+            } => {
                 // Each direct bit: dist = (dist << 1) + bit
                 while num_bits > 0 {
-                    let (bit, consumed) = self.range_decoder.decode_direct_bit(
-                        input,
-                        *in_pos,
-                    ).map_err(|_| {
-                        self.dist_decode_state = Some(DistDecodeState {
-                            len_state: dds.len_state,
-                            phase: DistPhase::DirectBits { dist, num_bits },
-                        });
-                        RangeCoderStatus::NeedInput
-                    })?;
+                    let (bit, consumed) = self
+                        .range_decoder
+                        .decode_direct_bit(input, *in_pos)
+                        .map_err(|_| {
+                            self.dist_decode_state = Some(DistDecodeState {
+                                len_state: dds.len_state,
+                                phase: DistPhase::DirectBits { dist, num_bits },
+                            });
+                            RangeCoderStatus::NeedInput
+                        })?;
                     *in_pos += consumed;
                     dist = (dist << 1) + bit;
                     num_bits -= 1;
@@ -1349,17 +1387,16 @@ impl LzmaDecoder {
             } => {
                 // Reverse bit tree decode: 4 bits using AlignDecoder
                 while i < K_NUM_ALIGN_BITS {
-                    let (bit, consumed) = self.range_decoder.decode_bit(
-                        &mut self.probs[OFF_ALIGN + m],
-                        input,
-                        *in_pos,
-                    ).map_err(|_| {
-                        self.dist_decode_state = Some(DistDecodeState {
-                            len_state: dds.len_state,
-                            phase: DistPhase::AlignBits { dist, m, symbol, i },
-                        });
-                        RangeCoderStatus::NeedInput
-                    })?;
+                    let (bit, consumed) = self
+                        .range_decoder
+                        .decode_bit(&mut self.probs[OFF_ALIGN + m], input, *in_pos)
+                        .map_err(|_| {
+                            self.dist_decode_state = Some(DistDecodeState {
+                                len_state: dds.len_state,
+                                phase: DistPhase::AlignBits { dist, m, symbol, i },
+                            });
+                            RangeCoderStatus::NeedInput
+                        })?;
                     *in_pos += consumed;
                     m = (m << 1) + bit as usize;
                     symbol |= bit << i;
@@ -1379,24 +1416,23 @@ impl LzmaDecoder {
             } => {
                 // Reverse bit tree decode using PosDecoders
                 while i < num_bits {
-                    let (bit, consumed) = self.range_decoder.decode_bit(
-                        &mut self.probs[probs_offset + m],
-                        input,
-                        *in_pos,
-                    ).map_err(|_| {
-                        self.dist_decode_state = Some(DistDecodeState {
-                            len_state: dds.len_state,
-                            phase: DistPhase::SpecPosBits {
-                                dist,
-                                probs_offset,
-                                m,
-                                symbol,
-                                i,
-                                num_bits,
-                            },
-                        });
-                        RangeCoderStatus::NeedInput
-                    })?;
+                    let (bit, consumed) = self
+                        .range_decoder
+                        .decode_bit(&mut self.probs[probs_offset + m], input, *in_pos)
+                        .map_err(|_| {
+                            self.dist_decode_state = Some(DistDecodeState {
+                                len_state: dds.len_state,
+                                phase: DistPhase::SpecPosBits {
+                                    dist,
+                                    probs_offset,
+                                    m,
+                                    symbol,
+                                    i,
+                                    num_bits,
+                                },
+                            });
+                            RangeCoderStatus::NeedInput
+                        })?;
                     *in_pos += consumed;
                     m = (m << 1) + bit as usize;
                     symbol |= bit << i;

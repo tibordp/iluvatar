@@ -37,7 +37,4 @@ pub trait Decompressor: Send {
     /// After restoration, the decompressor can resume decompression from
     /// the checkpoint's compressed position.
     fn restore(&mut self, checkpoint: &Checkpoint) -> Result<()>;
-
-    /// Reset the decompressor to its initial state.
-    fn reset(&mut self);
 }

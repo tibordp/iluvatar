@@ -2,6 +2,28 @@ use crate::archive::EntryType;
 use serde::{Deserialize, Serialize};
 
 /// An entry in the archive index, recording a file's metadata and position.
+///
+/// Obtained from [`ArchiveIndex::get()`](crate::ArchiveIndex::get) or
+/// [`ArchiveIndex::list()`](crate::ArchiveIndex::list).
+///
+/// # Example
+///
+/// ```no_run
+/// # fn example(archive: &mut iluvatar::sync::Archive<std::fs::File>) {
+/// use iluvatar::EntryType;
+///
+/// for entry in archive.list() {
+///     match entry.entry_type {
+///         EntryType::Regular => println!("{} ({} bytes)", entry.path, entry.size),
+///         EntryType::Directory => println!("{}/", entry.path),
+///         EntryType::SymLink => {
+///             println!("{} -> {}", entry.path, entry.link_target.as_deref().unwrap_or("?"))
+///         }
+///         _ => println!("{} (special)", entry.path),
+///     }
+/// }
+/// # }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
     /// Full path of the file within the archive.

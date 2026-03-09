@@ -94,7 +94,11 @@ impl Lzma2Decoder {
     pub fn new(dict_size: u32) -> Self {
         let dict_size = dict_size.max(1 << 12);
         // Start with default properties; they'll be set by the first chunk
-        let props = LzmaProperties { lc: 0, lp: 0, pb: 0 };
+        let props = LzmaProperties {
+            lc: 0,
+            lp: 0,
+            pb: 0,
+        };
         Self {
             state: Lzma2State::Control,
             control: 0,
@@ -416,7 +420,9 @@ impl Lzma2Decoder {
                         };
                     }
 
-                    let result = self.decoder.decode(lzma_input, &mut output[out_pos..out_pos + available_out]);
+                    let result = self
+                        .decoder
+                        .decode(lzma_input, &mut output[out_pos..out_pos + available_out]);
                     in_pos += result.bytes_consumed;
                     out_pos += result.bytes_produced;
                     self.chunk_in_consumed += result.bytes_consumed as u32;
@@ -472,7 +478,8 @@ impl Lzma2Decoder {
                             // case where unpack is done but packed bytes remain.
                             continue;
                         }
-                        LzmaDecodeStatus::FinishedWithMark | LzmaDecodeStatus::FinishedWithoutMark => {
+                        LzmaDecodeStatus::FinishedWithMark
+                        | LzmaDecodeStatus::FinishedWithoutMark => {
                             // LZMA decoder finished (produced all unpack_size bytes
                             // or hit an end marker). Skip any remaining packed bytes
                             // that the LZMA range coder didn't consume — the range
@@ -520,7 +527,6 @@ impl Lzma2Decoder {
         self.decoder.dist_decode_state = None;
         self.chunk_in_consumed = 0;
         self.chunk_out_produced = 0;
-
     }
 
     /// Get checkpoint state (all serializable state).

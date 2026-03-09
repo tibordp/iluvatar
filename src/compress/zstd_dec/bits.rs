@@ -65,7 +65,6 @@ impl<'a> ForwardBitReader<'a> {
         }
         Ok(result)
     }
-
 }
 
 /// Backward bit reader for zstd sequence bitstreams.
@@ -226,5 +225,4 @@ mod tests {
         assert_eq!(highest_bit(64), 6);
         assert_eq!(highest_bit(255), 7);
     }
-
 }

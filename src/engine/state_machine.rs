@@ -3,14 +3,14 @@ use crate::archive::{ArchiveEvent, ArchiveFormat, ArchiveParser};
 use crate::compress::checkpoint::{Checkpoint, CheckpointState};
 use crate::compress::decompressor::{DecompressStatus, Decompressor};
 use crate::compress::CompressionFormat;
+use crate::engine::checkpoint_strategy::{
+    default_interval_for_format, CheckpointContext, CheckpointStrategy, FixedInterval,
+};
 use crate::engine::progress::IndexProgress;
 use crate::engine::request::EngineRequest;
-use crate::error::{Result, Error};
+use crate::error::{Error, Result};
 use crate::index::builder::IndexBuilder;
 use crate::index::store::ArchiveIndex;
-
-/// Default checkpoint interval: 1 MiB of uncompressed data.
-pub const DEFAULT_CHECKPOINT_INTERVAL: u64 = 1024 * 1024;
 
 /// Default buffer size for decompression.
 const DECOMPRESS_BUF_SIZE: usize = 64 * 1024;
@@ -26,19 +26,13 @@ fn create_decompressor(format: CompressionFormat) -> Result<Box<dyn Decompressor
         CompressionFormat::Gzip => Ok(Box::new(crate::compress::gzip::GzipDecompressor::new())),
 
         #[cfg(feature = "bz2")]
-        CompressionFormat::Bzip2 => Ok(Box::new(
-            crate::compress::bzip2::Bzip2Decompressor::new(),
-        )),
+        CompressionFormat::Bzip2 => Ok(Box::new(crate::compress::bzip2::Bzip2Decompressor::new())),
 
         #[cfg(feature = "xz")]
-        CompressionFormat::Xz => Ok(Box::new(
-            crate::compress::xz::XzDecompressor::new(),
-        )),
+        CompressionFormat::Xz => Ok(Box::new(crate::compress::xz::XzDecompressor::new())),
 
         #[cfg(feature = "zstandard")]
-        CompressionFormat::Zstd => Ok(Box::new(
-            crate::compress::zstd_dec::ZstdDecompressor::new(),
-        )),
+        CompressionFormat::Zstd => Ok(Box::new(crate::compress::zstd_dec::ZstdDecompressor::new())),
 
         #[allow(unreachable_patterns)]
         _ => Err(Error::UnsupportedFormat),
@@ -68,21 +62,65 @@ enum IndexingState {
 /// Linearly scans a compressed archive to build an index.
 ///
 /// This is a sans-I/O state machine. The caller drives it by:
-/// 1. Calling `step()` to get the next request
-/// 2. Fulfilling the request (providing data, etc.)
-/// 3. Repeating until `Done`
-pub struct IndexingEngine {
+/// 1. Calling [`step()`](Self::step) to get the next [`EngineRequest`]
+/// 2. Fulfilling the request (providing data via [`provide_data()`](Self::provide_data), etc.)
+/// 3. Repeating until [`EngineRequest::Done`]
+/// 4. Calling [`finish()`](Self::finish) to get the completed [`ArchiveIndex`]
+///
+/// The type parameter `S` controls when decompressor checkpoints are
+/// created. Use [`IndexingEngine::new`] for the format-aware default
+/// ([`FixedInterval`]) or [`IndexingEngine::with_strategy`] for a
+/// custom strategy.
+///
+/// # Example
+///
+/// ```
+/// # fn example() -> iluvatar::Result<()> {
+/// use iluvatar::{IndexingEngine, EngineRequest, CompressionFormat};
+///
+/// # let compressed_data: &[u8] = &[];
+/// # let file_size = 0u64;
+/// let mut engine = IndexingEngine::new(
+///     CompressionFormat::Gzip,
+///     None, // auto-detect archive format
+///     file_size,
+/// )?;
+///
+/// let mut offset = 0;
+/// loop {
+///     match engine.step() {
+///         EngineRequest::NeedInput => {
+///             if offset >= compressed_data.len() {
+///                 engine.signal_eof();
+///             } else {
+///                 let end = (offset + 8192).min(compressed_data.len());
+///                 engine.provide_data(&compressed_data[offset..end]);
+///                 offset = end;
+///             }
+///         }
+///         EngineRequest::Done => break,
+///         EngineRequest::Error(e) => return Err(e),
+///         _ => {}
+///     }
+/// }
+///
+/// let index = engine.finish();
+/// # Ok(())
+/// # }
+/// ```
+pub struct IndexingEngine<S: CheckpointStrategy = FixedInterval> {
     decompressor: Box<dyn Decompressor>,
     archive_parser: Option<Box<dyn ArchiveParser>>,
     archive_format: Option<ArchiveFormat>,
     index_builder: IndexBuilder,
     /// Buffer for archive format auto-detection.
     detect_buf: Vec<u8>,
-    checkpoint_interval: u64,
+    strategy: S,
     compression: CompressionFormat,
     compressed_pos: u64,
     uncompressed_pos: u64,
     last_checkpoint_pos: u64,
+    total_checkpoint_data_bytes: u64,
     archive_size: u64,
     state: IndexingState,
     /// Compressed input buffer (data provided by caller).
@@ -93,17 +131,41 @@ pub struct IndexingEngine {
     eof: bool,
 }
 
-impl IndexingEngine {
-    /// Create a new indexing engine.
+impl IndexingEngine<FixedInterval> {
+    /// Create a new indexing engine with the default checkpoint strategy
+    /// for the given compression format.
+    ///
+    /// Uses [`FixedInterval`] with a format-aware interval:
+    /// 1 MiB for bzip2, 16 MiB for gzip, 64 MiB for zstd/xz.
     ///
     /// `compression` - compression format of the archive
     /// `archive_format` - archive container format, or `None` to auto-detect
-    /// `checkpoint_interval` - bytes of uncompressed data between checkpoints
     /// `archive_size` - total size of the compressed archive (for index metadata)
     pub fn new(
         compression: CompressionFormat,
         archive_format: Option<ArchiveFormat>,
-        checkpoint_interval: u64,
+        archive_size: u64,
+    ) -> Result<Self> {
+        Self::with_strategy(
+            compression,
+            archive_format,
+            FixedInterval::new(default_interval_for_format(compression)),
+            archive_size,
+        )
+    }
+}
+
+impl<S: CheckpointStrategy> IndexingEngine<S> {
+    /// Create a new indexing engine with a custom checkpoint strategy.
+    ///
+    /// `compression` - compression format of the archive
+    /// `archive_format` - archive container format, or `None` to auto-detect
+    /// `strategy` - controls when decompressor checkpoints are created
+    /// `archive_size` - total size of the compressed archive (for index metadata)
+    pub fn with_strategy(
+        compression: CompressionFormat,
+        archive_format: Option<ArchiveFormat>,
+        strategy: S,
         archive_size: u64,
     ) -> Result<Self> {
         let decompressor = create_decompressor(compression)?;
@@ -131,11 +193,12 @@ impl IndexingEngine {
                 IndexBuilder::new(compression, ArchiveFormat::Tar, archive_size)
             }),
             detect_buf,
-            checkpoint_interval,
+            strategy,
             compression,
             compressed_pos: 0,
             uncompressed_pos: 0,
             last_checkpoint_pos: 0,
+            total_checkpoint_data_bytes: 0,
             archive_size,
             state: IndexingState::NeedInput,
             input_buf: Vec::new(),
@@ -169,7 +232,10 @@ impl IndexingEngine {
             return EngineRequest::NeedInput;
         };
 
-        let result = match self.decompressor.decompress(input, &mut self.decompress_buf) {
+        let result = match self
+            .decompressor
+            .decompress(input, &mut self.decompress_buf)
+        {
             Ok(r) => r,
             Err(e) => return EngineRequest::Error(e),
         };
@@ -188,8 +254,7 @@ impl IndexingEngine {
                 if let Some(af) = crate::archive::detect::detect_archive_format(&self.detect_buf) {
                     self.archive_format = Some(af);
                     self.archive_parser = Some(create_archive_parser(af));
-                    self.index_builder =
-                        IndexBuilder::new(self.compression, af, self.archive_size);
+                    self.index_builder = IndexBuilder::new(self.compression, af, self.archive_size);
                     self.index_builder.add_checkpoint(Checkpoint {
                         compressed_offset: 0,
                         bit_offset: 0,
@@ -206,14 +271,34 @@ impl IndexingEngine {
                 // Not enough data yet — continue decompressing
             } else {
                 // Check if we should take a checkpoint
-                if self.uncompressed_pos - self.last_checkpoint_pos >= self.checkpoint_interval {
+                let ctx = CheckpointContext {
+                    uncompressed_pos: self.uncompressed_pos,
+                    compressed_pos: self.compressed_pos,
+                    last_checkpoint_uncompressed_pos: self.last_checkpoint_pos,
+                    checkpoint_count: self.index_builder.checkpoint_count(),
+                    total_checkpoint_data_bytes: self.total_checkpoint_data_bytes,
+                    archive_size: self.archive_size,
+                };
+                if self.strategy.should_checkpoint(&ctx) {
                     match self
                         .decompressor
                         .checkpoint(self.compressed_pos, self.uncompressed_pos)
                     {
                         Ok(cp) => {
+                            let cp_size = cp.estimated_size();
+                            self.total_checkpoint_data_bytes += cp_size as u64;
                             self.index_builder.add_checkpoint(cp);
                             self.last_checkpoint_pos = self.uncompressed_pos;
+
+                            let ctx = CheckpointContext {
+                                uncompressed_pos: self.uncompressed_pos,
+                                compressed_pos: self.compressed_pos,
+                                last_checkpoint_uncompressed_pos: self.last_checkpoint_pos,
+                                checkpoint_count: self.index_builder.checkpoint_count(),
+                                total_checkpoint_data_bytes: self.total_checkpoint_data_bytes,
+                                archive_size: self.archive_size,
+                            };
+                            self.strategy.on_checkpoint_created(&ctx, cp_size);
                         }
                         Err(e) => return EngineRequest::Error(e),
                     }
@@ -318,6 +403,9 @@ impl IndexingEngine {
     }
 
     /// Provide compressed data to the engine.
+    ///
+    /// Call this after [`step()`](Self::step) returns [`EngineRequest::NeedInput`].
+    /// The engine copies the data internally, so the caller's buffer can be reused.
     pub fn provide_data(&mut self, data: &[u8]) {
         self.input_buf.clear();
         self.input_buf.extend_from_slice(data);
@@ -325,13 +413,20 @@ impl IndexingEngine {
         self.state = IndexingState::Processing;
     }
 
-    /// Signal that we've reached the end of the compressed stream.
+    /// Signal that the end of the compressed stream has been reached.
+    ///
+    /// Call this instead of [`provide_data()`](Self::provide_data) when
+    /// the reader returns zero bytes (EOF). The engine may still need
+    /// a few more [`step()`](Self::step) calls to drain internally
+    /// buffered output.
     pub fn signal_eof(&mut self) {
         self.eof = true;
         self.state = IndexingState::Processing;
     }
 
-    /// Consume the engine and return the built index.
+    /// Consume the engine and return the completed index.
+    ///
+    /// Call this after [`step()`](Self::step) returns [`EngineRequest::Done`].
     pub fn finish(self) -> ArchiveIndex {
         self.index_builder.finish(self.uncompressed_pos)
     }
@@ -346,6 +441,7 @@ impl IndexingEngine {
             uncompressed_bytes_processed: self.uncompressed_pos,
             entries_found: self.index_builder.entry_count(),
             checkpoints_created: self.index_builder.checkpoint_count(),
+            checkpoint_data_bytes: self.total_checkpoint_data_bytes,
             last_entry_path: self.index_builder.last_entry_path().map(|s| s.to_owned()),
             is_complete: matches!(self.state, IndexingState::Done),
         }
@@ -391,10 +487,59 @@ enum ReadState {
     Done,
 }
 
-/// Reads a specific file from a compressed tar archive using an index.
+/// Reads a specific file from a compressed archive using an index.
 ///
-/// Sans-I/O: the caller provides compressed data when requested,
-/// and reads decompressed output when available.
+/// Sans-I/O state machine: the caller provides compressed data when
+/// requested and reads decompressed output when available.
+///
+/// The read loop follows the same pattern as [`IndexingEngine`], but with
+/// the addition of [`EngineRequest::SeekAndRead`] (which asks the caller
+/// to seek in the compressed stream) and [`EngineRequest::OutputReady`]
+/// (which signals decompressed file data is available via
+/// [`read_output()`](Self::read_output)).
+///
+/// # Example
+///
+/// ```
+/// # fn example(index: &iluvatar::ArchiveIndex, compressed: &[u8]) -> iluvatar::Result<Vec<u8>> {
+/// use iluvatar::{ReadEngine, EngineRequest};
+///
+/// let mut engine = ReadEngine::new(index, "path/to/file.txt")?;
+/// let mut result = Vec::new();
+/// let mut offset = 0;
+///
+/// loop {
+///     match engine.step() {
+///         EngineRequest::NeedInput => {
+///             if offset >= compressed.len() {
+///                 engine.signal_eof();
+///             } else {
+///                 let end = (offset + 8192).min(compressed.len());
+///                 engine.provide_data(&compressed[offset..end]);
+///                 offset = end;
+///             }
+///         }
+///         EngineRequest::SeekAndRead { offset: off, len } => {
+///             let start = off as usize;
+///             let end = (start + len).min(compressed.len());
+///             engine.provide_data(&compressed[start..end]);
+///             offset = end;
+///         }
+///         EngineRequest::OutputReady => {
+///             let mut buf = [0u8; 8192];
+///             loop {
+///                 let n = engine.read_output(&mut buf);
+///                 if n == 0 { break; }
+///                 result.extend_from_slice(&buf[..n]);
+///             }
+///         }
+///         EngineRequest::Done => break,
+///         EngineRequest::Error(e) => return Err(e),
+///     }
+/// }
+/// # Ok(result)
+/// # }
+/// ```
 pub struct ReadEngine {
     decompressor: Box<dyn Decompressor>,
     checkpoint: Checkpoint,
@@ -456,12 +601,7 @@ impl ReadEngine {
     /// `file_offset` and `len` are clamped to the file's size.
     /// If `file_offset >= file size`, the engine completes immediately
     /// with zero output.
-    pub fn new_range(
-        index: &ArchiveIndex,
-        path: &str,
-        file_offset: u64,
-        len: u64,
-    ) -> Result<Self> {
+    pub fn new_range(index: &ArchiveIndex, path: &str, file_offset: u64, len: u64) -> Result<Self> {
         let entry = index
             .get(path)
             .ok_or_else(|| Error::FileNotFound(path.into()))?;
@@ -584,6 +724,10 @@ impl ReadEngine {
     }
 
     /// Provide compressed data to the engine.
+    ///
+    /// Call this after [`step()`](Self::step) returns [`EngineRequest::NeedInput`]
+    /// or [`EngineRequest::SeekAndRead`]. For `SeekAndRead`, seek to the
+    /// requested offset first, then provide the bytes read from that position.
     pub fn provide_data(&mut self, data: &[u8]) {
         self.input_buf.clear();
         self.input_buf.extend_from_slice(data);
@@ -606,7 +750,10 @@ impl ReadEngine {
         }
     }
 
-    /// Signal end of compressed input.
+    /// Signal that the end of the compressed stream has been reached.
+    ///
+    /// Call this instead of [`provide_data()`](Self::provide_data) when
+    /// the reader returns zero bytes.
     pub fn signal_eof(&mut self) {
         self.eof = true;
     }
@@ -693,15 +840,11 @@ impl ReadEngine {
                         match &self.state {
                             ReadState::DecompressingToTarget { skip_remaining } => {
                                 let s = *skip_remaining;
-                                self.state = ReadState::NeedInput {
-                                    skip_remaining: s,
-                                };
+                                self.state = ReadState::NeedInput { skip_remaining: s };
                             }
                             ReadState::EmittingData { data_remaining } => {
                                 let d = *data_remaining;
-                                self.state = ReadState::NeedInputEmitting {
-                                    data_remaining: d,
-                                };
+                                self.state = ReadState::NeedInputEmitting { data_remaining: d };
                             }
                             _ => {}
                         }
@@ -778,9 +921,7 @@ mod tests {
 
     /// Helper: drive indexing engine with in-memory data.
     fn index_from_bytes(data: &[u8], format: CompressionFormat) -> ArchiveIndex {
-        let mut engine =
-            IndexingEngine::new(format, None, DEFAULT_CHECKPOINT_INTERVAL, data.len() as u64)
-                .unwrap();
+        let mut engine = IndexingEngine::new(format, None, data.len() as u64).unwrap();
         let mut offset = 0;
         let chunk_size = 8192;
 

@@ -1,6 +1,9 @@
 use super::CompressionFormat;
 
-/// Minimum number of bytes needed to detect compression format.
+/// Minimum number of bytes needed to reliably detect the compression format.
+///
+/// Six bytes covers the longest magic number (XZ: `fd 37 7a 58 5a 00`).
+/// Fewer bytes may still detect some formats (gzip needs only 2).
 pub const DETECT_MIN_BYTES: usize = 6;
 
 /// Detect the compression format from the first few bytes of a stream.
@@ -64,7 +67,10 @@ mod tests {
 
     #[test]
     fn test_detect_gzip() {
-        assert_eq!(detect_format(&[0x1f, 0x8b, 0x08]), Some(CompressionFormat::Gzip));
+        assert_eq!(
+            detect_format(&[0x1f, 0x8b, 0x08]),
+            Some(CompressionFormat::Gzip)
+        );
     }
 
     #[test]

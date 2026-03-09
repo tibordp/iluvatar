@@ -1,11 +1,11 @@
-use std::fs::File;
-use std::io::Write;
 use iluvatar::archive::ArchiveFormat;
 use iluvatar::compress::CompressionFormat;
 use iluvatar::engine::request::EngineRequest;
-use iluvatar::engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
+use iluvatar::engine::state_machine::{IndexingEngine, ReadEngine};
 use iluvatar::index::store::ArchiveIndex;
 use iluvatar::sync::Archive;
+use std::fs::File;
+use std::io::Write;
 use tempfile::NamedTempFile;
 
 // ─── Helpers ───
@@ -30,24 +30,25 @@ fn create_tar_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// Create a gzip-compressed tar archive.
+#[cfg(feature = "gzip")]
 fn create_tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
     let tar_data = create_tar_bytes(files);
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&tar_data).unwrap();
     encoder.finish().unwrap()
 }
 
 /// Create a bzip2-compressed tar archive.
+#[cfg(feature = "bz2")]
 fn create_tar_bz2(files: &[(&str, &[u8])]) -> Vec<u8> {
     let tar_data = create_tar_bytes(files);
-    let mut encoder =
-        bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
     encoder.write_all(&tar_data).unwrap();
     encoder.finish().unwrap()
 }
 
 /// Create an xz-compressed tar archive.
+#[cfg(feature = "xz")]
 fn create_tar_xz(files: &[(&str, &[u8])]) -> Vec<u8> {
     let tar_data = create_tar_bytes(files);
     let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
@@ -56,6 +57,7 @@ fn create_tar_xz(files: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// Create a zstd-compressed tar archive.
+#[cfg(feature = "zstandard")]
 fn create_tar_zst(files: &[(&str, &[u8])]) -> Vec<u8> {
     let tar_data = create_tar_bytes(files);
     zstd::encode_all(std::io::Cursor::new(&tar_data), 3).unwrap()
@@ -71,8 +73,7 @@ fn write_temp(data: &[u8]) -> NamedTempFile {
 
 /// Drive indexing engine with in-memory data.
 fn index_in_memory(data: &[u8], format: CompressionFormat) -> ArchiveIndex {
-    let mut engine =
-        IndexingEngine::new(format, None, DEFAULT_CHECKPOINT_INTERVAL, data.len() as u64).unwrap();
+    let mut engine = IndexingEngine::new(format, None, data.len() as u64).unwrap();
     let mut offset = 0;
     let chunk_size = 8192;
 
@@ -201,15 +202,10 @@ fn test_files() -> Vec<(&'static str, Vec<u8>)> {
         ("hello.txt", b"Hello, world!".to_vec()),
         ("data.bin", (0..1000).map(|i| (i % 256) as u8).collect()),
         ("empty.txt", Vec::new()),
-        (
-            "subdir/nested.txt",
-            b"This is a nested file.".to_vec(),
-        ),
+        ("subdir/nested.txt", b"This is a nested file.".to_vec()),
         (
             "large.txt",
-            (0..50000)
-                .map(|i| b"abcdefghij\n"[i % 11])
-                .collect(),
+            (0..50000).map(|i| b"abcdefghij\n"[i % 11]).collect(),
         ),
     ]
 }
@@ -231,7 +227,12 @@ fn test_uncompressed_index_and_read() {
 
     for (path, expected) in &files {
         let entry = index.get(path).unwrap();
-        assert_eq!(entry.size, expected.len() as u64, "size mismatch for {}", path);
+        assert_eq!(
+            entry.size,
+            expected.len() as u64,
+            "size mismatch for {}",
+            path
+        );
 
         let content = read_in_memory(&tar_data, &index, path);
         assert_eq!(&content, expected, "content mismatch for {}", path);
@@ -240,6 +241,7 @@ fn test_uncompressed_index_and_read() {
 
 // ─── Gzip Tests ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_gzip_index_and_read() {
     let files = test_files();
@@ -251,7 +253,12 @@ fn test_gzip_index_and_read() {
 
     for (path, expected) in &files {
         let entry = index.get(path).unwrap();
-        assert_eq!(entry.size, expected.len() as u64, "size mismatch for {}", path);
+        assert_eq!(
+            entry.size,
+            expected.len() as u64,
+            "size mismatch for {}",
+            path
+        );
 
         let content = read_in_memory(&compressed, &index, path);
         assert_eq!(&content, expected, "content mismatch for {}", path);
@@ -260,6 +267,7 @@ fn test_gzip_index_and_read() {
 
 // ─── Bzip2 Tests ───
 
+#[cfg(feature = "bz2")]
 #[test]
 fn test_bzip2_index_and_read() {
     let files = test_files();
@@ -271,7 +279,12 @@ fn test_bzip2_index_and_read() {
 
     for (path, expected) in &files {
         let entry = index.get(path).unwrap();
-        assert_eq!(entry.size, expected.len() as u64, "size mismatch for {}", path);
+        assert_eq!(
+            entry.size,
+            expected.len() as u64,
+            "size mismatch for {}",
+            path
+        );
 
         let content = read_in_memory(&compressed, &index, path);
         assert_eq!(&content, expected, "content mismatch for {}", path);
@@ -280,6 +293,7 @@ fn test_bzip2_index_and_read() {
 
 // ─── XZ Tests ───
 
+#[cfg(feature = "xz")]
 #[test]
 fn test_xz_index_and_read() {
     let files = test_files();
@@ -291,7 +305,12 @@ fn test_xz_index_and_read() {
 
     for (path, expected) in &files {
         let entry = index.get(path).unwrap();
-        assert_eq!(entry.size, expected.len() as u64, "size mismatch for {}", path);
+        assert_eq!(
+            entry.size,
+            expected.len() as u64,
+            "size mismatch for {}",
+            path
+        );
 
         let content = read_in_memory(&compressed, &index, path);
         assert_eq!(&content, expected, "content mismatch for {}", path);
@@ -300,6 +319,7 @@ fn test_xz_index_and_read() {
 
 // ─── Zstd Tests ───
 
+#[cfg(feature = "zstandard")]
 #[test]
 fn test_zstd_index_and_read() {
     let files = test_files();
@@ -311,7 +331,12 @@ fn test_zstd_index_and_read() {
 
     for (path, expected) in &files {
         let entry = index.get(path).unwrap();
-        assert_eq!(entry.size, expected.len() as u64, "size mismatch for {}", path);
+        assert_eq!(
+            entry.size,
+            expected.len() as u64,
+            "size mismatch for {}",
+            path
+        );
 
         let content = read_in_memory(&compressed, &index, path);
         assert_eq!(&content, expected, "content mismatch for {}", path);
@@ -320,6 +345,7 @@ fn test_zstd_index_and_read() {
 
 // ─── SyncArchive Tests ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_sync_archive_gzip() {
     let files = test_files();
@@ -336,6 +362,7 @@ fn test_sync_archive_gzip() {
     }
 }
 
+#[cfg(feature = "bz2")]
 #[test]
 fn test_sync_archive_bzip2() {
     let files = test_files();
@@ -352,6 +379,7 @@ fn test_sync_archive_bzip2() {
     }
 }
 
+#[cfg(feature = "xz")]
 #[test]
 fn test_sync_archive_xz() {
     let files = test_files();
@@ -368,6 +396,7 @@ fn test_sync_archive_xz() {
     }
 }
 
+#[cfg(feature = "zstandard")]
 #[test]
 fn test_sync_archive_zstd() {
     let files = test_files();
@@ -402,6 +431,7 @@ fn test_sync_archive_uncompressed() {
 
 // ─── Index Persistence Tests ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_index_save_and_load() {
     let files = test_files();
@@ -435,6 +465,7 @@ fn test_index_save_and_load() {
 
 // ─── Checkpoint Tests ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_checkpoints_created() {
     let files = test_files();
@@ -443,9 +474,13 @@ fn test_checkpoints_created() {
 
     // Use small checkpoint interval to force multiple checkpoints
     let index = {
-        let mut engine =
-            IndexingEngine::new(CompressionFormat::Gzip, None, 1024, compressed.len() as u64)
-                .unwrap();
+        let mut engine = IndexingEngine::with_strategy(
+            CompressionFormat::Gzip,
+            None,
+            iluvatar::FixedInterval::new(1024),
+            compressed.len() as u64,
+        )
+        .unwrap();
         let mut offset = 0;
         loop {
             match engine.step() {
@@ -485,6 +520,7 @@ fn test_checkpoints_created() {
     }
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_checkpoint_with_sync_archive() {
     let files = test_files();
@@ -493,7 +529,11 @@ fn test_checkpoint_with_sync_archive() {
     let tmp = write_temp(&compressed);
 
     // Small checkpoint interval
-    let mut archive = Archive::new_with_interval(File::open(tmp.path()).unwrap(), 1024).unwrap();
+    let mut archive = Archive::with_strategy(
+        File::open(tmp.path()).unwrap(),
+        iluvatar::FixedInterval::new(1024),
+    )
+    .unwrap();
 
     assert!(archive.index().checkpoints.len() > 1);
 
@@ -515,6 +555,7 @@ fn test_empty_archive() {
     assert_eq!(archive.list().len(), 0);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_single_file_archive() {
     let compressed = create_tar_gz(&[("only.txt", b"only file")]);
@@ -525,6 +566,7 @@ fn test_single_file_archive() {
     assert_eq!(archive.read_file("only.txt").unwrap(), b"only file");
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_file_not_found() {
     let compressed = create_tar_gz(&[("exists.txt", b"data")]);
@@ -535,6 +577,7 @@ fn test_file_not_found() {
     assert!(result.is_err());
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_large_file_in_archive() {
     // 500 KB file
@@ -547,13 +590,20 @@ fn test_large_file_in_archive() {
     assert_eq!(content, large_content);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_many_files() {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     for i in 0..100 {
-        files.push((format!("file_{:03}.txt", i), format!("content of file {}", i).into_bytes()));
+        files.push((
+            format!("file_{:03}.txt", i),
+            format!("content of file {}", i).into_bytes(),
+        ));
     }
-    let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, d)| (p.as_str(), d.as_slice())).collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
     let compressed = create_tar_gz(&refs);
     let tmp = write_temp(&compressed);
 
@@ -568,6 +618,7 @@ fn test_many_files() {
 
 // ─── Format Detection Tests ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_auto_detect_gzip() {
     let compressed = create_tar_gz(&[("test.txt", b"hello")]);
@@ -580,6 +631,7 @@ fn test_auto_detect_gzip() {
     );
 }
 
+#[cfg(feature = "bz2")]
 #[test]
 fn test_auto_detect_bzip2() {
     let compressed = create_tar_bz2(&[("test.txt", b"hello")]);
@@ -592,18 +644,17 @@ fn test_auto_detect_bzip2() {
     );
 }
 
+#[cfg(feature = "xz")]
 #[test]
 fn test_auto_detect_xz() {
     let compressed = create_tar_xz(&[("test.txt", b"hello")]);
     let tmp = write_temp(&compressed);
 
     let archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
-    assert_eq!(
-        archive.index().metadata.compression,
-        CompressionFormat::Xz
-    );
+    assert_eq!(archive.index().metadata.compression, CompressionFormat::Xz);
 }
 
+#[cfg(feature = "zstandard")]
 #[test]
 fn test_auto_detect_zstd() {
     let compressed = create_tar_zst(&[("test.txt", b"hello")]);
@@ -618,6 +669,7 @@ fn test_auto_detect_zstd() {
 
 // ─── Gzip Checkpoint Seek Test ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_gzip_checkpoint_midstream_seek() {
     // Use pseudo-random data that doesn't compress well, forcing the
@@ -642,8 +694,13 @@ fn test_gzip_checkpoint_midstream_seek() {
 
     // Use a checkpoint interval of 64KB
     let index = {
-        let mut engine =
-            IndexingEngine::new(CompressionFormat::Gzip, None, 65536, compressed.len() as u64).unwrap();
+        let mut engine = IndexingEngine::with_strategy(
+            CompressionFormat::Gzip,
+            None,
+            iluvatar::FixedInterval::new(65536),
+            compressed.len() as u64,
+        )
+        .unwrap();
         let mut offset = 0;
         loop {
             match engine.step() {
@@ -704,6 +761,7 @@ fn test_gzip_checkpoint_midstream_seek() {
 
 // ─── Index Query Tests ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_list_directory() {
     let files = &[
@@ -724,6 +782,7 @@ fn test_list_directory() {
 
 // ─── Index Serialization Roundtrip ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_index_bytes_roundtrip() {
     let files = test_files();
@@ -749,6 +808,7 @@ fn test_index_bytes_roundtrip() {
 
 // ─── Incremental Indexing Tests ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_progress_tracking() {
     let files = test_files();
@@ -756,8 +816,7 @@ fn test_progress_tracking() {
     let compressed = create_tar_gz(&refs);
 
     let mut engine =
-        IndexingEngine::new(CompressionFormat::Gzip, None, DEFAULT_CHECKPOINT_INTERVAL, compressed.len() as u64)
-            .unwrap();
+        IndexingEngine::new(CompressionFormat::Gzip, None, compressed.len() as u64).unwrap();
 
     let initial = engine.progress();
     assert_eq!(initial.compressed_bytes_processed, 0);
@@ -792,6 +851,7 @@ fn test_progress_tracking() {
     assert!(final_progress.fraction().unwrap() > 0.0);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_snapshot_index_usable_for_reads() {
     // Use larger files so indexing spans many provide_data calls
@@ -806,8 +866,7 @@ fn test_snapshot_index_usable_for_reads() {
     let compressed = create_tar_gz(&refs);
 
     let mut engine =
-        IndexingEngine::new(CompressionFormat::Gzip, None, DEFAULT_CHECKPOINT_INTERVAL, compressed.len() as u64)
-            .unwrap();
+        IndexingEngine::new(CompressionFormat::Gzip, None, compressed.len() as u64).unwrap();
 
     let mut offset = 0;
     let mut snapshot = None;
@@ -854,6 +913,7 @@ fn test_snapshot_index_usable_for_reads() {
     assert_eq!(final_index.entries.len(), files.len());
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_cancel_returns_partial_index() {
     // Use larger files so indexing spans many provide_data calls
@@ -868,8 +928,7 @@ fn test_cancel_returns_partial_index() {
     let compressed = create_tar_gz(&refs);
 
     let mut engine =
-        IndexingEngine::new(CompressionFormat::Gzip, None, DEFAULT_CHECKPOINT_INTERVAL, compressed.len() as u64)
-            .unwrap();
+        IndexingEngine::new(CompressionFormat::Gzip, None, compressed.len() as u64).unwrap();
 
     let mut offset = 0;
     let chunk_size = 512; // small chunks for fine-grained progress
@@ -908,6 +967,7 @@ fn test_cancel_returns_partial_index() {
     }
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_partial_index_serialization_roundtrip() {
     let files = test_files();
@@ -915,8 +975,7 @@ fn test_partial_index_serialization_roundtrip() {
     let compressed = create_tar_gz(&refs);
 
     let mut engine =
-        IndexingEngine::new(CompressionFormat::Gzip, None, DEFAULT_CHECKPOINT_INTERVAL, compressed.len() as u64)
-            .unwrap();
+        IndexingEngine::new(CompressionFormat::Gzip, None, compressed.len() as u64).unwrap();
 
     // Run partway then cancel
     let mut offset = 0;
@@ -948,6 +1007,7 @@ fn test_partial_index_serialization_roundtrip() {
 
 // ─── Range Read Tests ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_range_read_first_bytes() {
     let content: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
@@ -961,6 +1021,7 @@ fn test_range_read_first_bytes() {
     assert_eq!(&range, &content[..100]);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_range_read_middle() {
     let content: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
@@ -974,6 +1035,7 @@ fn test_range_read_middle() {
     assert_eq!(&range, &content[2000..2200]);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_range_read_end() {
     let content: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
@@ -987,6 +1049,7 @@ fn test_range_read_end() {
     assert_eq!(&range, &content[4950..5000]);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_range_read_past_end_clamps() {
     let content: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
@@ -1004,6 +1067,7 @@ fn test_range_read_past_end_clamps() {
     assert_eq!(&range, &content[900..1000]);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_range_read_entire_file() {
     let content: Vec<u8> = (0..3000).map(|i| (i % 256) as u8).collect();
@@ -1017,6 +1081,7 @@ fn test_range_read_entire_file() {
     assert_eq!(range, full);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_range_read_zero_length() {
     let content = b"hello world";
@@ -1028,6 +1093,7 @@ fn test_range_read_zero_length() {
     assert!(range.is_empty());
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_range_read_across_checkpoints() {
     // Create a large file that will span multiple checkpoints
@@ -1037,9 +1103,13 @@ fn test_range_read_across_checkpoints() {
 
     // Use a small checkpoint interval to force multiple checkpoints
     let index = {
-        let mut engine =
-            IndexingEngine::new(CompressionFormat::Gzip, None, 32 * 1024, compressed.len() as u64)
-                .unwrap();
+        let mut engine = IndexingEngine::with_strategy(
+            CompressionFormat::Gzip,
+            None,
+            iluvatar::FixedInterval::new(32 * 1024),
+            compressed.len() as u64,
+        )
+        .unwrap();
         let mut offset = 0;
         loop {
             match engine.step() {
@@ -1078,28 +1148,44 @@ fn test_range_read_across_checkpoints() {
     assert!(cp_idx > 0, "should use a mid-stream checkpoint");
 }
 
+#[cfg(all(
+    feature = "gzip",
+    feature = "bz2",
+    feature = "xz",
+    feature = "zstandard"
+))]
 #[test]
 fn test_range_read_all_formats() {
     let content: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
 
     let formats: Vec<(CompressionFormat, Vec<u8>)> = vec![
-        (CompressionFormat::Gzip, create_tar_gz(&[("f.bin", content.as_slice())])),
-        (CompressionFormat::Bzip2, create_tar_bz2(&[("f.bin", content.as_slice())])),
-        (CompressionFormat::Xz, create_tar_xz(&[("f.bin", content.as_slice())])),
-        (CompressionFormat::Zstd, create_tar_zst(&[("f.bin", content.as_slice())])),
-        (CompressionFormat::None, create_tar_bytes(&[("f.bin", content.as_slice())])),
+        (
+            CompressionFormat::Gzip,
+            create_tar_gz(&[("f.bin", content.as_slice())]),
+        ),
+        (
+            CompressionFormat::Bzip2,
+            create_tar_bz2(&[("f.bin", content.as_slice())]),
+        ),
+        (
+            CompressionFormat::Xz,
+            create_tar_xz(&[("f.bin", content.as_slice())]),
+        ),
+        (
+            CompressionFormat::Zstd,
+            create_tar_zst(&[("f.bin", content.as_slice())]),
+        ),
+        (
+            CompressionFormat::None,
+            create_tar_bytes(&[("f.bin", content.as_slice())]),
+        ),
     ];
 
     for (format, compressed) in &formats {
         let index = index_in_memory(compressed, *format);
 
         let range = read_range_in_memory(compressed, &index, "f.bin", 1000, 500);
-        assert_eq!(
-            range.len(),
-            500,
-            "range len mismatch for {:?}",
-            format
-        );
+        assert_eq!(range.len(), 500, "range len mismatch for {:?}", format);
         assert_eq!(
             &range,
             &content[1000..1500],
@@ -1109,6 +1195,7 @@ fn test_range_read_all_formats() {
     }
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_sync_archive_range_read() {
     let content: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
@@ -1134,6 +1221,7 @@ fn test_sync_archive_range_read() {
 
 // ─── Streaming Reader Tests ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_open_read_to_end() {
     let files = test_files();
@@ -1151,6 +1239,7 @@ fn test_open_read_to_end() {
     }
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_open_small_reads() {
     let content: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
@@ -1173,6 +1262,7 @@ fn test_open_small_reads() {
     assert_eq!(result, content);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_open_matches_read_file() {
     let content: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
@@ -1192,6 +1282,7 @@ fn test_open_matches_read_file() {
     assert_eq!(via_read_file, via_open);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_open_file_not_found() {
     let compressed = create_tar_gz(&[("exists.txt", b"data")]);
@@ -1202,6 +1293,7 @@ fn test_open_file_not_found() {
     assert!(result.is_err());
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_open_with_io_copy() {
     let content = b"hello from the archive";
@@ -1217,6 +1309,7 @@ fn test_open_with_io_copy() {
 
 // ─── Forward-only (Read, no Seek) Tests ───
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_from_reader_builds_index() {
     let files = test_files();
@@ -1234,6 +1327,7 @@ fn test_from_reader_builds_index() {
     }
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_from_reader_unknown_size() {
     let compressed = create_tar_gz(&[("hello.txt", b"world")]);
@@ -1246,6 +1340,7 @@ fn test_from_reader_unknown_size() {
     assert_eq!(archive.entry("hello.txt").unwrap().size, 5);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_from_reader_then_read_with_seekable() {
     let files = test_files();
@@ -1265,6 +1360,12 @@ fn test_from_reader_then_read_with_seekable() {
     }
 }
 
+#[cfg(all(
+    feature = "gzip",
+    feature = "bz2",
+    feature = "xz",
+    feature = "zstandard"
+))]
 #[test]
 fn test_from_reader_all_formats() {
     for (label, data) in [
@@ -1297,8 +1398,17 @@ fn create_cpio_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
              {:08X}{:08X}{:08X}{:08X}{:08X}{:08X}",
             ino,
             0o100644u32, // mode: regular file
-            1000u32, 1000u32, 1u32, 1700000000u32, filesize,
-            0u32, 0u32, 0u32, 0u32, namesize, 0u32,
+            1000u32,
+            1000u32,
+            1u32,
+            1700000000u32,
+            filesize,
+            0u32,
+            0u32,
+            0u32,
+            0u32,
+            namesize,
+            0u32,
         );
         archive.extend_from_slice(header.as_bytes());
         archive.extend_from_slice(path.as_bytes());
@@ -1324,8 +1434,7 @@ fn create_cpio_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
         "070701\
          {:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}\
          {:08X}{:08X}{:08X}{:08X}{:08X}{:08X}",
-        0u32, 0u32, 0u32, 0u32, 1u32, 0u32, 0u32,
-        0u32, 0u32, 0u32, 0u32, namesize, 0u32,
+        0u32, 0u32, 0u32, 0u32, 1u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, namesize, 0u32,
     );
     archive.extend_from_slice(header.as_bytes());
     archive.extend_from_slice(trailer.as_bytes());
@@ -1338,10 +1447,10 @@ fn create_cpio_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// Create a gzip-compressed cpio archive.
+#[cfg(feature = "gzip")]
 fn create_cpio_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
     let cpio_data = create_cpio_bytes(files);
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&cpio_data).unwrap();
     encoder.finish().unwrap()
 }
@@ -1376,6 +1485,7 @@ fn test_cpio_index_and_read() {
     }
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_cpio_gzip_index_and_read() {
     let files = &[
@@ -1443,6 +1553,7 @@ fn test_cpio_range_read() {
     assert_eq!(&range, &content[1000..1500]);
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn test_cpio_sync_archive() {
     let files = &[
@@ -1475,6 +1586,12 @@ fn test_cpio_empty_file() {
     assert!(content.is_empty());
 }
 
+#[cfg(all(
+    feature = "gzip",
+    feature = "bz2",
+    feature = "xz",
+    feature = "zstandard"
+))]
 #[test]
 fn test_cpio_compressed_all_formats() {
     let files = &[("test.txt", &b"Hello from cpio"[..])];
@@ -1512,11 +1629,9 @@ fn test_cpio_compressed_all_formats() {
         );
         let content = read_in_memory(data, &index, "test.txt");
         assert_eq!(
-            &content,
-            b"Hello from cpio",
+            &content, b"Hello from cpio",
             "content mismatch for {:?}",
             format
         );
     }
 }
-

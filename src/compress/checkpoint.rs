@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 /// A serializable snapshot of decompressor state at a known position.
+///
+/// Each checkpoint records both compressed and uncompressed stream offsets,
+/// plus enough internal state to resume decompression from that point.
+/// Checkpoints are stored in [`ArchiveIndex::checkpoints`](crate::ArchiveIndex).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     /// Byte offset in the compressed stream.
@@ -22,14 +26,10 @@ pub enum CheckpointState {
     Gzip(GzipCheckpointState),
     /// Bzip2: block boundary info.
     Bzip2(Bzip2CheckpointState),
-    /// XZ: block boundary info.
-    Xz(XzCheckpointState),
     /// XZ: full decompressor state for mid-stream checkpoint.
-    XzFull(XzFullCheckpointState),
-    /// Zstd: frame boundary info.
-    Zstd(ZstdCheckpointState),
+    Xz(XzFullCheckpointState),
     /// Zstd: full decompressor state for mid-stream checkpoint.
-    ZstdFull(ZstdFullCheckpointState),
+    Zstd(ZstdFullCheckpointState),
     /// LZMA2: full decompressor state for mid-stream checkpoint.
     Lzma2(Lzma2FullCheckpointState),
 }
@@ -161,4 +161,43 @@ pub struct Lzma2FullCheckpointState {
     pub total_out: u64,
     /// Whether the stream had finished at checkpoint.
     pub finished: bool,
+}
+
+impl CheckpointState {
+    /// Estimate the serialized size of this checkpoint state in bytes.
+    ///
+    /// This is a fast approximation that avoids actual serialization.
+    /// Used by adaptive checkpoint strategies to track index size growth.
+    pub fn estimated_size(&self) -> usize {
+        match self {
+            CheckpointState::None => 0,
+            CheckpointState::Gzip(s) => s.window.len() + 32,
+            CheckpointState::Bzip2(s) => s.stream_header.len() + 8,
+            CheckpointState::Xz(s) => {
+                s.phase.len()
+                    + s.stream_header.len()
+                    + s.lzma2_state.as_ref().map_or(0, |v| v.len())
+                    + s.buffer.len()
+                    + 32
+            }
+            CheckpointState::Zstd(s) => {
+                s.block_state.len()
+                    + s.window.len()
+                    + s.phase.len()
+                    + s.frame_header.as_ref().map_or(0, |v| v.len())
+                    + s.buffer.len()
+                    + s.staged_output.len()
+                    + 32
+            }
+            CheckpointState::Lzma2(s) => s.decoder_state.len() + 24,
+        }
+    }
+}
+
+impl Checkpoint {
+    /// Estimate the total serialized size of this checkpoint in bytes.
+    pub fn estimated_size(&self) -> usize {
+        // Two u64 offsets + u8 bit_offset + state
+        17 + self.state.estimated_size()
+    }
 }

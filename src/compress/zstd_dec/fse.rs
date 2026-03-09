@@ -51,7 +51,6 @@ impl FseTable {
     pub fn decode(&self, state: usize) -> &FseEntry {
         &self.entries[state]
     }
-
 }
 
 /// Read an FSE normalized count distribution from a bitstream.
@@ -82,7 +81,10 @@ fn read_ncount_inner(
         .map_err(|e| format!("reading table log: {}", e))?;
     let table_log = raw + FSE_MIN_TABLE_LOG;
     if table_log > MAX_FSE_LOG {
-        return Err(format!("table log {} exceeds max {}", table_log, MAX_FSE_LOG));
+        return Err(format!(
+            "table log {} exceeds max {}",
+            table_log, MAX_FSE_LOG
+        ));
     }
 
     let max_sv1 = max_symbol + 1;
@@ -123,8 +125,7 @@ fn read_ncount_inner(
         let bits_avail = nb_bits - 1;
         let low = reader
             .read_bits(bits_avail)
-            .map_err(|e| format!("reading count: {}", e))?
-            as i32;
+            .map_err(|e| format!("reading count: {}", e))? as i32;
 
         let count;
         if low < max_val {
@@ -263,10 +264,7 @@ pub(crate) fn build_fse_table(
         }
     }
 
-    Ok(FseTable {
-        table_log,
-        entries,
-    })
+    Ok(FseTable { table_log, entries })
 }
 
 /// Build a single-entry (RLE) FSE table for a given symbol.
@@ -299,14 +297,14 @@ pub(crate) fn build_rle_fse_table(
 
 /// Literal Length baseline values.
 pub(crate) const LL_BASE: [u32; 36] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48,
-    64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
+    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
 ];
 
 /// Literal Length extra bits.
 pub(crate) const LL_BITS: [u8; 36] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10,
-    11, 12, 13, 14, 15, 16,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16,
 ];
 
 /// Match Length baseline values.
@@ -318,40 +316,39 @@ pub(crate) const ML_BASE: [u32; 53] = [
 
 /// Match Length extra bits.
 pub(crate) const ML_BITS: [u8; 53] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 ];
 
 /// Offset baseline values: OF_base[n] = (1 << n) - 1 for n >= 1, OF_base[0] = 0.
 pub(crate) const OF_BASE: [u32; 32] = [
-    0, 1, 1, 5, 0xD, 0x1D, 0x3D, 0x7D, 0xFD, 0x1FD, 0x3FD, 0x7FD, 0xFFD, 0x1FFD, 0x3FFD,
-    0x7FFD, 0xFFFD, 0x1FFFD, 0x3FFFD, 0x7FFFD, 0xFFFFD, 0x1FFFFD, 0x3FFFFD, 0x7FFFFD, 0xFFFFFD,
-    0x1FFFFFD, 0x3FFFFFD, 0x7FFFFFD, 0xFFFFFFD, 0x1FFFFFFD, 0x3FFFFFFD, 0x7FFFFFFD,
+    0, 1, 1, 5, 0xD, 0x1D, 0x3D, 0x7D, 0xFD, 0x1FD, 0x3FD, 0x7FD, 0xFFD, 0x1FFD, 0x3FFD, 0x7FFD,
+    0xFFFD, 0x1FFFD, 0x3FFFD, 0x7FFFD, 0xFFFFD, 0x1FFFFD, 0x3FFFFD, 0x7FFFFD, 0xFFFFFD, 0x1FFFFFD,
+    0x3FFFFFD, 0x7FFFFFD, 0xFFFFFFD, 0x1FFFFFFD, 0x3FFFFFFD, 0x7FFFFFFD,
 ];
 
 /// Offset extra bits: OF_bits[n] = n.
 pub(crate) const OF_BITS: [u8; 32] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-    25, 26, 27, 28, 29, 30, 31,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31,
 ];
 
 // Default normalized distributions (from zstd_internal.h).
 
 const LL_DEFAULT_NORM: [i16; 36] = [
-    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1,
-    1, 1, -1, -1, -1, -1,
+    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+    -1, -1, -1, -1,
 ];
 const LL_DEFAULT_LOG: u32 = 6;
 
 const ML_DEFAULT_NORM: [i16; 53] = [
-    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
+    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
 ];
 const ML_DEFAULT_LOG: u32 = 6;
 
 const OF_DEFAULT_NORM: [i16; 29] = [
-    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1,
-    -1,
+    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 const OF_DEFAULT_LOG: u32 = 5;
 

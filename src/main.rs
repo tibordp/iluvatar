@@ -1,12 +1,16 @@
 use clap::{Parser, Subcommand};
+use iluvatar::sync::Archive;
+use iluvatar::{ArchiveIndex, EntryType, FixedInterval};
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use iluvatar::sync::Archive;
-use iluvatar::{ArchiveIndex, EntryType, DEFAULT_CHECKPOINT_INTERVAL};
 
 #[derive(Parser)]
-#[command(name = "iluvatar", version, about = "Random-access compressed archive tool")]
+#[command(
+    name = "iluvatar",
+    version,
+    about = "Random-access compressed archive tool"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -18,9 +22,9 @@ enum Command {
     Index {
         /// Archive file
         archive: PathBuf,
-        /// Checkpoint interval in bytes
-        #[arg(short, long, default_value_t = DEFAULT_CHECKPOINT_INTERVAL)]
-        interval: u64,
+        /// Checkpoint interval in bytes (overrides the format-aware default)
+        #[arg(short, long)]
+        interval: Option<u64>,
     },
     /// List archive contents
     Ls {
@@ -67,7 +71,11 @@ fn main() {
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Index { archive, interval } => cmd_index(&archive, interval),
-        Command::Ls { archive, path, long } => cmd_ls(&archive, path.as_deref(), long),
+        Command::Ls {
+            archive,
+            path,
+            long,
+        } => cmd_ls(&archive, path.as_deref(), long),
         Command::Cat {
             archive,
             path,
@@ -103,14 +111,14 @@ fn load_index(archive: &Path) -> Result<Option<ArchiveIndex>, Box<dyn std::error
 
 fn build_index(
     archive: &Path,
-    interval: u64,
+    interval: Option<u64>,
 ) -> Result<ArchiveIndex, Box<dyn std::error::Error>> {
     let mut file = File::open(archive)?;
     let size = file.metadata()?.len();
     let tty = io::stderr().is_terminal();
     let mut last_pct = 255u8;
 
-    let index = Archive::build_index_with_progress(&mut file, size, interval, |p| {
+    let progress_cb = |p: &iluvatar::IndexProgress| {
         if !tty {
             return true;
         }
@@ -129,7 +137,18 @@ fn build_index(
             );
         }
         true
-    })?;
+    };
+
+    let index = if let Some(interval) = interval {
+        Archive::build_index_with_strategy(
+            &mut file,
+            size,
+            FixedInterval::new(interval),
+            progress_cb,
+        )?
+    } else {
+        Archive::build_index_with_progress(&mut file, size, progress_cb)?
+    };
 
     if tty {
         eprintln!(
@@ -150,7 +169,7 @@ fn require_index(archive: &Path) -> Result<ArchiveIndex, Box<dyn std::error::Err
     if io::stderr().is_terminal() {
         eprintln!("\x1b[33mno index found, building on-the-fly...\x1b[0m");
     }
-    build_index(archive, DEFAULT_CHECKPOINT_INTERVAL)
+    build_index(archive, None)
 }
 
 fn open_archive(archive: &Path) -> Result<Archive<File>, Box<dyn std::error::Error>> {
@@ -161,7 +180,7 @@ fn open_archive(archive: &Path) -> Result<Archive<File>, Box<dyn std::error::Err
 
 // ─── Commands ───
 
-fn cmd_index(archive: &Path, interval: u64) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_index(archive: &Path, interval: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     let index = build_index(archive, interval)?;
     let p = index_path(archive);
     let data = index.to_bytes()?;
@@ -265,11 +284,7 @@ fn cmd_cat(
     }
 }
 
-fn cmd_cp(
-    archive: &Path,
-    path: &str,
-    dest: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_cp(archive: &Path, path: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut ar = open_archive(archive)?;
 
     let (is_dir, file_size) = {
@@ -389,13 +404,7 @@ fn epoch_to_civil(ts: u64) -> (i64, u32, u32, u32, u32) {
     (y, m, d, h, min)
 }
 
-fn format_name(
-    path: &str,
-    et: &EntryType,
-    mode: u32,
-    link: Option<&str>,
-    color: bool,
-) -> String {
+fn format_name(path: &str, et: &EntryType, mode: u32, link: Option<&str>, color: bool) -> String {
     if !color {
         return match (et, link) {
             (EntryType::SymLink, Some(t)) => format!("{path} -> {t}"),

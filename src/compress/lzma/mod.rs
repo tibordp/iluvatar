@@ -10,7 +10,7 @@ pub mod range_coder;
 
 use crate::compress::checkpoint::{Checkpoint, CheckpointState, Lzma2FullCheckpointState};
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
-use crate::error::{Result, Error};
+use crate::error::{Error, Result};
 
 use lzma2::{Lzma2DecodeStatus, Lzma2Decoder};
 
@@ -68,11 +68,7 @@ impl Decompressor for Lzma2Decompressor {
         self.total_out += result.bytes_produced as u64;
 
         match result.status {
-            Lzma2DecodeStatus::Error => {
-                Err(Error::DecompressionError(
-                    "corrupt LZMA2 data".into(),
-                ))
-            }
+            Lzma2DecodeStatus::Error => Err(Error::DecompressionError("corrupt LZMA2 data".into())),
             Lzma2DecodeStatus::Finished => {
                 self.finished = true;
                 Ok(DecompressResult {
@@ -81,30 +77,23 @@ impl Decompressor for Lzma2Decompressor {
                     status: DecompressStatus::StreamEnd,
                 })
             }
-            Lzma2DecodeStatus::Continue | Lzma2DecodeStatus::NeedInput => {
-                Ok(DecompressResult {
-                    bytes_consumed: result.bytes_consumed,
-                    bytes_produced: result.bytes_produced,
-                    status: DecompressStatus::Continue,
-                })
-            }
+            Lzma2DecodeStatus::Continue | Lzma2DecodeStatus::NeedInput => Ok(DecompressResult {
+                bytes_consumed: result.bytes_consumed,
+                bytes_produced: result.bytes_produced,
+                status: DecompressStatus::Continue,
+            }),
         }
     }
 
-    fn checkpoint(
-        &self,
-        compressed_offset: u64,
-        uncompressed_offset: u64,
-    ) -> Result<Checkpoint> {
+    fn checkpoint(&self, compressed_offset: u64, uncompressed_offset: u64) -> Result<Checkpoint> {
         let state = self.inner.get_state();
         Ok(Checkpoint {
             compressed_offset,
             bit_offset: 0,
             uncompressed_offset,
             state: CheckpointState::Lzma2(Lzma2FullCheckpointState {
-                decoder_state: bincode::serialize(&state).map_err(|e| {
-                    Error::CheckpointError(format!("serialize lzma2 state: {}", e))
-                })?,
+                decoder_state: bincode::serialize(&state)
+                    .map_err(|e| Error::CheckpointError(format!("serialize lzma2 state: {}", e)))?,
                 total_in: self.total_in,
                 total_out: self.total_out,
                 finished: self.finished,
@@ -134,7 +123,9 @@ impl Decompressor for Lzma2Decompressor {
             )),
         }
     }
+}
 
+impl Lzma2Decompressor {
     fn reset(&mut self) {
         self.inner = Lzma2Decoder::new(self.inner.inner_decoder().dict_size);
         self.total_in = 0;
@@ -184,7 +175,8 @@ mod tests {
             }
             if control < 0x80 {
                 // Uncompressed chunk: control(1) + unpack_hi(1) + unpack_lo(1) + data
-                let unpack_size = ((xz_data[pos + 1] as usize) << 8 | xz_data[pos + 2] as usize) + 1;
+                let unpack_size =
+                    ((xz_data[pos + 1] as usize) << 8 | xz_data[pos + 2] as usize) + 1;
                 pos += 3 + unpack_size;
             } else {
                 // LZMA chunk
@@ -249,7 +241,8 @@ mod tests {
         let compressed = compress_lzma2(original);
         let output = full_decompress(&compressed, compressed.len(), 65536);
         assert_eq!(
-            &output, &original[..],
+            &output,
+            &original[..],
             "decompressed {} bytes, expected {} bytes",
             output.len(),
             original.len()
@@ -263,7 +256,8 @@ mod tests {
         // Feed 1 byte at a time
         let output = full_decompress(&compressed, 1, 65536);
         assert_eq!(
-            &output, &original[..],
+            &output,
+            &original[..],
             "decompressed {} bytes, expected {} bytes",
             output.len(),
             original.len()
@@ -277,7 +271,8 @@ mod tests {
         // Small output buffer
         let output = full_decompress(&compressed, compressed.len(), 4);
         assert_eq!(
-            &output, &original[..],
+            &output,
+            &original[..],
             "decompressed {} bytes, expected {} bytes",
             output.len(),
             original.len()
@@ -307,7 +302,10 @@ mod tests {
             if result.status == DecompressStatus::StreamEnd {
                 break;
             }
-            if result.bytes_consumed == 0 && result.bytes_produced == 0 && offset >= compressed.len() {
+            if result.bytes_consumed == 0
+                && result.bytes_produced == 0
+                && offset >= compressed.len()
+            {
                 break;
             }
         }
@@ -354,12 +352,21 @@ mod tests {
             if result.status == DecompressStatus::StreamEnd {
                 break;
             }
-            if result.bytes_consumed == 0 && result.bytes_produced == 0 && offset >= compressed.len() {
+            if result.bytes_consumed == 0
+                && result.bytes_produced == 0
+                && offset >= compressed.len()
+            {
                 break;
             }
         }
 
-        assert_eq!(all_output.len(), original.len(), "output len mismatch: {} vs {}", all_output.len(), original.len());
+        assert_eq!(
+            all_output.len(),
+            original.len(),
+            "output len mismatch: {} vs {}",
+            all_output.len(),
+            original.len()
+        );
     }
 
     #[test]
@@ -387,7 +394,9 @@ mod tests {
         }
 
         // Take checkpoint
-        let cp = dec.checkpoint(offset as u64, all_output.len() as u64).unwrap();
+        let cp = dec
+            .checkpoint(offset as u64, all_output.len() as u64)
+            .unwrap();
 
         // Continue decompression to verify we get correct output
         let mut rest_output = Vec::new();
@@ -405,7 +414,10 @@ mod tests {
             if result.status == DecompressStatus::StreamEnd {
                 break;
             }
-            if result.bytes_consumed == 0 && result.bytes_produced == 0 && offset >= compressed.len() {
+            if result.bytes_consumed == 0
+                && result.bytes_produced == 0
+                && offset >= compressed.len()
+            {
                 break;
             }
         }
@@ -433,13 +445,17 @@ mod tests {
             if result.status == DecompressStatus::StreamEnd {
                 break;
             }
-            if result.bytes_consumed == 0 && result.bytes_produced == 0 && offset2 >= compressed.len() {
+            if result.bytes_consumed == 0
+                && result.bytes_produced == 0
+                && offset2 >= compressed.len()
+            {
                 break;
             }
         }
 
         assert_eq!(
-            restored_output, rest_output,
+            restored_output,
+            rest_output,
             "restored output ({} bytes) != expected ({} bytes)",
             restored_output.len(),
             rest_output.len()
@@ -470,7 +486,10 @@ mod tests {
             if result.status == DecompressStatus::StreamEnd {
                 break;
             }
-            if result.bytes_consumed == 0 && result.bytes_produced == 0 && offset >= compressed.len() {
+            if result.bytes_consumed == 0
+                && result.bytes_produced == 0
+                && offset >= compressed.len()
+            {
                 break;
             }
         }

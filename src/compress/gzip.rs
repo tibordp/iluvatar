@@ -2,7 +2,7 @@ use crate::compress::checkpoint::{
     Checkpoint, CheckpointState, GzipBlockBoundary, GzipCheckpointState,
 };
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
-use crate::error::{Result, Error};
+use crate::error::{Error, Result};
 use miniz_oxide::inflate::core::{
     decompress as miniz_decompress, inflate_flags, DecompressorOxide,
 };
@@ -208,8 +208,13 @@ impl GzipDecompressor {
         // circular window; miniz_oxide writes at `out_pos` within the
         // slice and returns HasMoreOutput when the buffer is full.
         let write_pos = self.dict_pos % WINDOW_SIZE;
-        let (status, in_consumed, out_produced) =
-            miniz_decompress(&mut self.inner, input, &mut *self.dict_buf, write_pos, flags);
+        let (status, in_consumed, out_produced) = miniz_decompress(
+            &mut self.inner,
+            input,
+            &mut *self.dict_buf,
+            write_pos,
+            flags,
+        );
 
         self.dict_pos += out_produced;
         self.total_out += out_produced as u64;
@@ -320,21 +325,15 @@ impl Decompressor for GzipDecompressor {
                         self.header_size = header_size;
 
                         // How many bytes from *this* input went to the header?
-                        let header_bytes_from_input =
-                            header_size.saturating_sub(old_header_len);
+                        let header_bytes_from_input = header_size.saturating_sub(old_header_len);
                         let remaining_input = &input[header_bytes_from_input..];
 
                         self.header_buf.clear();
 
                         if !remaining_input.is_empty() {
-                            let result = self.inflate_to_output(
-                                remaining_input,
-                                true,
-                                output,
-                            )?;
+                            let result = self.inflate_to_output(remaining_input, true, output)?;
                             Ok(DecompressResult {
-                                bytes_consumed: header_bytes_from_input
-                                    + result.bytes_consumed,
+                                bytes_consumed: header_bytes_from_input + result.bytes_consumed,
                                 bytes_produced: result.bytes_produced,
                                 status: result.status,
                             })
@@ -367,11 +366,7 @@ impl Decompressor for GzipDecompressor {
         }
     }
 
-    fn checkpoint(
-        &self,
-        _compressed_offset: u64,
-        _uncompressed_offset: u64,
-    ) -> Result<Checkpoint> {
+    fn checkpoint(&self, _compressed_offset: u64, _uncompressed_offset: u64) -> Result<Checkpoint> {
         if let Some(ref boundary) = self.last_boundary {
             Ok(Checkpoint {
                 compressed_offset: boundary.compressed_offset,
@@ -435,7 +430,9 @@ impl Decompressor for GzipDecompressor {
             )),
         }
     }
+}
 
+impl GzipDecompressor {
     fn reset(&mut self) {
         self.inner = DecompressorOxide::new();
         *self.dict_buf = [0u8; WINDOW_SIZE];
@@ -541,7 +538,10 @@ mod tests {
             if result.status == DecompressStatus::StreamEnd {
                 break;
             }
-            if result.bytes_consumed == 0 && result.bytes_produced == 0 && offset >= compressed.len() {
+            if result.bytes_consumed == 0
+                && result.bytes_produced == 0
+                && offset >= compressed.len()
+            {
                 break;
             }
         }
@@ -655,7 +655,8 @@ mod tests {
 
                 let expected_tail = &original[cp.uncompressed_offset as usize..];
                 assert_eq!(
-                    restored_output, expected_tail,
+                    restored_output,
+                    expected_tail,
                     "restored output ({} bytes) doesn't match expected tail ({} bytes)",
                     restored_output.len(),
                     expected_tail.len()

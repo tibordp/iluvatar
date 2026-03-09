@@ -4,26 +4,45 @@ use serde::{Deserialize, Serialize};
 ///
 /// Format-specific metadata entries (PAX headers, GNU long names, cpio trailers)
 /// are handled internally by each parser and never surface here.
+///
+/// # Example
+///
+/// ```
+/// use iluvatar::EntryType;
+///
+/// let ty = EntryType::Regular;
+/// assert!(ty.is_regular());
+/// assert!(!ty.is_directory());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryType {
+    /// A regular file with data content.
     Regular,
+    /// A hard link to another file in the archive.
     HardLink,
+    /// A symbolic link.
     SymLink,
+    /// A character device node.
     CharDevice,
+    /// A block device node.
     BlockDevice,
+    /// A directory.
     Directory,
+    /// A FIFO (named pipe).
     Fifo,
-    /// Socket (cpio supports this; tar typically does not).
+    /// A Unix domain socket (cpio supports this; tar typically does not).
     Socket,
-    /// Unknown or unrecognized type.
+    /// Unknown or unrecognized type with the raw type byte.
     Other(u8),
 }
 
 impl EntryType {
+    /// Returns `true` if this is a regular file.
     pub fn is_regular(&self) -> bool {
         matches!(self, EntryType::Regular)
     }
 
+    /// Returns `true` if this is a directory.
     pub fn is_directory(&self) -> bool {
         matches!(self, EntryType::Directory)
     }

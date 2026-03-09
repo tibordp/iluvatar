@@ -1,5 +1,5 @@
 use crate::archive::EntryType;
-use crate::error::{Result, Error};
+use crate::error::{Error, Result};
 
 /// Size of a newc/crc format header (fixed).
 pub const NEWC_HEADER_SIZE: usize = 110;

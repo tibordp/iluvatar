@@ -3,12 +3,14 @@ name = "iluvatar"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.73"
+authors = ["Tibor Djurica Potpara"]
 description = "Efficient random access to compressed tar and cpio archives via indexing and decompression checkpoints"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tibordp/iluvatar"
 keywords = ["tar", "cpio", "archive", "compression", "random-access"]
 categories = ["compression", "filesystem"]
 readme = "README.md"
+exclude = ["tests/vectors/", "reference/"]
 
 [dependencies]
 miniz_oxide = { version = "0.9", features = ["block-boundary"], optional = true }

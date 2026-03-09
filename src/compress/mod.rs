@@ -33,12 +33,29 @@ pub(crate) mod none;
 use serde::{Deserialize, Serialize};
 
 /// Detected or specified compression format.
+///
+/// Used both as a detection result and as
+/// metadata stored in the index.
+///
+/// # Example
+///
+/// ```
+/// use iluvatar::CompressionFormat;
+///
+/// let fmt = CompressionFormat::Gzip;
+/// assert_eq!(fmt.to_string(), "gzip");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CompressionFormat {
+    /// No compression (raw tar/cpio).
     None,
+    /// Gzip (DEFLATE) compression.
     Gzip,
+    /// Bzip2 compression.
     Bzip2,
+    /// XZ (LZMA2) compression.
     Xz,
+    /// Zstandard compression.
     Zstd,
 }
 

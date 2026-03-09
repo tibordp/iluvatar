@@ -5,10 +5,10 @@ decompressing the whole thing.
 
 iluvatar works by making an indexing pass over the compressed archive,
 recording each file's path, size, and byte offset in the decompressed stream.
-At regular intervals it snapshots the decompressor's internal state (a
+At configurable intervals it snapshots the decompressor's internal state (a
 "checkpoint"). Later, to read a single file, it restores the nearest
 checkpoint, seeks in the compressed stream, and decompresses forward to the
-target — typically at most 1 MiB of data regardless of archive size.
+target — typically a small amount of data regardless of archive size.
 
 ## Library Usage
 
@@ -43,9 +43,8 @@ use iluvatar::{IndexingEngine, EngineRequest, CompressionFormat};
 
 let mut engine = IndexingEngine::new(
     CompressionFormat::Gzip,
-    None,        // auto-detect archive format (tar vs cpio)
-    1024 * 1024, // checkpoint every 1 MiB of uncompressed data
-    file_size,
+    None,      // auto-detect archive format (tar vs cpio)
+    file_size, // used for progress reporting
 )?;
 
 loop {
@@ -79,6 +78,33 @@ let mut archive = Archive::new(file).await?;
 let data = archive.read_file("some/path").await?;
 ```
 
+### Checkpoint strategies
+
+By default, checkpoint intervals are tuned per compression format (1 MiB for
+bzip2, 16 MiB for gzip, 64 MiB for zstd/xz) to balance seek speed against
+index size. You can override this with a custom strategy:
+
+```rust
+use iluvatar::sync::Archive;
+use iluvatar::{FixedInterval, Budget, BudgetRatio};
+use std::fs::File;
+
+// Fixed interval: checkpoint every 8 MiB of decompressed data
+let file = File::open("data.tar.gz")?;
+let archive = Archive::with_strategy(file, FixedInterval::new(8 * 1024 * 1024))?;
+
+// Budget: keep total checkpoint data under ~10 MiB
+let file = File::open("data.tar.zst")?;
+let archive = Archive::with_strategy(file, Budget::new(10 * 1024 * 1024))?;
+
+// BudgetRatio: keep the index under ~5% of the archive size
+let file = File::open("data.tar.xz")?;
+let archive = Archive::with_strategy(file, BudgetRatio::new(0.05))?;
+# Ok::<(), iluvatar::Error>(())
+```
+
+You can also implement the `CheckpointStrategy` trait for fully custom logic.
+
 ### Progress tracking
 
 ```rust
@@ -90,7 +116,6 @@ let file_size = file.metadata()?.len();
 let index = Archive::build_index_with_progress(
     &mut file,
     file_size,
-    1024 * 1024,
     |progress| {
         if let Some(pct) = progress.fraction() {
             println!("{:.1}% - {} entries found", pct * 100.0, progress.entries_found);
@@ -110,8 +135,7 @@ let index = Archive::build_index_with_progress(
 2. **Random reads** — To read a file, find the nearest checkpoint before its
    data offset, restore the decompressor to that saved state, seek to the
    corresponding position in the compressed stream, and decompress forward.
-   With 1 MiB checkpoint intervals, at most 1 MiB needs decompressing per
-   read.
+   The checkpoint interval controls the maximum decompression needed per read.
 
 3. **Range reads** — When reading a byte range within a large file, the engine
    picks the checkpoint closest to the target offset (not the file's start),
@@ -128,7 +152,7 @@ let index = Archive::build_index_with_progress(
 
 **Compression formats:**
 
-| Format | Checkpoint strategy | Implementation |
+| Format | Checkpoint method | Implementation |
 |--------|-------------------|----------------|
 | gzip   | DEFLATE block boundary | `miniz_oxide` with `block-boundary` feature |
 | bzip2  | Full state snapshot | `bzip2` crate (C binding) |
@@ -147,8 +171,10 @@ which C library wrappers don't expose.
   archive. Subsequent reads are fast.
 - **Index files can be large.** Gzip checkpoints store a 32 KiB window per
   checkpoint; zstd and xz store the full decompressor state including
-  dictionary buffers, which can be several hundred KiB per checkpoint. With
-  the default 1 MiB interval, a multi-GB archive will produce a sizable index.
+  dictionary buffers, which can be several hundred KiB per checkpoint. The
+  format-aware defaults (16–64 MiB intervals) keep this reasonable, but very
+  large archives will still produce sizable indices. Use `Budget` or
+  `BudgetRatio` strategies to cap index size.
 - **Read-only.** This library cannot create or modify archives.
 - **Index format is not stable.** Stored indices include a version number and
   will be rejected if built by an incompatible version. Regenerate them when

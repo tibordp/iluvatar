@@ -4,8 +4,9 @@
 use std::io::Write;
 
 use iluvatar::compress::CompressionFormat;
+use iluvatar::engine::checkpoint_strategy::FixedInterval;
 use iluvatar::engine::request::EngineRequest;
-use iluvatar::engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
+use iluvatar::engine::state_machine::{IndexingEngine, ReadEngine};
 use iluvatar::index::store::ArchiveIndex;
 
 // ─── Helpers ───
@@ -81,8 +82,9 @@ fn index_in_memory_chunked(
     chunk_size: usize,
     checkpoint_interval: u64,
 ) -> ArchiveIndex {
+    let strategy = FixedInterval::new(checkpoint_interval);
     let mut engine =
-        IndexingEngine::new(format, None, checkpoint_interval, data.len() as u64).unwrap();
+        IndexingEngine::with_strategy(format, None, strategy, data.len() as u64).unwrap();
     let mut offset = 0;
 
     loop {
@@ -106,7 +108,7 @@ fn index_in_memory_chunked(
 }
 
 fn index_in_memory(data: &[u8], format: CompressionFormat) -> ArchiveIndex {
-    index_in_memory_chunked(data, format, 8192, DEFAULT_CHECKPOINT_INTERVAL)
+    index_in_memory_chunked(data, format, 8192, 1024 * 1024)
 }
 
 /// Read a file using read engine with in-memory data.
@@ -212,7 +214,8 @@ fn roundtrip_test(compressed: &[u8], format: CompressionFormat, files: &[(&str, 
     for (path, expected) in files {
         let actual = read_in_memory(compressed, &index, path);
         assert_eq!(
-            actual, *expected,
+            actual,
+            *expected,
             "content mismatch for '{}' (got {} bytes, expected {})",
             path,
             actual.len(),
@@ -223,6 +226,7 @@ fn roundtrip_test(compressed: &[u8], format: CompressionFormat, files: &[(&str, 
 
 // ─── Zstd engine-level tests ───
 
+#[cfg(feature = "zstandard")]
 #[test]
 fn test_zstd_levels_roundtrip() {
     let file_a = prng_data(1, 30_000);
@@ -239,6 +243,7 @@ fn test_zstd_levels_roundtrip() {
     }
 }
 
+#[cfg(feature = "zstandard")]
 #[test]
 fn test_zstd_multiframe_engine() {
     let file_data = prng_data(42, 80_000);
@@ -254,6 +259,7 @@ fn test_zstd_multiframe_engine() {
     }
 }
 
+#[cfg(feature = "zstandard")]
 #[test]
 fn test_zstd_many_small_files() {
     let files: Vec<(String, Vec<u8>)> = (0..100)
@@ -262,12 +268,16 @@ fn test_zstd_many_small_files() {
             (format!("file_{:03}.bin", i), prng_data(i as u64, size))
         })
         .collect();
-    let file_refs: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    let file_refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
     let tar = create_tar_bytes(&file_refs);
     let compressed = compress_tar_zstd(&tar, 3);
     roundtrip_test(&compressed, CompressionFormat::Zstd, &file_refs);
 }
 
+#[cfg(feature = "zstandard")]
 #[test]
 fn test_zstd_checkpoint_range_reads() {
     // Large file with small checkpoint interval, verify range reads from various offsets.
@@ -311,6 +321,7 @@ fn test_zstd_checkpoint_range_reads() {
     }
 }
 
+#[cfg(feature = "zstandard")]
 #[test]
 fn test_zstd_edge_cases() {
     // Empty file, single byte, all zeros, all 0xFF
@@ -320,13 +331,13 @@ fn test_zstd_edge_cases() {
         ("zeros.bin", vec![0u8; 50_000]),
         ("ones.bin", vec![0xFFu8; 50_000]),
     ];
-    let file_refs: Vec<(&str, &[u8])> =
-        cases.iter().map(|(n, d)| (*n, d.as_slice())).collect();
+    let file_refs: Vec<(&str, &[u8])> = cases.iter().map(|(n, d)| (*n, d.as_slice())).collect();
     let tar = create_tar_bytes(&file_refs);
     let compressed = compress_tar_zstd(&tar, 3);
     roundtrip_test(&compressed, CompressionFormat::Zstd, &file_refs);
 }
 
+#[cfg(feature = "zstandard")]
 #[test]
 fn test_zstd_small_engine_chunks() {
     // Feed engine in 128-byte chunks to stress decompressor buffering.
@@ -334,13 +345,14 @@ fn test_zstd_small_engine_chunks() {
     let tar = create_tar_bytes(&[("data.bin", &file_data)]);
     let compressed = compress_tar_zstd(&tar, 3);
 
-    let index = index_in_memory_chunked(&compressed, CompressionFormat::Zstd, 128, DEFAULT_CHECKPOINT_INTERVAL);
+    let index = index_in_memory_chunked(&compressed, CompressionFormat::Zstd, 128, 1024 * 1024);
     let actual = read_in_memory(&compressed, &index, "data.bin");
     assert_eq!(actual, file_data);
 }
 
 // ─── XZ engine-level tests ───
 
+#[cfg(feature = "xz")]
 #[test]
 fn test_xz_presets_roundtrip() {
     let file_a = prng_data(1, 30_000);
@@ -357,6 +369,7 @@ fn test_xz_presets_roundtrip() {
     }
 }
 
+#[cfg(feature = "xz")]
 #[test]
 fn test_xz_multiblock_engine() {
     let file_data = prng_data(42, 80_000);
@@ -372,6 +385,7 @@ fn test_xz_multiblock_engine() {
     }
 }
 
+#[cfg(feature = "xz")]
 #[test]
 fn test_xz_many_small_files() {
     let files: Vec<(String, Vec<u8>)> = (0..100)
@@ -380,24 +394,23 @@ fn test_xz_many_small_files() {
             (format!("file_{:03}.bin", i), prng_data(i as u64, size))
         })
         .collect();
-    let file_refs: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    let file_refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
     let tar = create_tar_bytes(&file_refs);
     let compressed = compress_tar_xz(&tar, 3);
     roundtrip_test(&compressed, CompressionFormat::Xz, &file_refs);
 }
 
+#[cfg(feature = "xz")]
 #[test]
 fn test_xz_checkpoint_range_reads() {
     let file_data = prng_data(12345, 200_000);
     let tar = create_tar_bytes(&[("big.bin", &file_data)]);
     let compressed = compress_tar_xz(&tar, 3);
 
-    let index = index_in_memory_chunked(
-        &compressed,
-        CompressionFormat::Xz,
-        8192,
-        32_768,
-    );
+    let index = index_in_memory_chunked(&compressed, CompressionFormat::Xz, 8192, 32_768);
 
     assert!(
         index.checkpoints.len() > 1,
@@ -425,6 +438,7 @@ fn test_xz_checkpoint_range_reads() {
     }
 }
 
+#[cfg(feature = "xz")]
 #[test]
 fn test_xz_edge_cases() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
@@ -433,26 +447,27 @@ fn test_xz_edge_cases() {
         ("zeros.bin", vec![0u8; 50_000]),
         ("ones.bin", vec![0xFFu8; 50_000]),
     ];
-    let file_refs: Vec<(&str, &[u8])> =
-        cases.iter().map(|(n, d)| (*n, d.as_slice())).collect();
+    let file_refs: Vec<(&str, &[u8])> = cases.iter().map(|(n, d)| (*n, d.as_slice())).collect();
     let tar = create_tar_bytes(&file_refs);
     let compressed = compress_tar_xz(&tar, 3);
     roundtrip_test(&compressed, CompressionFormat::Xz, &file_refs);
 }
 
+#[cfg(feature = "xz")]
 #[test]
 fn test_xz_small_engine_chunks() {
     let file_data = prng_data(333, 20_000);
     let tar = create_tar_bytes(&[("data.bin", &file_data)]);
     let compressed = compress_tar_xz(&tar, 3);
 
-    let index = index_in_memory_chunked(&compressed, CompressionFormat::Xz, 128, DEFAULT_CHECKPOINT_INTERVAL);
+    let index = index_in_memory_chunked(&compressed, CompressionFormat::Xz, 128, 1024 * 1024);
     let actual = read_in_memory(&compressed, &index, "data.bin");
     assert_eq!(actual, file_data);
 }
 
 // ─── Cross-format comparison ───
 
+#[cfg(all(feature = "xz", feature = "zstandard"))]
 #[test]
 fn test_same_data_all_compressed_formats() {
     // Same tar archive compressed with every format should produce identical file contents.

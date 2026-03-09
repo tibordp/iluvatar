@@ -8,9 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::fse::{self, FseTable};
-use super::huffman::{
-    self, decompress_huffman_1stream, decompress_huffman_4streams, HuffmanTable,
-};
+use super::huffman::{self, decompress_huffman_1stream, decompress_huffman_4streams, HuffmanTable};
 use super::sequences::{decode_sequences, execute_sequences, parse_sequences_header};
 
 /// Block types as specified in the zstd format.
@@ -123,7 +121,9 @@ pub(crate) fn decompress_block(
             output.extend(std::iter::repeat(byte).take(header.block_size));
             Ok(())
         }
-        BlockType::Compressed => decompress_compressed_block(block_data, header.block_size, state, window, output),
+        BlockType::Compressed => {
+            decompress_compressed_block(block_data, header.block_size, state, window, output)
+        }
         BlockType::Reserved => Err("cannot decompress reserved block".into()),
     }
 }
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn test_parse_block_header_compressed() {
         // last=0, type=Compressed(10), size=256
-        let val: u32 = 0 | (2 << 1) | (256 << 3);
+        let val: u32 = (2 << 1) | (256 << 3);
         let data = val.to_le_bytes();
         let header = parse_block_header(&data[..3]).unwrap();
         assert!(!header.is_last);

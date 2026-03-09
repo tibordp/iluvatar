@@ -18,6 +18,7 @@
 //! engines when you need control over I/O (e.g. in WASM, a custom VFS,
 //! or an async runtime other than tokio).
 
+pub mod checkpoint_strategy;
 pub mod progress;
 pub mod request;
 pub mod state_machine;

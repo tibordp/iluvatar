@@ -4,7 +4,7 @@ use crate::cpio::header::{
     self, align4, CpioHeader, CpioSubFormat, NEWC_CRC_MAGIC, NEWC_HEADER_SIZE, NEWC_MAGIC,
     ODC_HEADER_SIZE, ODC_MAGIC, TRAILER_NAME,
 };
-use crate::error::{Result, Error};
+use crate::error::{Error, Result};
 use std::collections::HashMap;
 
 /// Internal parser state.
@@ -30,13 +30,9 @@ enum CpioState {
         buf: Vec<u8>,
     },
     /// Skipping file data we don't need (non-symlink entries).
-    SkippingData {
-        remaining: u64,
-    },
+    SkippingData { remaining: u64 },
     /// Skipping padding after file data (newc only).
-    SkippingDataPad {
-        remaining: usize,
-    },
+    SkippingDataPad { remaining: usize },
     /// End of archive.
     End,
 }
@@ -101,31 +97,31 @@ impl CpioParser {
 
         // Detect sub-format from magic if this is the first header
         if self.sub_format.is_none() && self.header_buf.len() >= 6 {
-                if &self.header_buf[0..6] == NEWC_MAGIC {
-                    self.sub_format = Some(CpioSubFormat::Newc);
-                } else if &self.header_buf[0..6] == NEWC_CRC_MAGIC {
-                    self.sub_format = Some(CpioSubFormat::NewcCrc);
-                } else if &self.header_buf[0..6] == ODC_MAGIC {
-                    self.sub_format = Some(CpioSubFormat::Odc);
-                    // odc header is shorter — if we over-read, we'll handle below
-                    if self.header_buf.len() > ODC_HEADER_SIZE {
-                        // We read too many bytes (assumed newc size).
-                        // Return only what we need and rewind.
-                        let excess = self.header_buf.len() - ODC_HEADER_SIZE;
-                        self.stream_pos -= excess as u64;
-                        self.header_buf.truncate(ODC_HEADER_SIZE);
-                        let consumed = available - excess;
-                        return self.process_header(consumed);
-                    } else if self.header_buf.len() < ODC_HEADER_SIZE {
-                        // Need more data for odc header
-                        return Ok((available, ArchiveEvent::NeedData));
-                    }
-                } else {
-                    return Err(Error::InvalidCpioHeader(format!(
-                        "unrecognized cpio magic: {:?}",
-                        &self.header_buf[0..6]
-                    )));
+            if &self.header_buf[0..6] == NEWC_MAGIC {
+                self.sub_format = Some(CpioSubFormat::Newc);
+            } else if &self.header_buf[0..6] == NEWC_CRC_MAGIC {
+                self.sub_format = Some(CpioSubFormat::NewcCrc);
+            } else if &self.header_buf[0..6] == ODC_MAGIC {
+                self.sub_format = Some(CpioSubFormat::Odc);
+                // odc header is shorter — if we over-read, we'll handle below
+                if self.header_buf.len() > ODC_HEADER_SIZE {
+                    // We read too many bytes (assumed newc size).
+                    // Return only what we need and rewind.
+                    let excess = self.header_buf.len() - ODC_HEADER_SIZE;
+                    self.stream_pos -= excess as u64;
+                    self.header_buf.truncate(ODC_HEADER_SIZE);
+                    let consumed = available - excess;
+                    return self.process_header(consumed);
+                } else if self.header_buf.len() < ODC_HEADER_SIZE {
+                    // Need more data for odc header
+                    return Ok((available, ArchiveEvent::NeedData));
                 }
+            } else {
+                return Err(Error::InvalidCpioHeader(format!(
+                    "unrecognized cpio magic: {:?}",
+                    &self.header_buf[0..6]
+                )));
+            }
         }
 
         self.process_header(available)
@@ -336,9 +332,7 @@ impl CpioParser {
         }
 
         let (remaining, buf) = match &mut self.state {
-            CpioState::ReadingLinkTarget {
-                remaining, buf, ..
-            } => (remaining, buf),
+            CpioState::ReadingLinkTarget { remaining, buf, .. } => (remaining, buf),
             _ => unreachable!(),
         };
 
@@ -477,10 +471,10 @@ mod tests {
                  {:08X}\
                  {:08X}",
                 ino,
-                0o100644u32, // mode: regular file
-                1000u32,     // uid
-                1000u32,     // gid
-                1u32,        // nlink
+                0o100644u32,   // mode: regular file
+                1000u32,       // uid
+                1000u32,       // gid
+                1u32,          // nlink
                 1700000000u32, // mtime
                 filesize,
                 0u32, // devmajor
@@ -499,18 +493,14 @@ mod tests {
             // Pad header+name to 4-byte boundary
             let total = 110 + namesize;
             let padded = (total + 3) & !3;
-            for _ in total..padded {
-                archive.push(0);
-            }
+            archive.resize(archive.len() + padded - total, 0);
 
             // Write file data
             archive.extend_from_slice(content);
 
             // Pad data to 4-byte boundary
             let data_padded = (filesize + 3) & !3;
-            for _ in filesize..data_padded {
-                archive.push(0);
-            }
+            archive.resize(archive.len() + data_padded - filesize, 0);
 
             ino += 1;
         }
@@ -552,9 +542,7 @@ mod tests {
         archive.push(0);
         let total = 110 + namesize;
         let padded = (total + 3) & !3;
-        for _ in total..padded {
-            archive.push(0);
-        }
+        archive.resize(archive.len() + padded - total, 0);
 
         archive
     }
@@ -691,10 +679,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let data_offset = entries[0].data_offset as usize;
         // Verify data is at the reported offset
-        assert_eq!(
-            &archive[data_offset..data_offset + 10],
-            b"0123456789"
-        );
+        assert_eq!(&archive[data_offset..data_offset + 10], b"0123456789");
     }
 
     #[test]
@@ -710,17 +695,24 @@ mod tests {
              {:08X}{:08X}{:08X}{:08X}{:08X}{:08X}",
             1u32,
             0o040755u32, // mode: directory
-            1000u32, 1000u32, 2u32, 1700000000u32, 0u32,
-            0u32, 0u32, 0u32, 0u32, namesize, 0u32,
+            1000u32,
+            1000u32,
+            2u32,
+            1700000000u32,
+            0u32,
+            0u32,
+            0u32,
+            0u32,
+            0u32,
+            namesize,
+            0u32,
         );
         archive.extend_from_slice(header.as_bytes());
         archive.extend_from_slice(dirname.as_bytes());
         archive.push(0);
         let total = 110 + namesize;
         let padded = (total + 3) & !3;
-        for _ in total..padded {
-            archive.push(0);
-        }
+        archive.resize(archive.len() + padded - total, 0);
 
         // Trailer
         let trailer_name = "TRAILER!!!";
@@ -729,17 +721,14 @@ mod tests {
             "070701\
              {:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}\
              {:08X}{:08X}{:08X}{:08X}{:08X}{:08X}",
-            0u32, 0u32, 0u32, 0u32, 1u32, 0u32, 0u32,
-            0u32, 0u32, 0u32, 0u32, namesize, 0u32,
+            0u32, 0u32, 0u32, 0u32, 1u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, namesize, 0u32,
         );
         archive.extend_from_slice(trailer_header.as_bytes());
         archive.extend_from_slice(trailer_name.as_bytes());
         archive.push(0);
         let total = 110 + namesize;
         let padded = (total + 3) & !3;
-        for _ in total..padded {
-            archive.push(0);
-        }
+        archive.resize(archive.len() + padded - total, 0);
 
         let mut parser = CpioParser::new();
         let mut offset = 0;

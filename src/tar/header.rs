@@ -1,4 +1,4 @@
-use crate::error::{Result, Error};
+use crate::error::{Error, Result};
 use crate::tar::entry::{TarEntry, TarEntryType};
 
 /// Size of a tar header/block.
@@ -74,9 +74,7 @@ pub fn validate_checksum(header: &[u8; BLOCK_SIZE]) -> bool {
 /// where the file data starts (immediately after this header block).
 pub fn parse_header(header: &[u8; BLOCK_SIZE], data_offset: u64) -> Result<TarEntry> {
     if !validate_checksum(header) {
-        return Err(Error::InvalidTarHeader(
-            "checksum mismatch".into(),
-        ));
+        return Err(Error::InvalidTarHeader("checksum mismatch".into()));
     }
 
     let name = parse_string(&header[0..100]);
@@ -104,16 +102,8 @@ pub fn parse_header(header: &[u8; BLOCK_SIZE], data_offset: u64) -> Result<TarEn
             format!("{}/{}", prefix, name)
         };
 
-        let uname = if uname.is_empty() {
-            None
-        } else {
-            Some(uname)
-        };
-        let gname = if gname.is_empty() {
-            None
-        } else {
-            Some(gname)
-        };
+        let uname = if uname.is_empty() { None } else { Some(uname) };
+        let gname = if gname.is_empty() { None } else { Some(gname) };
 
         (full_path, uname, gname)
     } else {

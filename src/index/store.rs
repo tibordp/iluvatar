@@ -9,6 +9,8 @@ use std::collections::HashMap;
 pub(crate) const INDEX_VERSION: u32 = 2;
 
 /// Metadata about the indexed archive.
+///
+/// Stored as part of [`ArchiveIndex`] and serialized with it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMetadata {
     /// Version of the index format.
@@ -37,22 +39,52 @@ fn default_archive_format() -> ArchiveFormat {
     ArchiveFormat::Tar
 }
 
-/// The complete index for a compressed tar archive.
+/// The complete index for a compressed archive.
 ///
 /// Contains all the information needed to efficiently seek to and read
-/// any file within the archive.
+/// any file within the archive: file metadata, decompressor checkpoints,
+/// and archive-level information.
+///
+/// An index can be serialized with [`to_bytes()`](Self::to_bytes) and
+/// restored with [`from_bytes()`](Self::from_bytes) to avoid re-scanning
+/// the archive on every use.
+///
+/// # Example
+///
+/// ```no_run
+/// # fn example() -> iluvatar::Result<()> {
+/// use iluvatar::sync::Archive;
+/// use std::fs::File;
+///
+/// // Build an index
+/// let mut archive = Archive::new(File::open("data.tar.gz")?)?;
+///
+/// // Save it for later
+/// let bytes = archive.index().to_bytes()?;
+/// std::fs::write("data.tar.gz.idx", &bytes)?;
+///
+/// // Restore it in a future session
+/// let bytes = std::fs::read("data.tar.gz.idx")?;
+/// let index = iluvatar::ArchiveIndex::from_bytes(&bytes)?;
+/// let mut archive = Archive::from_parts(File::open("data.tar.gz")?, index);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveIndex {
-    /// Archive metadata.
+    /// Archive metadata (compression format, size, completeness).
     pub metadata: IndexMetadata,
     /// Sorted list of decompressor checkpoints by uncompressed offset.
     pub checkpoints: Vec<Checkpoint>,
-    /// Map from file path to index entry.
+    /// File entries keyed by path.
     pub entries: HashMap<String, IndexEntry>,
 }
 
 impl ArchiveIndex {
     /// Look up a file by its path.
+    ///
+    /// Handles trailing-slash ambiguity: `get("dir")` will find an entry
+    /// stored as `"dir/"` and vice versa.
     pub fn get(&self, path: &str) -> Option<&IndexEntry> {
         self.entries.get(path).or_else(|| {
             // Try with/without trailing slash for directories
@@ -65,6 +97,10 @@ impl ArchiveIndex {
     }
 
     /// List all entries, optionally filtered by a directory prefix.
+    ///
+    /// Pass `None` to list everything, or `Some("dir")` to list entries
+    /// under `dir/`. The prefix match is path-component-aware, so
+    /// `"src"` matches `"src/main.rs"` but not `"src2/foo.rs"`.
     pub fn list(&self, prefix: Option<&str>) -> Vec<&IndexEntry> {
         match prefix {
             Some(prefix) => {
@@ -103,12 +139,12 @@ impl ArchiveIndex {
         (idx, &self.checkpoints[idx])
     }
 
-    /// Number of files in the index.
+    /// Returns the number of file entries in the index.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Whether the index is empty.
+    /// Returns `true` if the index contains no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

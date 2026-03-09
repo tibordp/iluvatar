@@ -1,6 +1,6 @@
 use crate::compress::checkpoint::{Bzip2CheckpointState, Checkpoint, CheckpointState};
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
-use crate::error::{Result, Error};
+use crate::error::{Error, Result};
 use bzip2::Decompress as BzDecompress;
 
 // ─── Block Boundary Scanner ──────────────────────────────────────────
@@ -204,9 +204,7 @@ impl Decompressor for Bzip2Decompressor {
         // ── Normal mode ──
 
         // Capture the stream level from the header if not yet parsed
-        if !self.header_parsed && input.len() >= 4
-            && &input[0..2] == b"BZ" && input[2] == b'h'
-        {
+        if !self.header_parsed && input.len() >= 4 && &input[0..2] == b"BZ" && input[2] == b'h' {
             self.stream_level = input[3];
             self.header_parsed = true;
         }
@@ -249,11 +247,7 @@ impl Decompressor for Bzip2Decompressor {
         })
     }
 
-    fn checkpoint(
-        &self,
-        _compressed_offset: u64,
-        _uncompressed_offset: u64,
-    ) -> Result<Checkpoint> {
+    fn checkpoint(&self, _compressed_offset: u64, _uncompressed_offset: u64) -> Result<Checkpoint> {
         // Return the last block boundary (like gzip/xz pattern).
         if let Some(ref boundary) = self.last_block_boundary {
             // Compute exact uncompressed offset from block index.
@@ -330,31 +324,12 @@ impl Decompressor for Bzip2Decompressor {
             )),
         }
     }
-
-    fn reset(&mut self) {
-        self.inner = BzDecompress::new(false);
-        self.total_in = 0;
-        self.total_out = 0;
-        self.stream_level = 0;
-        self.header_parsed = false;
-        self.block_count = 0;
-        self.scanner = MagicScanner::new();
-        self.last_block_boundary = None;
-        self.restore_active = false;
-        self.restore_header.clear();
-        self.bit_shifter = None;
-        self.shift_buffer.clear();
-    }
 }
 
 impl Bzip2Decompressor {
     /// Decompress in restore mode: prepend stream header, bit-shift input,
     /// and suppress CRC validation error at end of stream.
-    fn decompress_restore(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> Result<DecompressResult> {
+    fn decompress_restore(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
         // Phase 1: Feed the stream header to the fresh decoder
         if !self.restore_header.is_empty() {
             let header = std::mem::take(&mut self.restore_header);
@@ -389,9 +364,7 @@ impl Bzip2Decompressor {
                     // Header fully consumed, fall through to process input
                 }
                 Err(e) => {
-                    return Err(Error::DecompressionError(
-                        format!("bzip2 header: {}", e),
-                    ));
+                    return Err(Error::DecompressionError(format!("bzip2 header: {}", e)));
                 }
             }
         }
@@ -437,9 +410,9 @@ impl Bzip2Decompressor {
                 let status = match status {
                     bzip2::Status::Ok => DecompressStatus::Continue,
                     bzip2::Status::MemNeeded => DecompressStatus::Continue,
-                    bzip2::Status::RunOk
-                    | bzip2::Status::FlushOk
-                    | bzip2::Status::FinishOk => DecompressStatus::Continue,
+                    bzip2::Status::RunOk | bzip2::Status::FlushOk | bzip2::Status::FinishOk => {
+                        DecompressStatus::Continue
+                    }
                     bzip2::Status::StreamEnd => DecompressStatus::StreamEnd,
                 };
                 Ok(DecompressResult {
