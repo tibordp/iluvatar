@@ -18,6 +18,12 @@ const DECOMPRESS_BUF_SIZE: usize = 64 * 1024;
 // ─── Factory for creating decompressors ───
 
 /// Create a boxed decompressor for the given format.
+///
+/// For XZ/LZMA2 and Zstd, pure-Rust decoders are used by default. These
+/// support full-state checkpointing at any byte offset, unlike the C-wrapper
+/// decompressors which can only checkpoint at frame/block boundaries.
+/// The C-wrapper decompressors are still available behind feature flags
+/// if needed (e.g., for performance-critical paths).
 pub fn create_decompressor(format: CompressionFormat) -> Result<Box<dyn Decompressor>> {
     match format {
         CompressionFormat::None => Ok(Box::new(crate::compress::none::NoneDecompressor::new())),
@@ -31,10 +37,14 @@ pub fn create_decompressor(format: CompressionFormat) -> Result<Box<dyn Decompre
         )),
 
         #[cfg(feature = "xz")]
-        CompressionFormat::Xz => Ok(Box::new(crate::compress::xz::XzDecompressor::new()?)),
+        CompressionFormat::Xz => Ok(Box::new(
+            crate::compress::xz::XzDecompressor::new(),
+        )),
 
         #[cfg(feature = "zstandard")]
-        CompressionFormat::Zstd => Ok(Box::new(crate::compress::zstd::ZstdDecompressor::new()?)),
+        CompressionFormat::Zstd => Ok(Box::new(
+            crate::compress::zstd_dec::ZstdPureDecompressor::new(),
+        )),
 
         #[allow(unreachable_patterns)]
         _ => Err(SupertarError::UnsupportedFormat),
@@ -420,11 +430,11 @@ impl ReadEngine {
             .get(path)
             .ok_or_else(|| SupertarError::FileNotFound(path.into()))?;
 
-        let checkpoint = index.checkpoint_for(entry).clone();
-        let decompressor = create_decompressor(index.metadata.compression)?;
-
         let target_offset = entry.uncompressed_offset;
         let target_size = entry.size;
+        let (_, checkpoint) = index.best_checkpoint_for_offset(target_offset);
+        let checkpoint = checkpoint.clone();
+        let decompressor = create_decompressor(index.metadata.compression)?;
 
         Ok(Self {
             decompressor,

@@ -10,6 +10,8 @@ the entire archive from the beginning.
 
 - **Multiple archive formats**: tar and cpio (newc, odc), auto-detected
 - **Multiple compression formats**: gzip, bzip2, xz, zstd, and uncompressed
+- **Pure Rust decompressors**: xz/LZMA2 and zstd are implemented from scratch
+  with no C dependencies, including full checkpoint/resume support
 - **Sans-I/O core**: The engine never performs I/O itself, making it compatible
   with sync, async, and custom runtimes (e.g. a VFS layer)
 - **Persistent index**: Serialize the index to disk and reuse it across sessions
@@ -19,8 +21,38 @@ the entire archive from the beginning.
   to the nearest checkpoint
 - **Incremental indexing**: Monitor progress, take snapshots, or cancel early
   and still use the partial index
+- **CLI tool**: Browse, list, and extract files from compressed archives
 
-## Quick Start
+## CLI
+
+Install the CLI with:
+
+```sh
+cargo install supertar --features cli
+```
+
+### Usage
+
+```sh
+# Build an index (stored alongside the archive as .stidx)
+supertar index archive.tar.zst
+
+# List archive contents
+supertar ls archive.tar.zst
+supertar ls -l archive.tar.zst           # long format with permissions, sizes, dates
+
+# Print a file to stdout
+supertar cat archive.tar.zst path/to/file.txt
+supertar cat archive.tar.zst big.bin --offset 0 --length 1024  # byte range
+
+# Extract a file
+supertar cp archive.tar.zst path/to/file.txt ./output/
+```
+
+The index is built automatically on first access if no `.stidx` file exists.
+Subsequent operations reuse the saved index for instant access.
+
+## Library Quick Start
 
 ```rust
 use supertar::sync::Archive;
@@ -119,13 +151,13 @@ let index = Archive::build_index_with_progress(
 
 ## Compression Format Support
 
-| Format | Checkpoint Support | Notes |
-|--------|-------------------|-------|
-| gzip   | Block boundary    | Uses miniz_oxide with DEFLATE block boundary detection |
-| bzip2  | Stream state      | Full decompressor state snapshot |
-| xz     | Stream state      | Full decompressor state snapshot |
-| zstd   | Stream state      | Full decompressor state snapshot |
-| none   | Trivial           | Direct byte offset seeking |
+| Format | Checkpoint Strategy | Implementation |
+|--------|-------------------|----------------|
+| gzip   | DEFLATE block boundary | miniz_oxide with `block-boundary` feature |
+| bzip2  | Full state snapshot | `bzip2` crate (C binding) |
+| xz     | Full state snapshot | Pure Rust LZMA2 decoder (no C dependencies) |
+| zstd   | Full state snapshot | Pure Rust decoder (no C dependencies) |
+| none   | Trivial offset | Direct byte seeking |
 
 ## Archive Format Support
 
@@ -139,8 +171,8 @@ let index = Archive::build_index_with_progress(
 - **Index must be built first**: The initial indexing pass reads the entire
   archive. Subsequent reads are fast.
 - **Memory**: Checkpoint state size varies by format. Gzip checkpoints store a
-  32 KiB sliding window. With 1 MiB intervals on a 1 GiB archive, expect ~32 MiB
-  of checkpoint data.
+  32 KiB sliding window. Zstd and xz checkpoints store the full decompressor
+  state including window buffers, so index files can be large for these formats.
 - **No modification**: This is a read-only library. It cannot create or modify
   archives.
 - **Index versioning**: Index format may change between versions. Stored indices
@@ -155,7 +187,14 @@ All compression formats are enabled by default. Disable what you don't need:
 supertar = { version = "0.1", default-features = false, features = ["gzip"] }
 ```
 
-Available features: `gzip`, `bz2`, `xz`, `zstandard`
+| Feature | Description |
+|---------|-------------|
+| `gzip` | gzip/DEFLATE support (via miniz_oxide) |
+| `bz2` | bzip2 support (via bzip2 crate) |
+| `xz` | xz/LZMA2 support (pure Rust) |
+| `zstandard` | zstd support (pure Rust) |
+| `tokio` | Async API via tokio |
+| `cli` | Build the `supertar` CLI binary |
 
 ## License
 

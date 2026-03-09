@@ -9,10 +9,13 @@ pub mod gzip;
 pub mod bzip2;
 
 #[cfg(feature = "xz")]
+pub mod lzma;
+
+#[cfg(feature = "xz")]
 pub mod xz;
 
 #[cfg(feature = "zstandard")]
-pub mod zstd;
+pub mod zstd_dec;
 
 pub mod none;
 
