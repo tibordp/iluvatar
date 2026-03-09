@@ -32,7 +32,7 @@ impl<'a> ForwardBitReader<'a> {
 
     /// Bytes consumed (rounded up).
     pub fn bytes_consumed(&self) -> usize {
-        (self.bits_consumed() + 7) / 8
+        self.bits_consumed().div_ceil(8)
     }
 
     /// Read up to 25 bits (enough for FSE NCount reading).
@@ -66,19 +66,6 @@ impl<'a> ForwardBitReader<'a> {
         Ok(result)
     }
 
-    /// Peek up to 32 bits without consuming.
-    pub fn peek_bits(&self, n: u32) -> Result<u32, &'static str> {
-        let mut clone = self.clone();
-        clone.read_bits(n)
-    }
-
-    /// Align to the next byte boundary.
-    pub fn align_to_byte(&mut self) {
-        if self.bit_pos > 0 {
-            self.byte_pos += 1;
-            self.bit_pos = 0;
-        }
-    }
 }
 
 /// Backward bit reader for zstd sequence bitstreams.
@@ -122,11 +109,7 @@ impl BackwardBitReader {
 
     /// How many bits are still available to read.
     pub fn bits_remaining(&self) -> usize {
-        if self.bit_pos > self.total_bits {
-            0
-        } else {
-            self.total_bits - self.bit_pos
-        }
+        self.total_bits.saturating_sub(self.bit_pos)
     }
 
     /// Read `n` bits from the bitstream (MSB first from the end of data).
@@ -155,37 +138,6 @@ impl BackwardBitReader {
         }
         Ok(result)
     }
-
-    /// Read bits in LSB-first order (for extra bits in sequences).
-    /// This is how additional bits for LL/ML/OF are read.
-    pub fn read_bits_lsb(&mut self, n: u32) -> Result<usize, &'static str> {
-        if n == 0 {
-            return Ok(0);
-        }
-        let n_usize = n as usize;
-        if n_usize > self.bits_remaining() {
-            return Err("not enough bits in backward bitstream");
-        }
-        // Read n bits MSB-first, then reverse their bit order
-        let val = self.read_bits(n)?;
-        Ok(reverse_bits(val, n_usize))
-    }
-
-    /// Check if the stream is fully consumed.
-    pub fn is_finished(&self) -> bool {
-        self.bit_pos >= self.total_bits
-    }
-}
-
-/// Reverse the bottom `n` bits of `val`.
-fn reverse_bits(val: usize, n: usize) -> usize {
-    let mut result = 0;
-    for i in 0..n {
-        if val & (1 << (n - 1 - i)) != 0 {
-            result |= 1 << i;
-        }
-    }
-    result
 }
 
 /// Compute floor(log2(x)) for x > 0.
@@ -266,20 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn test_backward_read_bits_lsb() {
-        // Test that read_bits_lsb reverses the bit order correctly
-        // Data: [0b11111110, 0b10000000]
-        // last byte 0x80, init bit = bit 7, total_bits = 15
-        // bits (MSB-first from end): from byte[1] bits 6..0: 0000000, from byte[0]: 11111110
-        let data = [0b11111110, 0b10000000];
-        let mut reader = BackwardBitReader::new(&data).unwrap();
-        reader.read_bits(7).unwrap(); // skip 7 zero bits
-        // now read 4 bits MSB = 1111
-        let msb_val = reader.read_bits(4).unwrap();
-        assert_eq!(msb_val, 0b1111);
-    }
-
-    #[test]
     fn test_highest_bit() {
         assert_eq!(highest_bit(1), 0);
         assert_eq!(highest_bit(2), 1);
@@ -289,11 +227,4 @@ mod tests {
         assert_eq!(highest_bit(255), 7);
     }
 
-    #[test]
-    fn test_reverse_bits() {
-        assert_eq!(reverse_bits(0b1010, 4), 0b0101);
-        assert_eq!(reverse_bits(0b1100, 4), 0b0011);
-        assert_eq!(reverse_bits(0b1, 1), 0b1);
-        assert_eq!(reverse_bits(0b10, 2), 0b01);
-    }
 }

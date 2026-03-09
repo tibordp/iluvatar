@@ -59,8 +59,7 @@ pub(crate) fn parse_frame_header(data: &[u8]) -> Result<FrameHeader, String> {
     let mut pos = 5;
 
     // Window descriptor (absent if single_segment)
-    let window_size;
-    if !single_segment {
+    let window_size = if !single_segment {
         if pos >= data.len() {
             return Err("frame header truncated at window descriptor".into());
         }
@@ -69,11 +68,11 @@ pub(crate) fn parse_frame_header(data: &[u8]) -> Result<FrameHeader, String> {
         let exponent = (win_byte >> 3) as u32;
         let mantissa = (win_byte & 7) as u64;
         let base = 1u64 << (MIN_WINDOW_LOG + exponent);
-        window_size = (base + (mantissa * (base >> 3))) as usize;
+        (base + (mantissa * (base >> 3))) as usize
     } else {
         // Will be set from content_size below
-        window_size = 0;
-    }
+        0
+    };
 
     // Dictionary ID
     let dict_id_size = match dict_id_flag {
@@ -172,7 +171,7 @@ pub(crate) fn check_skippable_frame(data: &[u8]) -> Option<usize> {
         return None;
     }
     let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if magic >= SKIPPABLE_MAGIC_LOW && magic <= SKIPPABLE_MAGIC_HIGH {
+    if (SKIPPABLE_MAGIC_LOW..=SKIPPABLE_MAGIC_HIGH).contains(&magic) {
         let frame_size =
             u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
         Some(8 + frame_size)

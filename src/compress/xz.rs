@@ -88,6 +88,12 @@ pub struct XzDecompressor {
     finished: bool,
 }
 
+impl Default for XzDecompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl XzDecompressor {
     pub fn new() -> Self {
         Self {
@@ -396,7 +402,7 @@ impl Decompressor for XzDecompressor {
     }
 
     fn checkpoint(&self, compressed_offset: u64, uncompressed_offset: u64) -> Result<Checkpoint> {
-        let lzma2_checkpoint = self.lzma2.as_ref().map(|dec| {
+        let lzma2_checkpoint = self.lzma2.as_ref().and_then(|dec| {
             dec.checkpoint(0, 0)
                 .ok()
                 .and_then(|cp| {
@@ -406,7 +412,7 @@ impl Decompressor for XzDecompressor {
                         None
                     }
                 })
-        }).flatten();
+        });
 
         let state = XzFullCheckpointState {
             phase: bincode::serialize(&self.phase).unwrap_or_default(),

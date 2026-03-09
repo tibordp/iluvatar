@@ -781,11 +781,7 @@ impl LzmaDecoder {
                             if dist == 0xFFFF_FFFF {
                                 // End marker
                                 self.phase = DecodePhase::Finished(
-                                    if self.range_decoder.is_finished_ok() {
-                                        LzmaDecodeStatus::FinishedWithMark
-                                    } else {
-                                        LzmaDecodeStatus::FinishedWithMark
-                                    },
+                                    LzmaDecodeStatus::FinishedWithMark,
                                 );
                                 continue;
                             }
@@ -1008,9 +1004,7 @@ impl LzmaDecoder {
 
         if is_rep_g1 == 0 {
             // Rep1
-            let dist = self.reps[1];
-            self.reps[1] = self.reps[0];
-            self.reps[0] = dist;
+            self.reps.swap(0, 1);
             self.state = update_state_rep(self.state);
             self.phase = DecodePhase::MatchLength(MatchType::Rep1);
             self.len_decode_state = Some(LenDecodeState {
@@ -1134,7 +1128,7 @@ impl LzmaDecoder {
                     pos_state: lds.pos_state,
                     phase: LenPhase::Choice2,
                 });
-                return self.decode_length(input, in_pos);
+                self.decode_length(input, in_pos)
             }
 
             LenPhase::Low { mut m, mut bits_remaining } => {
@@ -1195,7 +1189,7 @@ impl LzmaDecoder {
                         bits_remaining: K_LEN_NUM_HIGH_BITS,
                     },
                 });
-                return self.decode_length(input, in_pos);
+                self.decode_length(input, in_pos)
             }
 
             LenPhase::Mid { mut m, mut bits_remaining } => {
@@ -1310,7 +1304,7 @@ impl LzmaDecoder {
                         num_bits: direct_bits_count,
                     },
                 });
-                return self.decode_distance(input, in_pos);
+                self.decode_distance(input, in_pos)
             }
 
             DistPhase::DirectBits { mut dist, mut num_bits } => {
@@ -1341,7 +1335,7 @@ impl LzmaDecoder {
                         i: 0,
                     },
                 });
-                return self.decode_distance(input, in_pos);
+                self.decode_distance(input, in_pos)
             }
 
             DistPhase::AlignBits {
@@ -1369,7 +1363,7 @@ impl LzmaDecoder {
                     i += 1;
                 }
                 dist |= symbol;
-                return Ok(dist);
+                Ok(dist)
             }
 
             DistPhase::SpecPosBits {
@@ -1405,7 +1399,7 @@ impl LzmaDecoder {
                     symbol |= bit << i;
                     i += 1;
                 }
-                return Ok(dist + symbol);
+                Ok(dist + symbol)
             }
         }
     }

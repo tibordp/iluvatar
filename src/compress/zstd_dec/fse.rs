@@ -52,10 +52,6 @@ impl FseTable {
         &self.entries[state]
     }
 
-    /// Table size (1 << table_log).
-    pub fn size(&self) -> usize {
-        1 << self.table_log
-    }
 }
 
 /// Read an FSE normalized count distribution from a bitstream.
@@ -234,8 +230,7 @@ pub(crate) fn build_fse_table(
     let step = (table_size >> 1) + (table_size >> 3) + 3; // FSE_TABLESTEP
 
     let mut position: u32 = 0;
-    for s in 0..max_sv1 {
-        let count = normalized[s];
+    for (s, &count) in normalized.iter().enumerate().take(max_sv1) {
         for _ in 0..count.max(0) {
             entries[position as usize].symbol = s as u8;
             position = (position + step) & table_mask;
@@ -249,21 +244,21 @@ pub(crate) fn build_fse_table(
     }
 
     // Phase 3: Build decoding entries (nbBits, nextState, baseValue, nbAdditionalBits)
-    for u in 0..table_size as usize {
-        let symbol = entries[u].symbol as usize;
+    for entry in entries.iter_mut().take(table_size as usize) {
+        let symbol = entry.symbol as usize;
         let next_state = symbol_next[symbol] as u32;
         symbol_next[symbol] += 1;
         let nb_bits = table_log - highest_bit(next_state);
-        entries[u].nb_bits = nb_bits as u8;
-        entries[u].next_state = ((next_state << nb_bits) - table_size) as u16;
+        entry.nb_bits = nb_bits as u8;
+        entry.next_state = ((next_state << nb_bits) - table_size) as u16;
         if let Some(bv) = base_values {
             if symbol < bv.len() {
-                entries[u].base_value = bv[symbol];
+                entry.base_value = bv[symbol];
             }
         }
         if let Some(nb) = nb_add_bits {
             if symbol < nb.len() {
-                entries[u].nb_additional_bits = nb[symbol];
+                entry.nb_additional_bits = nb[symbol];
             }
         }
     }

@@ -11,7 +11,7 @@ use super::fse::{self, FseTable};
 use super::huffman::{
     self, decompress_huffman_1stream, decompress_huffman_4streams, HuffmanTable,
 };
-use super::sequences::{self, decode_sequences, execute_sequences, parse_sequences_header};
+use super::sequences::{decode_sequences, execute_sequences, parse_sequences_header};
 
 /// Block types as specified in the zstd format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

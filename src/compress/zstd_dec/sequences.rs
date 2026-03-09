@@ -169,6 +169,7 @@ pub(crate) fn parse_sequences_header(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_seq_table(
     mode: SymbolCompressionMode,
     data: &[u8],
@@ -365,10 +366,8 @@ fn resolve_offset(
                     rep_offsets[0] as usize
                 }
                 2 => {
-                    let off = rep_offsets[1];
-                    rep_offsets[1] = rep_offsets[0];
-                    rep_offsets[0] = off;
-                    off as usize
+                    rep_offsets.swap(0, 1);
+                    rep_offsets[0] as usize
                 }
                 3 => {
                     let off = rep_offsets[2];
@@ -384,10 +383,8 @@ fn resolve_offset(
             match offset_raw {
                 1 => {
                     // Use rep_offsets[1] (which becomes new rep_offsets[0])
-                    let off = rep_offsets[1];
-                    rep_offsets[1] = rep_offsets[0];
-                    rep_offsets[0] = off;
-                    off as usize
+                    rep_offsets.swap(0, 1);
+                    rep_offsets[0] as usize
                 }
                 2 => {
                     let off = rep_offsets[2];

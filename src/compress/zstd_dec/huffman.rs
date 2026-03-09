@@ -11,8 +11,6 @@ use super::fse::{build_fse_table, read_ncount, FseTable};
 
 /// Maximum Huffman table log.
 pub(crate) const HUF_TABLE_LOG_MAX: u32 = 12;
-/// Maximum Huffman table log for zstd literals (usually 11).
-pub(crate) const HUF_TABLE_LOG_DEFAULT: u32 = 11;
 
 /// A single entry in the Huffman decoding table (flat table approach).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -50,7 +48,7 @@ pub(crate) fn read_huffman_table(data: &[u8]) -> Result<(HuffmanTable, usize), S
     let (weights, num_symbols, bytes_consumed) = if header_byte >= 128 {
         // Direct representation: weights are packed 4 bits each
         let num_weights = (header_byte - 127) as usize;
-        let num_bytes = (num_weights + 1) / 2;
+        let num_bytes = num_weights.div_ceil(2);
         if 1 + num_bytes > data.len() {
             return Err("huffman table header extends past data".into());
         }
@@ -156,8 +154,8 @@ pub(crate) fn read_huffman_table(data: &[u8]) -> Result<(HuffmanTable, usize), S
 
     // Fill the table
     let mut entries = vec![HufEntry::default(); table_size];
-    for symbol in 0..total_symbols {
-        let w = all_weights[symbol] as u32;
+    for (symbol, &weight) in all_weights.iter().enumerate().take(total_symbols) {
+        let w = weight as u32;
         if w == 0 {
             continue;
         }
@@ -349,11 +347,7 @@ pub(crate) fn decompress_huffman_1stream(
     let mut output = Vec::with_capacity(regen_size);
 
     while output.len() < regen_size {
-        let bits_remaining = if bit_pos < total_bits {
-            total_bits - bit_pos
-        } else {
-            0
-        };
+        let bits_remaining = total_bits.saturating_sub(bit_pos);
         if bits_remaining == 0 {
             break;
         }
@@ -428,7 +422,7 @@ pub(crate) fn decompress_huffman_4streams(
 
     // Each stream decodes approximately regen_size/4 bytes
     // (the last stream may have a different count)
-    let seg_size = (regen_size + 3) / 4;
+    let seg_size = regen_size.div_ceil(4);
     let regen1 = seg_size.min(regen_size);
     let regen2 = seg_size.min(regen_size.saturating_sub(seg_size));
     let regen3 = seg_size.min(regen_size.saturating_sub(2 * seg_size));

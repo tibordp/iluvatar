@@ -31,9 +31,6 @@ use block::{
 };
 use frame::{check_skippable_frame, parse_frame_header, FrameHeader, ZSTD_MAGIC};
 
-/// Maximum block size for zstd (128 KiB).
-const ZSTD_BLOCK_SIZE_MAX: usize = 128 * 1024;
-
 /// Processing state of the decompressor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum DecoderPhase {
@@ -82,6 +79,12 @@ pub struct ZstdPureDecompressor {
     total_out: u64,
     /// Whether the decompressor has reached the end.
     finished: bool,
+}
+
+impl Default for ZstdPureDecompressor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ZstdPureDecompressor {
