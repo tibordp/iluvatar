@@ -1,5 +1,5 @@
 use crate::archive::EntryType;
-use crate::error::{Result, SupertarError};
+use crate::error::{Result, Error};
 
 /// Size of a newc/crc format header (fixed).
 pub const NEWC_HEADER_SIZE: usize = 110;
@@ -32,6 +32,7 @@ pub enum CpioSubFormat {
 
 /// Parsed cpio header fields (format-independent).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CpioHeader {
     pub ino: u64,
     pub mode: u32,
@@ -50,23 +51,23 @@ pub struct CpioHeader {
 /// Parse an 8-character hex field from a newc header.
 fn parse_hex8(data: &[u8]) -> Result<u64> {
     let s = std::str::from_utf8(data)
-        .map_err(|_| SupertarError::InvalidCpioHeader("invalid UTF-8 in hex field".into()))?;
+        .map_err(|_| Error::InvalidCpioHeader("invalid UTF-8 in hex field".into()))?;
     u64::from_str_radix(s, 16)
-        .map_err(|_| SupertarError::InvalidCpioHeader(format!("invalid hex field: {:?}", s)))
+        .map_err(|_| Error::InvalidCpioHeader(format!("invalid hex field: {:?}", s)))
 }
 
 /// Parse a 6- or 11-character octal field from an odc header.
 fn parse_octal(data: &[u8]) -> Result<u64> {
     let s = std::str::from_utf8(data)
-        .map_err(|_| SupertarError::InvalidCpioHeader("invalid UTF-8 in octal field".into()))?;
+        .map_err(|_| Error::InvalidCpioHeader("invalid UTF-8 in octal field".into()))?;
     u64::from_str_radix(s, 8)
-        .map_err(|_| SupertarError::InvalidCpioHeader(format!("invalid octal field: {:?}", s)))
+        .map_err(|_| Error::InvalidCpioHeader(format!("invalid octal field: {:?}", s)))
 }
 
 /// Parse a newc-format cpio header (110 bytes).
 pub fn parse_newc_header(data: &[u8]) -> Result<CpioHeader> {
     if data.len() < NEWC_HEADER_SIZE {
-        return Err(SupertarError::InvalidCpioHeader("header too short".into()));
+        return Err(Error::InvalidCpioHeader("header too short".into()));
     }
     // Offsets: magic(0,6) ino(6,8) mode(14,8) uid(22,8) gid(30,8)
     //          nlink(38,8) mtime(46,8) filesize(54,8) devmajor(62,8) devminor(70,8)
@@ -90,7 +91,7 @@ pub fn parse_newc_header(data: &[u8]) -> Result<CpioHeader> {
 /// Parse an odc-format cpio header (76 bytes).
 pub fn parse_odc_header(data: &[u8]) -> Result<CpioHeader> {
     if data.len() < ODC_HEADER_SIZE {
-        return Err(SupertarError::InvalidCpioHeader("odc header too short".into()));
+        return Err(Error::InvalidCpioHeader("odc header too short".into()));
     }
     // Offsets: magic(0,6) dev(6,6) ino(12,6) mode(18,6) uid(24,6) gid(30,6)
     //          nlink(36,6) rdev(42,6) mtime(48,11) namesize(59,6) filesize(65,11)

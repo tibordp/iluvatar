@@ -4,7 +4,7 @@ use crate::cpio::header::{
     self, align4, CpioHeader, CpioSubFormat, NEWC_CRC_MAGIC, NEWC_HEADER_SIZE, NEWC_MAGIC,
     ODC_HEADER_SIZE, ODC_MAGIC, TRAILER_NAME,
 };
-use crate::error::{Result, SupertarError};
+use crate::error::{Result, Error};
 use std::collections::HashMap;
 
 /// Internal parser state.
@@ -121,7 +121,7 @@ impl CpioParser {
                         return Ok((available, ArchiveEvent::NeedData));
                     }
                 } else {
-                    return Err(SupertarError::InvalidCpioHeader(format!(
+                    return Err(Error::InvalidCpioHeader(format!(
                         "unrecognized cpio magic: {:?}",
                         &self.header_buf[0..6]
                     )));

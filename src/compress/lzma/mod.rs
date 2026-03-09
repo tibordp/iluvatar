@@ -1,4 +1,4 @@
-//! Pure-Rust LZMA and LZMA2 decoder with full-state checkpointing.
+//! LZMA and LZMA2 decoder with full-state checkpointing.
 //!
 //! This module provides a sans-I/O LZMA2 decoder that implements the
 //! `Decompressor` trait. All internal state is serializable, allowing
@@ -10,11 +10,11 @@ pub mod range_coder;
 
 use crate::compress::checkpoint::{Checkpoint, CheckpointState, Lzma2FullCheckpointState};
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
-use crate::error::{Result, SupertarError};
+use crate::error::{Result, Error};
 
 use lzma2::{Lzma2DecodeStatus, Lzma2Decoder};
 
-/// Pure-Rust LZMA2 decompressor implementing the `Decompressor` trait.
+/// LZMA2 decompressor implementing the `Decompressor` trait.
 ///
 /// Handles raw LZMA2 streams. For XZ container format, use the XZ
 /// decompressor which delegates to this for the LZMA2 payload.
@@ -42,7 +42,7 @@ impl Lzma2Decompressor {
     /// Create from an LZMA2 dictionary size property byte (0-40).
     pub fn from_prop_byte(prop: u8) -> Result<Self> {
         let inner = Lzma2Decoder::from_prop_byte(prop).ok_or_else(|| {
-            SupertarError::DecompressionError(format!("invalid LZMA2 property byte: {}", prop))
+            Error::DecompressionError(format!("invalid LZMA2 property byte: {}", prop))
         })?;
         Ok(Self {
             inner,
@@ -67,21 +67,28 @@ impl Decompressor for Lzma2Decompressor {
         self.total_in += result.bytes_consumed as u64;
         self.total_out += result.bytes_produced as u64;
 
-        let status = match result.status {
+        match result.status {
+            Lzma2DecodeStatus::Error => {
+                Err(Error::DecompressionError(
+                    "corrupt LZMA2 data".into(),
+                ))
+            }
             Lzma2DecodeStatus::Finished => {
                 self.finished = true;
-                DecompressStatus::StreamEnd
+                Ok(DecompressResult {
+                    bytes_consumed: result.bytes_consumed,
+                    bytes_produced: result.bytes_produced,
+                    status: DecompressStatus::StreamEnd,
+                })
             }
             Lzma2DecodeStatus::Continue | Lzma2DecodeStatus::NeedInput => {
-                DecompressStatus::Continue
+                Ok(DecompressResult {
+                    bytes_consumed: result.bytes_consumed,
+                    bytes_produced: result.bytes_produced,
+                    status: DecompressStatus::Continue,
+                })
             }
-        };
-
-        Ok(DecompressResult {
-            bytes_consumed: result.bytes_consumed,
-            bytes_produced: result.bytes_produced,
-            status,
-        })
+        }
     }
 
     fn checkpoint(
@@ -96,7 +103,7 @@ impl Decompressor for Lzma2Decompressor {
             uncompressed_offset,
             state: CheckpointState::Lzma2(Lzma2FullCheckpointState {
                 decoder_state: bincode::serialize(&state).map_err(|e| {
-                    SupertarError::CheckpointError(format!("serialize lzma2 state: {}", e))
+                    Error::CheckpointError(format!("serialize lzma2 state: {}", e))
                 })?,
                 total_in: self.total_in,
                 total_out: self.total_out,
@@ -110,7 +117,7 @@ impl Decompressor for Lzma2Decompressor {
             CheckpointState::Lzma2(state) => {
                 let decoder_state: lzma2::Lzma2DecoderState =
                     bincode::deserialize(&state.decoder_state).map_err(|e| {
-                        SupertarError::CheckpointError(format!("deserialize lzma2 state: {}", e))
+                        Error::CheckpointError(format!("deserialize lzma2 state: {}", e))
                     })?;
                 self.inner.restore_state(&decoder_state);
                 self.total_in = state.total_in;
@@ -122,7 +129,7 @@ impl Decompressor for Lzma2Decompressor {
                 self.reset();
                 Ok(())
             }
-            _ => Err(SupertarError::CheckpointError(
+            _ => Err(Error::CheckpointError(
                 "expected LZMA2 checkpoint state".into(),
             )),
         }

@@ -5,6 +5,22 @@
 //! and delegates actual LZMA decoding to the `LzmaDecoder`.
 //!
 //! All state is serializable for checkpointing.
+//!
+//! # Known limitations
+//!
+//! - **EOPM not rejected**: An End-Of-Payload Marker in the LZMA bitstream
+//!   is invalid inside LZMA2 (end-of-stream should only be signaled by the
+//!   LZMA2 control byte 0x00). The decoder treats EOPM as a normal chunk
+//!   completion rather than an error.
+//!
+//! - **Dictionary reset doesn't invalidate old data**: After a dictionary
+//!   reset (control byte >= 0xE0), the sliding window is cleared but old
+//!   data may remain accessible. A back-reference to pre-reset data should
+//!   be an error but is silently served from stale window contents.
+//!
+//! - **Property requirements not fully enforced**: Some chunk types require
+//!   new LZMA properties to be present. The decoder checks `props_set` but
+//!   does not track whether properties were invalidated by a prior reset.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +57,7 @@ pub enum Lzma2DecodeStatus {
     Continue,
     Finished,
     NeedInput,
+    Error,
 }
 
 /// Result of an LZMA2 decode step.
@@ -111,6 +128,7 @@ impl Lzma2Decoder {
     }
 
     /// Is the decoder in a finished state?
+    #[allow(dead_code)]
     pub fn is_finished(&self) -> bool {
         matches!(self.state, Lzma2State::Finished)
     }
@@ -150,7 +168,7 @@ impl Lzma2Decoder {
                     return Lzma2DecodeResult {
                         bytes_consumed: in_pos,
                         bytes_produced: out_pos,
-                        status: Lzma2DecodeStatus::Finished,
+                        status: Lzma2DecodeStatus::Error,
                     };
                 }
                 Lzma2State::Control => {
@@ -414,7 +432,11 @@ impl Lzma2Decoder {
                                     // Data error: packed data exhausted before unpack complete
                                     self.state = Lzma2State::Error;
                                 }
-                            } else if available_in == 0 {
+                            } else if result.bytes_consumed == 0 {
+                                // LZMA decoder needs more data than currently
+                                // available (e.g. range coder init needs 5 bytes
+                                // but only 1 is buffered). Return to caller so
+                                // more input can be provided.
                                 return Lzma2DecodeResult {
                                     bytes_consumed: in_pos,
                                     bytes_produced: out_pos,

@@ -5,7 +5,7 @@ use crate::compress::decompressor::{DecompressStatus, Decompressor};
 use crate::compress::CompressionFormat;
 use crate::engine::progress::IndexProgress;
 use crate::engine::request::EngineRequest;
-use crate::error::{Result, SupertarError};
+use crate::error::{Result, Error};
 use crate::index::builder::IndexBuilder;
 use crate::index::store::ArchiveIndex;
 
@@ -18,13 +18,7 @@ const DECOMPRESS_BUF_SIZE: usize = 64 * 1024;
 // ─── Factory for creating decompressors ───
 
 /// Create a boxed decompressor for the given format.
-///
-/// For XZ/LZMA2 and Zstd, pure-Rust decoders are used by default. These
-/// support full-state checkpointing at any byte offset, unlike the C-wrapper
-/// decompressors which can only checkpoint at frame/block boundaries.
-/// The C-wrapper decompressors are still available behind feature flags
-/// if needed (e.g., for performance-critical paths).
-pub fn create_decompressor(format: CompressionFormat) -> Result<Box<dyn Decompressor>> {
+fn create_decompressor(format: CompressionFormat) -> Result<Box<dyn Decompressor>> {
     match format {
         CompressionFormat::None => Ok(Box::new(crate::compress::none::NoneDecompressor::new())),
 
@@ -43,16 +37,16 @@ pub fn create_decompressor(format: CompressionFormat) -> Result<Box<dyn Decompre
 
         #[cfg(feature = "zstandard")]
         CompressionFormat::Zstd => Ok(Box::new(
-            crate::compress::zstd_dec::ZstdPureDecompressor::new(),
+            crate::compress::zstd_dec::ZstdDecompressor::new(),
         )),
 
         #[allow(unreachable_patterns)]
-        _ => Err(SupertarError::UnsupportedFormat),
+        _ => Err(Error::UnsupportedFormat),
     }
 }
 
 /// Create a boxed archive parser for the given format.
-pub fn create_archive_parser(format: ArchiveFormat) -> Box<dyn ArchiveParser> {
+fn create_archive_parser(format: ArchiveFormat) -> Box<dyn ArchiveParser> {
     match format {
         ArchiveFormat::Tar => Box::new(crate::tar::parser::TarParser::new()),
         ArchiveFormat::Cpio => Box::new(crate::cpio::parser::CpioParser::new()),
@@ -428,7 +422,7 @@ impl ReadEngine {
     pub fn new(index: &ArchiveIndex, path: &str) -> Result<Self> {
         let entry = index
             .get(path)
-            .ok_or_else(|| SupertarError::FileNotFound(path.into()))?;
+            .ok_or_else(|| Error::FileNotFound(path.into()))?;
 
         let target_offset = entry.uncompressed_offset;
         let target_size = entry.size;
@@ -470,7 +464,7 @@ impl ReadEngine {
     ) -> Result<Self> {
         let entry = index
             .get(path)
-            .ok_or_else(|| SupertarError::FileNotFound(path.into()))?;
+            .ok_or_else(|| Error::FileNotFound(path.into()))?;
 
         let file_offset = file_offset.min(entry.size);
         let read_len = len.min(entry.size - file_offset);

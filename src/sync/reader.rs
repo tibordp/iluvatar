@@ -2,7 +2,7 @@ use crate::compress::detect;
 use crate::engine::progress::IndexProgress;
 use crate::engine::request::EngineRequest;
 use crate::engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
-use crate::error::{Result, SupertarError};
+use crate::error::{Result, Error};
 use crate::index::entry::IndexEntry;
 use crate::index::store::ArchiveIndex;
 use std::io::{Read, Seek, SeekFrom};
@@ -109,7 +109,7 @@ impl<R: Read> Archive<R> {
             header_len += n;
         }
         let format = detect::detect_format(&header[..header_len])
-            .ok_or(SupertarError::UnsupportedFormat)?;
+            .ok_or(Error::UnsupportedFormat)?;
 
         let mut engine = IndexingEngine::new(format, None, checkpoint_interval, file_size)?;
         let mut buf = vec![0u8; BUF_SIZE];

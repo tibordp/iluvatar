@@ -2,11 +2,11 @@ use clap::{Parser, Subcommand};
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use supertar::sync::Archive;
-use supertar::{ArchiveIndex, EntryType, DEFAULT_CHECKPOINT_INTERVAL};
+use iluvatar::sync::Archive;
+use iluvatar::{ArchiveIndex, EntryType, DEFAULT_CHECKPOINT_INTERVAL};
 
 #[derive(Parser)]
-#[command(name = "supertar", version, about = "Random-access compressed archive tool")]
+#[command(name = "iluvatar", version, about = "Random-access compressed archive tool")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

@@ -34,7 +34,7 @@ impl EntryType {
 /// Produced by any `ArchiveParser` implementation. Contains the union
 /// of metadata fields meaningful across tar and cpio.
 #[derive(Debug, Clone)]
-pub struct ArchiveEntry {
+pub(crate) struct ArchiveEntry {
     /// Path of the entry within the archive.
     pub path: String,
     /// Size of the file data in bytes.

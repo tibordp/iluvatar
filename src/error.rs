@@ -1,6 +1,6 @@
-/// Errors that can occur during supertar operations.
+/// Errors that can occur during iluvatar operations.
 #[derive(Debug, thiserror::Error)]
-pub enum SupertarError {
+pub enum Error {
     #[error("unsupported compression format")]
     UnsupportedFormat,
 
@@ -41,11 +41,11 @@ pub enum SupertarError {
     InvalidState(String),
 }
 
-impl From<std::io::Error> for SupertarError {
+impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        SupertarError::Io(e.to_string())
+        Error::Io(e.to_string())
     }
 }
 
-/// Result type alias for supertar operations.
-pub type Result<T> = std::result::Result<T, SupertarError>;
+/// Result type alias for iluvatar operations.
+pub type Result<T> = std::result::Result<T, Error>;

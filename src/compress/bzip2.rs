@@ -1,6 +1,6 @@
 use crate::compress::checkpoint::{Bzip2CheckpointState, Checkpoint, CheckpointState};
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
-use crate::error::{Result, SupertarError};
+use crate::error::{Result, Error};
 use bzip2::Decompress as BzDecompress;
 
 // ─── Block Boundary Scanner ──────────────────────────────────────────
@@ -217,7 +217,7 @@ impl Decompressor for Bzip2Decompressor {
         let status = self
             .inner
             .decompress(input, output)
-            .map_err(|e| SupertarError::DecompressionError(format!("bzip2: {}", e)))?;
+            .map_err(|e| Error::DecompressionError(format!("bzip2: {}", e)))?;
 
         let consumed = (self.inner.total_in() - before_in) as usize;
         let produced = (self.inner.total_out() - before_out) as usize;
@@ -325,7 +325,7 @@ impl Decompressor for Bzip2Decompressor {
                 self.last_block_boundary = None;
                 Ok(())
             }
-            _ => Err(SupertarError::CheckpointError(
+            _ => Err(Error::CheckpointError(
                 "expected bzip2 checkpoint state".into(),
             )),
         }
@@ -389,7 +389,7 @@ impl Bzip2Decompressor {
                     // Header fully consumed, fall through to process input
                 }
                 Err(e) => {
-                    return Err(SupertarError::DecompressionError(
+                    return Err(Error::DecompressionError(
                         format!("bzip2 header: {}", e),
                     ));
                 }
@@ -459,7 +459,7 @@ impl Bzip2Decompressor {
                         status: DecompressStatus::StreamEnd,
                     })
                 } else {
-                    Err(SupertarError::DecompressionError(
+                    Err(Error::DecompressionError(
                         "bzip2 restore: decompression error before any output".into(),
                     ))
                 }

@@ -167,6 +167,7 @@ impl SlidingWindow {
         }
     }
 
+    #[allow(dead_code)]
     pub fn copy_match(&mut self, dist: u32, len: usize) {
         for _ in 0..len {
             let b = self.get_byte(dist);
@@ -200,6 +201,7 @@ impl SlidingWindow {
     }
 
     /// Get the last `dict_size` bytes of the window for checkpointing.
+    #[allow(dead_code)]
     pub fn get_window_data(&self) -> Vec<u8> {
         if !self.is_full {
             self.buf[..self.pos].to_vec()
@@ -212,6 +214,7 @@ impl SlidingWindow {
     }
 
     /// Restore window state from checkpoint data.
+    #[allow(dead_code)]
     pub fn restore_from_data(&mut self, data: &[u8], total_pos: u64) {
         let len = data.len().min(self.size);
         if len <= self.size {

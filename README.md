@@ -1,88 +1,45 @@
-# supertar
+# iluvatar
 
-Efficient random access to files within compressed tar and cpio archives.
+Read individual files from compressed tar and cpio archives without
+decompressing the whole thing.
 
-supertar builds an index of a compressed archive, including periodic decompressor
-state checkpoints, enabling fast random access to any file without decompressing
-the entire archive from the beginning.
+iluvatar works by making an indexing pass over the compressed archive,
+recording each file's path, size, and byte offset in the decompressed stream.
+At regular intervals it snapshots the decompressor's internal state (a
+"checkpoint"). Later, to read a single file, it restores the nearest
+checkpoint, seeks in the compressed stream, and decompresses forward to the
+target — typically at most 1 MiB of data regardless of archive size.
 
-## Features
-
-- **Multiple archive formats**: tar and cpio (newc, odc), auto-detected
-- **Multiple compression formats**: gzip, bzip2, xz, zstd, and uncompressed
-- **Pure Rust decompressors**: xz/LZMA2 and zstd are implemented from scratch
-  with no C dependencies, including full checkpoint/resume support
-- **Sans-I/O core**: The engine never performs I/O itself, making it compatible
-  with sync, async, and custom runtimes (e.g. a VFS layer)
-- **Persistent index**: Serialize the index to disk and reuse it across sessions
-- **Decompression checkpoints**: Periodic snapshots of decompressor state allow
-  seeking to nearby positions without full re-decompression
-- **Range reads**: Read arbitrary byte ranges within files efficiently by seeking
-  to the nearest checkpoint
-- **Incremental indexing**: Monitor progress, take snapshots, or cancel early
-  and still use the partial index
-- **CLI tool**: Browse, list, and extract files from compressed archives
-
-## CLI
-
-Install the CLI with:
-
-```sh
-cargo install supertar --features cli
-```
-
-### Usage
-
-```sh
-# Build an index (stored alongside the archive as .stidx)
-supertar index archive.tar.zst
-
-# List archive contents
-supertar ls archive.tar.zst
-supertar ls -l archive.tar.zst           # long format with permissions, sizes, dates
-
-# Print a file to stdout
-supertar cat archive.tar.zst path/to/file.txt
-supertar cat archive.tar.zst big.bin --offset 0 --length 1024  # byte range
-
-# Extract a file
-supertar cp archive.tar.zst path/to/file.txt ./output/
-```
-
-The index is built automatically on first access if no `.stidx` file exists.
-Subsequent operations reuse the saved index for instant access.
-
-## Library Quick Start
+## Library Usage
 
 ```rust
-use supertar::sync::Archive;
+use iluvatar::sync::Archive;
 use std::fs::File;
 
 let file = File::open("data.tar.gz")?;
 let mut archive = Archive::new(file)?;
 
-// List all entries
 for entry in archive.list() {
     println!("{} ({} bytes)", entry.path, entry.size);
 }
 
-// Read a file
 let contents = archive.read_file("path/to/file.txt")?;
 
-// Read a byte range within a file
+// Read just the first 1 KiB of a large file without decompressing all of it
 let header = archive.read_file_range("big.bin", 0, 1024)?;
 
-// Save the index for next time
+// Save the index for next time (avoids re-scanning the archive)
 std::fs::write("data.tar.gz.idx", archive.index().to_bytes()?)?;
-# Ok::<(), supertar::SupertarError>(())
+# Ok::<(), iluvatar::Error>(())
 ```
 
-## Sans-I/O Usage
+### Sans-I/O engine
 
-For async runtimes, WASM, or custom I/O, drive the engine directly:
+The library core is a sans-I/O state machine — it never calls `read()` or
+`seek()` itself, so you can plug it into tokio, WASM, a VFS, or anything else:
 
 ```rust
-use supertar::{IndexingEngine, EngineRequest, CompressionFormat};
+use iluvatar::{IndexingEngine, EngineRequest, CompressionFormat};
 
 let mut engine = IndexingEngine::new(
     CompressionFormat::Gzip,
@@ -109,13 +66,23 @@ loop {
 
 let index = engine.finish();
 // Use index with ReadEngine to read individual files
-# Ok::<(), supertar::SupertarError>(())
+# Ok::<(), iluvatar::Error>(())
 ```
 
-## Progress Tracking and Cancellation
+### Async (tokio)
+
+```rust,ignore
+use iluvatar::tokio::Archive;
+
+let file = tokio::fs::File::open("data.tar.zst").await?;
+let mut archive = Archive::new(file).await?;
+let data = archive.read_file("some/path").await?;
+```
+
+### Progress tracking
 
 ```rust
-use supertar::sync::Archive;
+use iluvatar::sync::Archive;
 use std::fs::File;
 
 let mut file = File::open("large.tar.gz")?;
@@ -128,73 +95,98 @@ let index = Archive::build_index_with_progress(
         if let Some(pct) = progress.fraction() {
             println!("{:.1}% - {} entries found", pct * 100.0, progress.entries_found);
         }
-        true // return false to cancel
+        true // return false to cancel early and get a partial index
     },
 )?;
-# Ok::<(), supertar::SupertarError>(())
+# Ok::<(), iluvatar::Error>(())
 ```
 
-## How It Works
+## How it works
 
-1. **Indexing pass**: Decompress the entire archive once, recording each file's
-   path, size, and byte offset in the uncompressed stream. At regular intervals,
-   save a snapshot of the decompressor's internal state (a "checkpoint").
+1. **Indexing pass** — Decompress the entire archive once, recording each
+   file's metadata and byte offset. Periodically snapshot the decompressor
+   state into a "checkpoint".
 
-2. **Random reads**: To read a file, find the nearest checkpoint before its data
-   offset, restore the decompressor to that state, seek in the compressed stream,
-   and decompress forward to the target. With 1 MiB checkpoint intervals, at most
-   1 MiB of data needs decompressing per read.
+2. **Random reads** — To read a file, find the nearest checkpoint before its
+   data offset, restore the decompressor to that saved state, seek to the
+   corresponding position in the compressed stream, and decompress forward.
+   With 1 MiB checkpoint intervals, at most 1 MiB needs decompressing per
+   read.
 
-3. **Range reads**: For reading a byte range within a large file, the engine
-   picks the checkpoint closest to the target offset (not just the file's start),
-   minimizing decompression overhead.
+3. **Range reads** — When reading a byte range within a large file, the engine
+   picks the checkpoint closest to the target offset (not the file's start),
+   so reading byte 9 GB of a 10 GB file doesn't decompress the first 9 GB.
 
-## Compression Format Support
+## Supported formats
 
-| Format | Checkpoint Strategy | Implementation |
+**Archive formats:**
+
+| Format | Variants |
+|--------|----------|
+| tar    | ustar, GNU, PAX, V7 (including long name extensions) |
+| cpio   | newc (SVR4), odc (POSIX.1) |
+
+**Compression formats:**
+
+| Format | Checkpoint strategy | Implementation |
 |--------|-------------------|----------------|
-| gzip   | DEFLATE block boundary | miniz_oxide with `block-boundary` feature |
+| gzip   | DEFLATE block boundary | `miniz_oxide` with `block-boundary` feature |
 | bzip2  | Full state snapshot | `bzip2` crate (C binding) |
-| xz     | Full state snapshot | Pure Rust LZMA2 decoder (no C dependencies) |
-| zstd   | Full state snapshot | Pure Rust decoder (no C dependencies) |
-| none   | Trivial offset | Direct byte seeking |
+| xz     | Full state snapshot | Built-in LZMA2 decoder |
+| zstd   | Full state snapshot | Built-in decoder |
+| none   | Trivial byte offset | Direct seeking |
 
-## Archive Format Support
-
-| Format | Variants | Notes |
-|--------|----------|-------|
-| tar    | ustar, GNU, PAX, V7 | Full support including long names and extended headers |
-| cpio   | newc (SVR4), odc (POSIX.1) | Auto-detected from magic bytes |
+The xz and zstd decompressors are built-in rather than wrapping C libraries,
+because checkpoint/resume requires access to the full decompressor state,
+which C library wrappers don't expose.
 
 ## Limitations
 
-- **Index must be built first**: The initial indexing pass reads the entire
+- **The initial indexing pass reads the entire archive.** There's no way around
+  this — you have to decompress everything once to find out what's in the
   archive. Subsequent reads are fast.
-- **Memory**: Checkpoint state size varies by format. Gzip checkpoints store a
-  32 KiB sliding window. Zstd and xz checkpoints store the full decompressor
-  state including window buffers, so index files can be large for these formats.
-- **No modification**: This is a read-only library. It cannot create or modify
-  archives.
-- **Index versioning**: Index format may change between versions. Stored indices
-  include a version number and will be rejected if incompatible.
+- **Index files can be large.** Gzip checkpoints store a 32 KiB window per
+  checkpoint; zstd and xz store the full decompressor state including
+  dictionary buffers, which can be several hundred KiB per checkpoint. With
+  the default 1 MiB interval, a multi-GB archive will produce a sizable index.
+- **Read-only.** This library cannot create or modify archives.
+- **Index format is not stable.** Stored indices include a version number and
+  will be rejected if built by an incompatible version. Regenerate them when
+  you upgrade.
+- **Bzip2 requires a C compiler.** The bzip2 decompressor wraps `libbz2`.
+  The other formats are all Rust-only.
 
-## Feature Flags
+## Feature flags
 
 All compression formats are enabled by default. Disable what you don't need:
 
 ```toml
 [dependencies]
-supertar = { version = "0.1", default-features = false, features = ["gzip"] }
+iluvatar = { version = "0.1", default-features = false, features = ["gzip"] }
 ```
 
 | Feature | Description |
 |---------|-------------|
-| `gzip` | gzip/DEFLATE support (via miniz_oxide) |
-| `bz2` | bzip2 support (via bzip2 crate) |
-| `xz` | xz/LZMA2 support (pure Rust) |
-| `zstandard` | zstd support (pure Rust) |
+| `gzip` | gzip/DEFLATE support (requires `miniz_oxide`) |
+| `bz2` | bzip2 support (requires `bzip2` crate, C binding) |
+| `xz` | xz/LZMA2 support |
+| `zstandard` | zstd support |
 | `tokio` | Async API via tokio |
-| `cli` | Build the `supertar` CLI binary |
+| `cli` | CLI binary (demo/utility, not the main focus) |
+
+## CLI
+
+A small CLI is included for quick inspection of archives. It's a thin wrapper
+around the library, not a production tool.
+
+```sh
+cargo install iluvatar --features cli
+
+iluvatar index archive.tar.zst      # build a .stidx index file
+iluvatar ls -l archive.tar.zst      # list contents
+iluvatar cat archive.tar.zst path/to/file.txt
+iluvatar cp archive.tar.zst path/to/file.txt ./output/
+```
 
 ## License
 

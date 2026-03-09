@@ -24,11 +24,11 @@ pub enum CheckpointState {
     Bzip2(Bzip2CheckpointState),
     /// XZ: block boundary info.
     Xz(XzCheckpointState),
-    /// XZ: full decompressor state for mid-stream checkpoint (pure-Rust decoder).
+    /// XZ: full decompressor state for mid-stream checkpoint.
     XzFull(XzFullCheckpointState),
     /// Zstd: frame boundary info.
     Zstd(ZstdCheckpointState),
-    /// Zstd: full decompressor state for mid-stream checkpoint (pure-Rust decoder).
+    /// Zstd: full decompressor state for mid-stream checkpoint.
     ZstdFull(ZstdFullCheckpointState),
     /// LZMA2: full decompressor state for mid-stream checkpoint.
     Lzma2(Lzma2FullCheckpointState),
@@ -95,7 +95,7 @@ pub struct ZstdCheckpointState {
     pub frame_index: u32,
 }
 
-/// XZ checkpoint: full decompressor state for mid-stream resume (pure-Rust decoder).
+/// XZ checkpoint: full decompressor state for mid-stream resume.
 ///
 /// Captures the complete XZ container parsing state and the inner LZMA2 decoder
 /// state, enabling decompression resume from any byte offset.
@@ -118,7 +118,7 @@ pub struct XzFullCheckpointState {
     pub buffer: Vec<u8>,
 }
 
-/// Zstd checkpoint: full decompressor state for mid-stream resume (pure-Rust decoder).
+/// Zstd checkpoint: full decompressor state for mid-stream resume.
 ///
 /// Unlike the frame-boundary-only `ZstdCheckpointState`, this captures the
 /// complete decoder state (FSE/Huffman tables, repeat offsets, window buffer,

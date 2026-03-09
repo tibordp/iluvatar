@@ -1,7 +1,7 @@
-use crate::error::{Result, SupertarError};
+use crate::error::{Result, Error};
 use crate::index::store::{ArchiveIndex, INDEX_VERSION};
 
-/// Magic bytes for the supertar index file format.
+/// Magic bytes for the iluvatar index file format.
 const INDEX_MAGIC: &[u8; 8] = b"STRIDX\x00\x01";
 
 impl ArchiveIndex {
@@ -10,25 +10,25 @@ impl ArchiveIndex {
         let mut buf = Vec::new();
         buf.extend_from_slice(INDEX_MAGIC);
         bincode::serialize_into(&mut buf, self)
-            .map_err(|e| SupertarError::Serialization(e.to_string()))?;
+            .map_err(|e| Error::Serialization(e.to_string()))?;
         Ok(buf)
     }
 
     /// Deserialize an index from bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < INDEX_MAGIC.len() {
-            return Err(SupertarError::IndexError("data too short".into()));
+            return Err(Error::IndexError("data too short".into()));
         }
 
         if &data[..INDEX_MAGIC.len()] != INDEX_MAGIC {
-            return Err(SupertarError::IndexError("invalid index magic".into()));
+            return Err(Error::IndexError("invalid index magic".into()));
         }
 
         let index: ArchiveIndex = bincode::deserialize(&data[INDEX_MAGIC.len()..])
-            .map_err(|e| SupertarError::Serialization(e.to_string()))?;
+            .map_err(|e| Error::Serialization(e.to_string()))?;
 
         if index.metadata.version != INDEX_VERSION {
-            return Err(SupertarError::IndexVersionMismatch {
+            return Err(Error::IndexVersionMismatch {
                 expected: INDEX_VERSION,
                 got: index.metadata.version,
             });

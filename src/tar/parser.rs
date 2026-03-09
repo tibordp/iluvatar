@@ -71,6 +71,7 @@ impl TarParser {
     }
 
     /// Current position in the uncompressed stream.
+    #[allow(dead_code)]
     pub fn stream_pos(&self) -> u64 {
         self.stream_pos
     }

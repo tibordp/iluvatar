@@ -1,23 +1,34 @@
+//! Decompressor implementations and compression format detection.
+//!
+//! Each supported compression format has its own submodule implementing
+//! a `Decompressor` trait — a sans-I/O interface that consumes compressed
+//! bytes and produces decompressed output, with support for checkpointing
+//! and restoring internal state.
+//!
+//! The xz and zstd decompressors are built-in rather than wrapping C
+//! libraries, because checkpoint/resume requires serializing the full
+//! decompressor state, which C library wrappers don't expose.
+
 pub mod checkpoint;
-pub mod decompressor;
-pub mod detect;
+pub(crate) mod decompressor;
+pub(crate) mod detect;
 
 #[cfg(feature = "gzip")]
-pub mod gzip;
+pub(crate) mod gzip;
 
 #[cfg(feature = "bz2")]
-pub mod bzip2;
+pub(crate) mod bzip2;
 
 #[cfg(feature = "xz")]
-pub mod lzma;
+pub(crate) mod lzma;
 
 #[cfg(feature = "xz")]
-pub mod xz;
+pub(crate) mod xz;
 
 #[cfg(feature = "zstandard")]
-pub mod zstd_dec;
+pub(crate) mod zstd_dec;
 
-pub mod none;
+pub(crate) mod none;
 
 use serde::{Deserialize, Serialize};
 

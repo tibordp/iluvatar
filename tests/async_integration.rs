@@ -1,6 +1,6 @@
 #![cfg(feature = "tokio")]
 
-use supertar::tokio::Archive;
+use iluvatar::tokio::Archive;
 use tokio::io::AsyncReadExt;
 
 // Re-use the same tar-building helpers via a shared module would be ideal,

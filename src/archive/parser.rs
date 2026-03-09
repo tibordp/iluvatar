@@ -19,6 +19,7 @@ pub enum ArchiveEvent {
 /// `(bytes_consumed, event)`. Metadata-only entries (PAX headers,
 /// GNU long names, cpio trailers) are consumed internally and
 /// never emitted as `ArchiveEvent::Entry`.
+#[allow(dead_code)]
 pub trait ArchiveParser: Send {
     /// Feed decompressed data to the parser.
     ///

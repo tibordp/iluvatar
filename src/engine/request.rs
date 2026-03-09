@@ -22,5 +22,5 @@ pub enum EngineRequest {
     Done,
 
     /// An error occurred.
-    Error(crate::error::SupertarError),
+    Error(crate::error::Error),
 }

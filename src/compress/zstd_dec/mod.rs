@@ -1,4 +1,4 @@
-//! Pure-Rust zstd (Zstandard) decoder with full-state checkpointing.
+//! Zstd (Zstandard) decoder with full-state checkpointing.
 //!
 //! This module implements a sans-I/O zstd decompressor that processes
 //! input slices and produces output. Unlike the C-library wrapper (`zstd` crate),
@@ -12,6 +12,29 @@
 //! - `huffman.rs` — Huffman table building and literal decompression
 //! - `sequences.rs` — Sequence (LLL, Offset, ML) decoding and execution
 //! - `bits.rs` — Bit readers (forward and backward)
+//!
+//! # Known limitations
+//!
+//! - **Content checksum (XXH64)**: The checksum flag is parsed and the 4
+//!   trailing bytes are skipped, but the hash is not computed or verified.
+//!   Corrupted data that is structurally valid will decompress without error.
+//!
+//! - **Content size validation**: Frame Content Size is parsed from the
+//!   header but not enforced against actual decompressed output. A frame
+//!   that produces more or fewer bytes than declared is not rejected.
+//!
+//! - **Dictionary support**: Dictionary IDs are parsed from the frame
+//!   header but dictionaries are not supported. Frames that require a
+//!   predefined dictionary will fail during decompression (missing context)
+//!   rather than being cleanly rejected upfront.
+//!
+//! - **Window size limits**: Window size from the frame header is used for
+//!   the sliding window, but no upper bound is enforced. A malicious frame
+//!   could declare a very large window size causing high memory usage.
+//!
+//! - **Legacy frame formats**: Only the current zstd frame format (magic
+//!   `0xFD2FB528`) and skippable frames are supported. Legacy formats from
+//!   pre-1.0 zstd are not recognized.
 
 pub(crate) mod bits;
 pub(crate) mod block;
@@ -24,7 +47,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compress::checkpoint::{Checkpoint, CheckpointState, ZstdFullCheckpointState};
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
-use crate::error::{Result, SupertarError};
+use crate::error::{Result, Error};
 
 use block::{
     block_compressed_size, decompress_block, parse_block_header, BlockDecoderState, BlockType,
@@ -53,10 +76,10 @@ enum DecoderPhase {
     Done,
 }
 
-/// Pure-Rust zstd decompressor with full-state checkpointing.
+/// Zstd decompressor with full-state checkpointing.
 ///
 /// Implements the `Decompressor` trait for sans-I/O usage.
-pub struct ZstdPureDecompressor {
+pub struct ZstdDecompressor {
     /// Current processing phase.
     phase: DecoderPhase,
     /// Internal buffer for accumulating partial input.
@@ -81,14 +104,14 @@ pub struct ZstdPureDecompressor {
     finished: bool,
 }
 
-impl Default for ZstdPureDecompressor {
+impl Default for ZstdDecompressor {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ZstdPureDecompressor {
-    /// Create a new pure-Rust zstd decompressor.
+impl ZstdDecompressor {
+    /// Create a new zstd decompressor.
     pub fn new() -> Self {
         Self {
             phase: DecoderPhase::FrameHeader,
@@ -150,15 +173,15 @@ impl ZstdPureDecompressor {
     /// Restore state from a checkpoint.
     fn restore_from_checkpoint_state(&mut self, state: &ZstdFullCheckpointState) -> Result<()> {
         self.block_state = bincode::deserialize(&state.block_state)
-            .map_err(|e| SupertarError::CheckpointError(format!("deserialize block_state: {}", e)))?;
+            .map_err(|e| Error::CheckpointError(format!("deserialize block_state: {}", e)))?;
         self.window = state.window.clone();
         self.window_size = state.window_size;
         self.phase = bincode::deserialize(&state.phase)
-            .map_err(|e| SupertarError::CheckpointError(format!("deserialize phase: {}", e)))?;
+            .map_err(|e| Error::CheckpointError(format!("deserialize phase: {}", e)))?;
         self.frame_header = if let Some(ref fh_bytes) = state.frame_header {
             Some(
                 bincode::deserialize(fh_bytes).map_err(|e| {
-                    SupertarError::CheckpointError(format!("deserialize frame_header: {}", e))
+                    Error::CheckpointError(format!("deserialize frame_header: {}", e))
                 })?,
             )
         } else {
@@ -172,7 +195,7 @@ impl ZstdPureDecompressor {
     }
 }
 
-impl Decompressor for ZstdPureDecompressor {
+impl Decompressor for ZstdDecompressor {
     fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
         // If we have staged output from a previous call, deliver it first
         if self.staged_pos < self.staged_output.len() {
@@ -270,7 +293,7 @@ impl Decompressor for ZstdPureDecompressor {
                     }
 
                     let header = parse_block_header(&self.buffer[pos..]).map_err(|e| {
-                        SupertarError::DecompressionError(format!("block header: {}", e))
+                        Error::DecompressionError(format!("block header: {}", e))
                     })?;
                     pos += 3;
 
@@ -298,7 +321,7 @@ impl Decompressor for ZstdPureDecompressor {
                         1 => BlockType::Rle,
                         2 => BlockType::Compressed,
                         _ => {
-                            return Err(SupertarError::DecompressionError(
+                            return Err(Error::DecompressionError(
                                 "invalid block type".into(),
                             ))
                         }
@@ -321,7 +344,7 @@ impl Decompressor for ZstdPureDecompressor {
                         &mut block_output,
                     )
                     .map_err(|e| {
-                        SupertarError::DecompressionError(format!("block decompress: {}", e))
+                        Error::DecompressionError(format!("block decompress: {}", e))
                     })?;
 
                     pos += compressed_size;
@@ -415,7 +438,7 @@ impl Decompressor for ZstdPureDecompressor {
                 self.reset();
                 Ok(())
             }
-            _ => Err(SupertarError::CheckpointError(
+            _ => Err(Error::CheckpointError(
                 "expected ZstdFull checkpoint state".into(),
             )),
         }
@@ -439,7 +462,7 @@ impl Decompressor for ZstdPureDecompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
+    use crate::compress::decompressor::{DecompressStatus, Decompressor};
 
     fn compress_zstd(data: &[u8]) -> Vec<u8> {
         zstd::encode_all(std::io::Cursor::new(data), 1).unwrap()
@@ -459,7 +482,7 @@ mod tests {
 
     /// Full decompression loop.
     fn full_decompress(compressed: &[u8], chunk_size: usize) -> Vec<u8> {
-        let mut dec = ZstdPureDecompressor::new();
+        let mut dec = ZstdDecompressor::new();
         let mut all_output = Vec::new();
         let mut offset = 0;
 
@@ -532,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_decompress_incremental() {
-        let original = b"Hello, world! This is a test of the pure Rust zstd decoder.";
+        let original = b"Hello, world! This is a test of the zstd decoder.";
         let compressed = compress_zstd(original);
         let output = full_decompress(&compressed, 10);
         assert_eq!(&output, &original[..]);
@@ -560,7 +583,7 @@ mod tests {
         let compressed = compress_zstd_multiframe(&original, 2000);
 
         // Decompress partially, take checkpoint
-        let mut dec = ZstdPureDecompressor::new();
+        let mut dec = ZstdDecompressor::new();
         let mut all_output = Vec::new();
         let mut offset = 0;
         let mut checkpoint_saved = None;
@@ -598,7 +621,7 @@ mod tests {
 
         // Restore from checkpoint
         if let Some(cp) = checkpoint_saved {
-            let mut dec2 = ZstdPureDecompressor::new();
+            let mut dec2 = ZstdDecompressor::new();
             dec2.restore(&cp).unwrap();
 
             let mut restored_output = Vec::new();
@@ -644,7 +667,7 @@ mod tests {
         let original = b"Hello, world!";
         let compressed = compress_zstd(original);
 
-        let mut dec = ZstdPureDecompressor::new();
+        let mut dec = ZstdDecompressor::new();
         let output = full_decompress(&compressed, compressed.len());
         assert_eq!(&output, &original[..]);
 
@@ -668,5 +691,292 @@ mod tests {
         let compressed = compress_zstd_level(&original, 19);
         let output = full_decompress(&compressed, 4096);
         assert_eq!(output, original);
+    }
+
+    // ─── Golden reference file tests ───
+    //
+    // These test against the official zstd golden decompression vectors from
+    // the zstd 1.5.6 source tree. They exercise edge cases that the reference
+    // implementation explicitly tests for.
+
+    /// Decompress a golden file and compare against the reference zstd crate.
+    fn verify_golden(compressed: &[u8], chunk_size: usize) {
+        let expected = zstd::decode_all(std::io::Cursor::new(compressed)).unwrap();
+        let output = full_decompress(compressed, chunk_size);
+        assert_eq!(output.len(), expected.len(), "length mismatch");
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_golden_rle_first_block() {
+        // 1 MiB of zeros, encoded with an RLE block as the first block.
+        let compressed = include_bytes!(
+            "../../../tests/vectors/zstd/golden-decompression/rle-first-block.zst"
+        );
+        verify_golden(compressed, 4096);
+    }
+
+    #[test]
+    fn test_golden_empty_block() {
+        // Frame containing an empty block — decompresses to 0 bytes.
+        let compressed = include_bytes!(
+            "../../../tests/vectors/zstd/golden-decompression/empty-block.zst"
+        );
+        verify_golden(compressed, compressed.len());
+    }
+
+    #[test]
+    fn test_golden_block_128k() {
+        // Frame with a 128 KiB block.
+        let compressed = include_bytes!(
+            "../../../tests/vectors/zstd/golden-decompression/block-128k.zst"
+        );
+        verify_golden(compressed, 4096);
+    }
+
+    #[test]
+    fn test_golden_zero_seq_2b() {
+        // Minimal frame with a 2-byte zero sequence section.
+        let compressed = include_bytes!(
+            "../../../tests/vectors/zstd/golden-decompression/zeroSeq_2B.zst"
+        );
+        verify_golden(compressed, compressed.len());
+    }
+
+    #[test]
+    fn test_golden_rle_first_block_incremental() {
+        // Same as above but fed in tiny 64-byte chunks.
+        let compressed = include_bytes!(
+            "../../../tests/vectors/zstd/golden-decompression/rle-first-block.zst"
+        );
+        verify_golden(compressed, 64);
+    }
+
+    #[test]
+    fn test_golden_block_128k_incremental() {
+        let compressed = include_bytes!(
+            "../../../tests/vectors/zstd/golden-decompression/block-128k.zst"
+        );
+        verify_golden(compressed, 64);
+    }
+
+    // ─── Golden compression round-trip tests ───
+    //
+    // Compress the official golden compression test inputs at various levels,
+    // then decompress with our decoder.
+
+    #[test]
+    fn test_golden_compress_http() {
+        let original = include_bytes!(
+            "../../../tests/vectors/zstd/golden-compression/http"
+        );
+        for level in [1, 3, 9, 15, 19] {
+            let compressed = compress_zstd_level(original, level);
+            let output = full_decompress(&compressed, 4096);
+            assert_eq!(&output, &original[..], "mismatch at level {level}");
+        }
+    }
+
+    #[test]
+    fn test_golden_compress_huffman_compressed_larger() {
+        // This input expands under compression — tests raw/RLE block fallback.
+        let original = include_bytes!(
+            "../../../tests/vectors/zstd/golden-compression/huffman-compressed-larger"
+        );
+        for level in [1, 3, 9, 15, 19] {
+            let compressed = compress_zstd_level(original, level);
+            let output = full_decompress(&compressed, 4096);
+            assert_eq!(&output, &original[..], "mismatch at level {level}");
+        }
+    }
+
+    #[test]
+    fn test_golden_compress_large_literal_and_match_lengths() {
+        // 200 KB of data that exercises large literal and match length codes.
+        let original = include_bytes!(
+            "../../../tests/vectors/zstd/golden-compression/large-literal-and-match-lengths"
+        );
+        for level in [1, 3, 9, 19] {
+            let compressed = compress_zstd_level(original, level);
+            let output = full_decompress(&compressed, 4096);
+            assert_eq!(output.len(), original.len(), "length mismatch at level {level}");
+            assert_eq!(&output, &original[..], "mismatch at level {level}");
+        }
+    }
+
+    #[test]
+    fn test_golden_compress_block_splitter() {
+        // 256 KB regression test for block splitter corruption.
+        let original = include_bytes!(
+            "../../../tests/vectors/zstd/golden-compression/PR-3517-block-splitter-corruption-test"
+        );
+        for level in [1, 9, 19] {
+            let compressed = compress_zstd_level(original, level);
+            let output = full_decompress(&compressed, 4096);
+            assert_eq!(output.len(), original.len(), "length mismatch at level {level}");
+            assert_eq!(&output, &original[..], "mismatch at level {level}");
+        }
+    }
+
+    // ─── Diverse data pattern tests ───
+
+    /// Simple deterministic PRNG for reproducible test data.
+    fn prng_data(seed: u64, size: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..size)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_all_compression_levels() {
+        // Exercises every zstd compression level (1-19).
+        // Different levels produce fundamentally different block structures:
+        // 1-3: greedy/fast, 4-9: lazy matching, 10-19: optimal parsing + Huffman literals.
+        let original = prng_data(12345, 50_000);
+        for level in 1..=19 {
+            let compressed = compress_zstd_level(&original, level);
+            let output = full_decompress(&compressed, 4096);
+            assert_eq!(output, original, "mismatch at level {level}");
+        }
+    }
+
+    #[test]
+    fn test_all_zeros() {
+        // All-zero data triggers RLE blocks.
+        let original = vec![0u8; 100_000];
+        let compressed = compress_zstd(&original);
+        let output = full_decompress(&compressed, 4096);
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_single_byte() {
+        let original = vec![42u8; 1];
+        let compressed = compress_zstd(&original);
+        let output = full_decompress(&compressed, 4096);
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_incompressible_random() {
+        // Highly random data — likely produces raw (uncompressed) blocks.
+        let original = prng_data(99999, 100_000);
+        let compressed = compress_zstd_level(&original, 1);
+        let output = full_decompress(&compressed, 4096);
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_repeating_pattern_various_periods() {
+        // Varying repeat periods exercise different match-distance encodings.
+        for period in [1, 2, 3, 7, 16, 255, 1024] {
+            let original: Vec<u8> = (0..50_000).map(|i| (i % period) as u8).collect();
+            let compressed = compress_zstd(&original);
+            let output = full_decompress(&compressed, 4096);
+            assert_eq!(output, original, "mismatch for period {period}");
+        }
+    }
+
+    #[test]
+    fn test_multiframe_various_sizes() {
+        // Multi-frame with varying frame sizes.
+        let original = prng_data(54321, 100_000);
+        for frame_size in [500, 2048, 8192, 32768] {
+            let compressed = compress_zstd_multiframe(&original, frame_size);
+            let output = full_decompress(&compressed, 4096);
+            assert_eq!(output, original, "mismatch for frame_size {frame_size}");
+        }
+    }
+
+    #[test]
+    fn test_tiny_input_chunks() {
+        // Feed compressed data 1 byte at a time.
+        let original = prng_data(11111, 10_000);
+        let compressed = compress_zstd(&original);
+        let output = full_decompress(&compressed, 1);
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_checkpoint_restore_golden() {
+        // Checkpoint/restore with the large golden compression file.
+        let original = include_bytes!(
+            "../../../tests/vectors/zstd/golden-compression/large-literal-and-match-lengths"
+        );
+        let compressed = compress_zstd_level(original, 3);
+
+        let mut dec = ZstdDecompressor::new();
+        let mut all_output = Vec::new();
+        let mut offset = 0;
+        let mut checkpoint_saved = None;
+        let mut output_at_checkpoint = 0;
+
+        // Decompress until we have >50KB, then checkpoint
+        while offset < compressed.len() {
+            let end = (offset + 4096).min(compressed.len());
+            let mut output = vec![0u8; 256 * 1024];
+            let result = dec.decompress(&compressed[offset..end], &mut output).unwrap();
+            all_output.extend_from_slice(&output[..result.bytes_produced]);
+            offset += result.bytes_consumed;
+
+            if all_output.len() >= 50_000 && checkpoint_saved.is_none() {
+                checkpoint_saved = Some(dec.checkpoint(offset as u64, all_output.len() as u64).unwrap());
+                output_at_checkpoint = all_output.len();
+            }
+
+            if result.status == DecompressStatus::StreamEnd {
+                break;
+            }
+        }
+
+        // Drain
+        loop {
+            let mut output = vec![0u8; 65536];
+            let result = dec.decompress(&[], &mut output).unwrap();
+            if result.bytes_produced > 0 {
+                all_output.extend_from_slice(&output[..result.bytes_produced]);
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(&all_output, &original[..]);
+
+        // Now restore from checkpoint and decompress the rest
+        let checkpoint = checkpoint_saved.unwrap();
+        let restore_offset = checkpoint.compressed_offset as usize;
+        let mut dec2 = ZstdDecompressor::new();
+        dec2.restore(&checkpoint).unwrap();
+
+        let mut restored_output = Vec::new();
+        let mut offset = restore_offset;
+
+        while offset < compressed.len() {
+            let end = (offset + 4096).min(compressed.len());
+            let mut output = vec![0u8; 256 * 1024];
+            let result = dec2.decompress(&compressed[offset..end], &mut output).unwrap();
+            restored_output.extend_from_slice(&output[..result.bytes_produced]);
+            offset += result.bytes_consumed;
+
+            if result.status == DecompressStatus::StreamEnd {
+                break;
+            }
+        }
+
+        loop {
+            let mut output = vec![0u8; 65536];
+            let result = dec2.decompress(&[], &mut output).unwrap();
+            if result.bytes_produced > 0 {
+                restored_output.extend_from_slice(&output[..result.bytes_produced]);
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(restored_output, all_output[output_at_checkpoint..]);
     }
 }

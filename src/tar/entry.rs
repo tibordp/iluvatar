@@ -76,8 +76,10 @@ pub struct TarEntry {
     /// Modification time (Unix timestamp).
     pub mtime: u64,
     /// Owner user name.
+    #[allow(dead_code)]
     pub uname: Option<String>,
     /// Owner group name.
+    #[allow(dead_code)]
     pub gname: Option<String>,
     /// Link target for hard/symlinks.
     pub link_target: Option<String>,

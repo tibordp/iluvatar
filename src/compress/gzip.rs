@@ -2,7 +2,7 @@ use crate::compress::checkpoint::{
     Checkpoint, CheckpointState, GzipBlockBoundary, GzipCheckpointState,
 };
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
-use crate::error::{Result, SupertarError};
+use crate::error::{Result, Error};
 use miniz_oxide::inflate::core::{
     decompress as miniz_decompress, inflate_flags, DecompressorOxide,
 };
@@ -273,7 +273,7 @@ impl GzipDecompressor {
                 DecompressStatus::StreamEnd
             }
             _ => {
-                return Err(SupertarError::DecompressionError(format!(
+                return Err(Error::DecompressionError(format!(
                     "inflate error: {:?}",
                     status
                 )));
@@ -430,7 +430,7 @@ impl Decompressor for GzipDecompressor {
                 self.reset();
                 Ok(())
             }
-            _ => Err(SupertarError::CheckpointError(
+            _ => Err(Error::CheckpointError(
                 "expected gzip checkpoint state".into(),
             )),
         }

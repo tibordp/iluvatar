@@ -143,6 +143,7 @@ impl RangeDecoder {
     }
 
     /// Check if decoding finished correctly.
+    #[allow(dead_code)]
     pub fn is_finished_ok(&self) -> bool {
         self.code == 0
     }

@@ -1,11 +1,11 @@
 use std::fs::File;
 use std::io::Write;
-use supertar::archive::ArchiveFormat;
-use supertar::compress::CompressionFormat;
-use supertar::engine::request::EngineRequest;
-use supertar::engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
-use supertar::index::store::ArchiveIndex;
-use supertar::sync::Archive;
+use iluvatar::archive::ArchiveFormat;
+use iluvatar::compress::CompressionFormat;
+use iluvatar::engine::request::EngineRequest;
+use iluvatar::engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
+use iluvatar::index::store::ArchiveIndex;
+use iluvatar::sync::Archive;
 use tempfile::NamedTempFile;
 
 // ─── Helpers ───

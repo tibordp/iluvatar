@@ -1,69 +1,79 @@
-//! # supertar
+//! # iluvatar
 //!
-//! Efficient random access to files within compressed tar/cpio archives.
+//! Read individual files from compressed tar and cpio archives without
+//! decompressing the whole thing.
 //!
-//! supertar builds an index of a compressed archive, including periodic
-//! decompressor state checkpoints, enabling fast random access to any file
-//! without decompressing the entire archive from the beginning.
+//! The library makes an indexing pass over the archive, recording each file's
+//! position and periodically snapshotting the decompressor state. Subsequent
+//! reads restore the nearest snapshot and decompress forward — typically
+//! at most 1 MiB regardless of archive size.
 //!
-//! ## Key Features
+//! ## Quick start
 //!
-//! - **Sans-I/O core**: The engine never performs I/O itself, making it
-//!   compatible with both sync and async runtimes.
-//! - **Multiple compression formats**: gzip, bzip2, xz, zstd, and uncompressed.
-//! - **Persistent index**: Index can be serialized to disk and reused.
-//! - **Decompression checkpoints**: Periodic snapshots of decompressor state
-//!   allow seeking to nearby positions without full re-decompression.
-//!
-//! ## Quick Start (Sync)
+//! The [`sync::Archive`] type wraps any `Read + Seek` reader:
 //!
 //! ```no_run
-//! use supertar::sync::Archive;
+//! use iluvatar::sync::Archive;
 //! use std::fs::File;
 //!
 //! let file = File::open("data.tar.gz").unwrap();
 //! let mut archive = Archive::new(file).unwrap();
+//!
+//! // List entries
 //! for entry in archive.list() {
 //!     println!("{} ({} bytes)", entry.path, entry.size);
 //! }
-//! let contents = archive.read_file("path/to/file.txt").unwrap();
+//!
+//! // Read a file
+//! let data = archive.read_file("path/to/file.txt").unwrap();
+//!
+//! // Read a byte range without decompressing the whole file
+//! let header = archive.read_file_range("big.bin", 0, 1024).unwrap();
 //! ```
 //!
-//! ## Sans-I/O Usage
+//! ## Sans-I/O engine
 //!
-//! For async or custom I/O, use the engine directly:
+//! For async runtimes, WASM, or custom I/O, drive the engine directly.
+//! It never calls `read()` or `seek()` — you feed it data and it tells
+//! you what it needs next via [`EngineRequest`].
 //!
 //! ```no_run
-//! use supertar::engine::state_machine::IndexingEngine;
-//! use supertar::engine::request::EngineRequest;
-//! use supertar::compress::CompressionFormat;
+//! use iluvatar::{IndexingEngine, EngineRequest, CompressionFormat};
 //!
 //! let mut engine = IndexingEngine::new(
 //!     CompressionFormat::Gzip,
-//!     None,        // auto-detect archive format (tar vs cpio)
-//!     1024 * 1024, // checkpoint every 1 MiB
-//!     0,           // archive size (can be 0 if unknown)
+//!     None,        // auto-detect archive format
+//!     1024 * 1024, // checkpoint interval
+//!     0,           // archive size (0 = unknown)
 //! ).unwrap();
 //!
-//! // Drive the engine with your own I/O:
 //! // loop {
 //! //     match engine.step() {
-//! //         EngineRequest::NeedInput => { /* read data, call engine.provide_data() */ }
+//! //         EngineRequest::NeedInput => { /* provide data */ }
 //! //         EngineRequest::Done => break,
 //! //         _ => {}
 //! //     }
 //! // }
 //! // let index = engine.finish();
 //! ```
+//!
+//! ## Modules
+//!
+//! - [`sync`] — Synchronous `Archive` API (most users want this)
+//! - [`tokio`] — Async equivalent using tokio
+//! - [`engine`] — Sans-I/O [`IndexingEngine`] and [`ReadEngine`]
+//! - [`compress`] — Decompressor implementations and format detection
+//! - [`archive`] — Archive format types and parsers (tar, cpio)
+//! - [`index`] — Index types and serialization
 
 pub mod archive;
 pub mod compress;
-pub mod cpio;
+pub(crate) mod cpio;
 pub mod engine;
 pub mod error;
 pub mod index;
 pub mod sync;
-pub mod tar;
+pub(crate) mod tar;
 
 #[cfg(feature = "tokio")]
 pub mod tokio;
@@ -74,6 +84,6 @@ pub use compress::CompressionFormat;
 pub use engine::progress::IndexProgress;
 pub use engine::request::EngineRequest;
 pub use engine::state_machine::{IndexingEngine, ReadEngine, DEFAULT_CHECKPOINT_INTERVAL};
-pub use error::{Result, SupertarError};
+pub use error::{Result, Error};
 pub use index::entry::IndexEntry;
 pub use index::store::ArchiveIndex;

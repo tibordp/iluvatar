@@ -1,4 +1,4 @@
-use crate::error::{Result, SupertarError};
+use crate::error::{Result, Error};
 use crate::tar::entry::{TarEntry, TarEntryType};
 
 /// Size of a tar header/block.
@@ -28,10 +28,10 @@ pub fn parse_octal(field: &[u8]) -> Result<u64> {
     }
 
     let s = std::str::from_utf8(&s)
-        .map_err(|_| SupertarError::InvalidTarHeader("invalid octal field".into()))?;
+        .map_err(|_| Error::InvalidTarHeader("invalid octal field".into()))?;
 
     u64::from_str_radix(s, 8)
-        .map_err(|_| SupertarError::InvalidTarHeader(format!("invalid octal: {:?}", s)))
+        .map_err(|_| Error::InvalidTarHeader(format!("invalid octal: {:?}", s)))
 }
 
 /// Extract a null-terminated string from a tar header field.
@@ -74,7 +74,7 @@ pub fn validate_checksum(header: &[u8; BLOCK_SIZE]) -> bool {
 /// where the file data starts (immediately after this header block).
 pub fn parse_header(header: &[u8; BLOCK_SIZE], data_offset: u64) -> Result<TarEntry> {
     if !validate_checksum(header) {
-        return Err(SupertarError::InvalidTarHeader(
+        return Err(Error::InvalidTarHeader(
             "checksum mismatch".into(),
         ));
     }

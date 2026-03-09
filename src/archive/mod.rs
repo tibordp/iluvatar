@@ -1,11 +1,19 @@
-pub mod detect;
+//! Archive format types and parsers.
+//!
+//! This module defines the format-agnostic interface shared by tar and cpio:
+//!
+//! - [`EntryType`] — File type enum (regular, directory, symlink, etc.).
+//! - [`ArchiveFormat`] — Enum distinguishing tar from cpio.
+
+pub(crate) mod detect;
 pub mod entry;
-pub mod parser;
+pub(crate) mod parser;
 
 use serde::{Deserialize, Serialize};
 
-pub use entry::{ArchiveEntry, EntryType};
-pub use parser::{ArchiveEvent, ArchiveParser};
+pub use entry::EntryType;
+pub(crate) use entry::ArchiveEntry;
+pub(crate) use parser::{ArchiveEvent, ArchiveParser};
 
 /// The archive container format (orthogonal to compression).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
