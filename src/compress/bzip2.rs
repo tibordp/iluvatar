@@ -332,7 +332,13 @@ impl Decompressor for Bzip2Decompressor {
                     break;
                 }
                 if result.bytes_consumed == 0 && result.bytes_produced == 0 {
-                    break;
+                    // Inner decoder cannot make progress with current input/output;
+                    // return partial progress so the caller can provide more data.
+                    return Ok(DecompressResult {
+                        bytes_consumed: total_consumed + seg_consumed,
+                        bytes_produced: total_produced,
+                        status: final_status,
+                    });
                 }
             }
             total_consumed += seg_consumed;
