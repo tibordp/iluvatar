@@ -55,7 +55,7 @@ use block::{
 use frame::{check_skippable_frame, parse_frame_header, FrameHeader, ZSTD_MAGIC};
 
 /// Processing state of the decompressor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum DecoderPhase {
     /// Waiting for a frame header (or end of stream).
     FrameHeader,
@@ -72,6 +72,24 @@ enum DecoderPhase {
     FrameChecksum { has_checksum: bool },
     /// Stream is complete.
     Done,
+}
+
+/// Append data to a window buffer, maintaining max capacity.
+/// Uses `copy_within` + `truncate` instead of `drain` for efficiency.
+fn append_to_window(window: &mut Vec<u8>, window_size: usize, data: &[u8]) {
+    if data.len() >= window_size {
+        // Data alone fills the window — just keep the tail
+        let start = data.len() - window_size;
+        window.clear();
+        window.extend_from_slice(&data[start..]);
+    } else {
+        window.extend_from_slice(data);
+        if window.len() > window_size {
+            let new_start = window.len() - window_size;
+            window.copy_within(new_start.., 0);
+            window.truncate(window_size);
+        }
+    }
 }
 
 /// Zstd decompressor with full-state checkpointing.
@@ -140,15 +158,6 @@ impl ZstdDecompressor {
             }
         }
         to_copy
-    }
-
-    /// Append data to the window, maintaining max window_size.
-    fn append_to_window(&mut self, data: &[u8]) {
-        self.window.extend_from_slice(data);
-        if self.window.len() > self.window_size {
-            let excess = self.window.len() - self.window_size;
-            self.window.drain(..excess);
-        }
     }
 
     /// Get the serializable state for checkpointing.
@@ -339,10 +348,7 @@ impl Decompressor for ZstdDecompressor {
 
                     pos += compressed_size;
 
-                    // Append output to window
-                    self.append_to_window(&block_output);
-
-                    // Stage the output for delivery
+                    append_to_window(&mut self.window, self.window_size, &block_output);
                     self.staged_output.extend_from_slice(&block_output);
 
                     if header_last {
@@ -384,7 +390,12 @@ impl Decompressor for ZstdDecompressor {
 
         // Remove consumed data from buffer
         if pos > 0 {
-            self.buffer.drain(..pos);
+            if pos >= self.buffer.len() {
+                self.buffer.clear();
+            } else {
+                self.buffer.copy_within(pos.., 0);
+                self.buffer.truncate(self.buffer.len() - pos);
+            }
         }
 
         self.total_in += bytes_consumed_from_input as u64;

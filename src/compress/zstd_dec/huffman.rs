@@ -201,103 +201,88 @@ fn decompress_huffman_weights_fse(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Decompress FSE-coded byte symbols (used for Huffman weights).
 fn decompress_fse_weights(table: &FseTable, data: &[u8]) -> Result<Vec<u8>, String> {
+    use super::bits::read_bits_backward_bulk;
+
     if data.is_empty() {
         return Err("empty FSE compressed data".into());
     }
 
     // Initialize backward bit reader
-    // Find the init bit in the last byte
     let last_byte = data[data.len() - 1];
     if last_byte == 0 {
         return Err("last byte is 0 in FSE stream".into());
     }
     let init_bit = 7 - last_byte.leading_zeros() as usize;
-    // Total available bits
     let total_bits = (data.len() - 1) * 8 + init_bit;
 
-    let mut bit_pos = 0usize; // bits consumed from the end
+    let mut bit_pos = 0usize;
 
-    let read_bits_backward = |bit_pos: &mut usize, n: u32| -> Result<usize, String> {
-        if n == 0 {
-            return Ok(0);
-        }
+    let read_bits_checked = |bit_pos: &mut usize, n: u32| -> Result<usize, String> {
         let n = n as usize;
         if *bit_pos + n > total_bits {
             return Err("FSE bit read overflow".into());
         }
-        let mut result: usize = 0;
-        for _ in 0..n {
-            result <<= 1;
-            let abs_bit = total_bits - 1 - *bit_pos;
-            let byte_idx = abs_bit / 8;
-            let bit_idx = abs_bit % 8;
-            if (data[byte_idx] >> bit_idx) & 1 != 0 {
-                result |= 1;
-            }
-            *bit_pos += 1;
-        }
+        let result = read_bits_backward_bulk(data, total_bits, *bit_pos, n) as usize;
+        *bit_pos += n;
         Ok(result)
     };
 
     // Initialize two states
-    let mut state1 = read_bits_backward(&mut bit_pos, table.table_log)?;
-    let mut state2 = read_bits_backward(&mut bit_pos, table.table_log)?;
+    let mut state1 = read_bits_checked(&mut bit_pos, table.table_log)?;
+    let mut state2 = read_bits_checked(&mut bit_pos, table.table_log)?;
 
     let mut output = Vec::new();
 
     // Read bits from the backward stream, padding with zeros if past the end.
-    // This matches the reference behavior where BIT_readBits continues reading
-    // from the register even past the logical end of the stream.
     let read_bits_padded = |bit_pos: &mut usize, n: u32| -> usize {
+        let n = n as usize;
         if n == 0 {
             return 0;
         }
-        let n = n as usize;
-        let mut result: usize = 0;
-        for _ in 0..n {
-            result <<= 1;
-            if *bit_pos < total_bits {
-                let abs_bit = total_bits - 1 - *bit_pos;
-                let byte_idx = abs_bit / 8;
-                let bit_idx = abs_bit % 8;
-                if (data[byte_idx] >> bit_idx) & 1 != 0 {
-                    result |= 1;
-                }
-            }
-            // else: beyond stream end, bit is zero (padding)
-            *bit_pos += 1;
+        // If fully within bounds, use bulk read
+        if *bit_pos + n <= total_bits {
+            let result = read_bits_backward_bulk(data, total_bits, *bit_pos, n) as usize;
+            *bit_pos += n;
+            return result;
         }
+        // Partially past end: read available bits, pad rest with zeros
+        let avail = total_bits.saturating_sub(*bit_pos);
+        let result = if avail > 0 {
+            read_bits_backward_bulk(data, total_bits, *bit_pos, avail) as usize
+        } else {
+            0
+        };
+        // Shift the available bits up and pad the MSB positions with zeros
+        let result = result << (n - avail);
+        // Note: backward bitstream reads MSB-first, so available bits go to
+        // higher positions and padding zeros go to lower positions. But our
+        // bulk reader returns LSB-aligned, so we need to handle this carefully.
+        // Actually, the original per-bit code reads MSB-first with zero padding
+        // for past-end bits. The bulk equivalent: read `avail` bits (MSB portion),
+        // shift left by (n - avail) to place them at MSB, zeros fill LSB.
+        *bit_pos += n;
         result
     };
 
-    // Two-interleaved-state FSE decode loop matching the reference implementation.
-    // The reference uses BIT_reloadDStream to detect overflow AFTER each
-    // decode+update step. Overflow means bits were consumed past the stream end.
-    // "Completed" (bit_pos == total_bits) is NOT overflow; only bit_pos > total_bits is.
+    // Two-interleaved-state FSE decode loop
     loop {
-        // Decode from state1 and update state
         let entry1 = table.decode(state1);
         output.push(entry1.symbol);
         let new_bits1 = read_bits_padded(&mut bit_pos, entry1.nb_bits as u32);
         state1 = entry1.next_state as usize + new_bits1;
 
-        // Check for overflow (consumed past end)
         if bit_pos > total_bits {
-            // Stream overflowed after state1 update: output state2's final symbol
             let entry2 = table.decode(state2);
             output.push(entry2.symbol);
             break;
         }
 
-        // Decode from state2 and update state
         let entry2 = table.decode(state2);
         output.push(entry2.symbol);
         let new_bits2 = read_bits_padded(&mut bit_pos, entry2.nb_bits as u32);
         state2 = entry2.next_state as usize + new_bits2;
 
-        // Check for overflow (consumed past end)
         if bit_pos > total_bits {
-            // Stream overflowed after state2 update: output state1's final symbol
             let entry1_final = table.decode(state1);
             output.push(entry1_final.symbol);
             break;
@@ -307,17 +292,20 @@ fn decompress_fse_weights(table: &FseTable, data: &[u8]) -> Result<Vec<u8>, Stri
     Ok(output)
 }
 
-/// Decompress Huffman-coded literals using a single stream.
-pub(crate) fn decompress_huffman_1stream(
+/// Decompress a Huffman stream directly into a pre-allocated output slice.
+fn decompress_huffman_stream_into(
     table: &HuffmanTable,
     src: &[u8],
-    regen_size: usize,
-) -> Result<Vec<u8>, String> {
+    output: &mut [u8],
+) -> Result<(), String> {
+    use super::bits::read_bits_backward_bulk;
+
+    let regen_size = output.len();
     if src.is_empty() {
         if regen_size == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        return Err("empty source for huffman 1-stream".into());
+        return Err("empty source for huffman stream".into());
     }
 
     let last_byte = src[src.len() - 1];
@@ -326,49 +314,53 @@ pub(crate) fn decompress_huffman_1stream(
     }
     let init_bit = 7 - last_byte.leading_zeros() as usize;
     let total_bits = (src.len() - 1) * 8 + init_bit;
+    let table_log = table.table_log as usize;
 
     let mut bit_pos = 0usize;
-    let mut output = Vec::with_capacity(regen_size);
+    let mut out_pos = 0;
 
-    while output.len() < regen_size {
+    while out_pos < regen_size {
         let bits_remaining = total_bits.saturating_sub(bit_pos);
         if bits_remaining == 0 {
             break;
         }
 
-        // Peek table_log bits
-        let peek_n = (table.table_log as usize).min(bits_remaining);
-        let mut peek_val: u32 = 0;
-        for i in 0..peek_n {
-            peek_val <<= 1;
-            let abs_bit = total_bits - 1 - (bit_pos + i);
-            let byte_idx = abs_bit / 8;
-            let bit_idx = abs_bit % 8;
-            if (src[byte_idx] >> bit_idx) & 1 != 0 {
-                peek_val |= 1;
-            }
-        }
+        // Peek table_log bits using bulk read
+        let peek_n = table_log.min(bits_remaining);
+        let mut peek_val =
+            read_bits_backward_bulk(src, total_bits, bit_pos, peek_n) as u32;
         // Pad to table_log bits if we peeked fewer
-        if peek_n < table.table_log as usize {
-            peek_val <<= table.table_log as usize - peek_n;
+        if peek_n < table_log {
+            peek_val <<= table_log - peek_n;
         }
 
         let entry = table.decode(peek_val);
         if entry.nb_bits as usize > bits_remaining {
             break;
         }
-        output.push(entry.symbol);
+        output[out_pos] = entry.symbol;
+        out_pos += 1;
         bit_pos += entry.nb_bits as usize;
     }
 
-    if output.len() != regen_size {
+    if out_pos != regen_size {
         return Err(format!(
-            "huffman 1-stream: decoded {} bytes, expected {}",
-            output.len(),
-            regen_size
+            "huffman stream: decoded {} bytes, expected {}",
+            out_pos, regen_size
         ));
     }
 
+    Ok(())
+}
+
+/// Decompress Huffman-coded literals using a single stream.
+pub(crate) fn decompress_huffman_1stream(
+    table: &HuffmanTable,
+    src: &[u8],
+    regen_size: usize,
+) -> Result<Vec<u8>, String> {
+    let mut output = vec![0u8; regen_size];
+    decompress_huffman_stream_into(table, src, &mut output)?;
     Ok(output)
 }
 
@@ -405,31 +397,23 @@ pub(crate) fn decompress_huffman_4streams(
     let stream4 = &src[stream4_start..];
 
     // Each stream decodes approximately regen_size/4 bytes
-    // (the last stream may have a different count)
     let seg_size = regen_size.div_ceil(4);
     let regen1 = seg_size.min(regen_size);
     let regen2 = seg_size.min(regen_size.saturating_sub(seg_size));
     let regen3 = seg_size.min(regen_size.saturating_sub(2 * seg_size));
     let regen4 = regen_size.saturating_sub(3 * seg_size);
 
-    let out1 = decompress_huffman_1stream(table, stream1, regen1)?;
-    let out2 = decompress_huffman_1stream(table, stream2, regen2)?;
-    let out3 = decompress_huffman_1stream(table, stream3, regen3)?;
-    let out4 = decompress_huffman_1stream(table, stream4, regen4)?;
+    // Decode directly into a single output buffer (avoids 4 allocations + copies)
+    let mut result = vec![0u8; regen_size];
+    let mut offset = 0;
 
-    let mut result = Vec::with_capacity(regen_size);
-    result.extend_from_slice(&out1);
-    result.extend_from_slice(&out2);
-    result.extend_from_slice(&out3);
-    result.extend_from_slice(&out4);
-
-    if result.len() != regen_size {
-        return Err(format!(
-            "huffman 4-stream: decoded {} bytes, expected {}",
-            result.len(),
-            regen_size
-        ));
-    }
+    decompress_huffman_stream_into(table, stream1, &mut result[offset..offset + regen1])?;
+    offset += regen1;
+    decompress_huffman_stream_into(table, stream2, &mut result[offset..offset + regen2])?;
+    offset += regen2;
+    decompress_huffman_stream_into(table, stream3, &mut result[offset..offset + regen3])?;
+    offset += regen3;
+    decompress_huffman_stream_into(table, stream4, &mut result[offset..offset + regen4])?;
 
     Ok(result)
 }

@@ -5,8 +5,6 @@
 //! finding the leading 1-bit in the last byte, then reads bits in that
 //! reversed order.
 
-use serde::{Deserialize, Serialize};
-
 /// A forward bit reader (reads bits left-to-right from a byte slice).
 /// Used for FSE NCount header decoding.
 #[derive(Debug, Clone)]
@@ -44,25 +42,20 @@ impl<'a> ForwardBitReader<'a> {
         if n > 25 {
             return Err("too many bits requested");
         }
-        // Build a u32 from current position
-        let mut result: u32 = 0;
-        let mut bits_read: u32 = 0;
-        while bits_read < n {
-            if self.byte_pos >= self.data.len() {
-                return Err("read past end of bitstream");
-            }
-            let available = 8 - self.bit_pos;
-            let to_read = (n - bits_read).min(available);
-            let mask = (1u32 << to_read) - 1;
-            let bits = ((self.data[self.byte_pos] >> self.bit_pos) as u32) & mask;
-            result |= bits << bits_read;
-            bits_read += to_read;
-            self.bit_pos += to_read;
-            if self.bit_pos >= 8 {
-                self.bit_pos = 0;
-                self.byte_pos += 1;
-            }
+        let total_bit = self.byte_pos * 8 + self.bit_pos as usize;
+        if total_bit + n as usize > self.data.len() * 8 {
+            return Err("read past end of bitstream");
         }
+        // Load up to 4 bytes into a u32 from current byte position
+        let mut buf = [0u8; 4];
+        let bytes_avail = self.data.len() - self.byte_pos;
+        let bytes_to_copy = bytes_avail.min(4);
+        buf[..bytes_to_copy].copy_from_slice(&self.data[self.byte_pos..self.byte_pos + bytes_to_copy]);
+        let val = u32::from_le_bytes(buf);
+        let result = (val >> self.bit_pos) & ((1u32 << n) - 1);
+        let new_bit = self.bit_pos + n;
+        self.byte_pos += (new_bit / 8) as usize;
+        self.bit_pos = new_bit % 8;
         Ok(result)
     }
 }
@@ -71,10 +64,10 @@ impl<'a> ForwardBitReader<'a> {
 ///
 /// The bitstream is read from the end. Initialization finds the leading 1-bit
 /// in the last byte and starts reading from there toward the beginning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct BackwardBitReader {
-    /// The full data of the bitstream (stored for serialization).
-    data: Vec<u8>,
+#[derive(Debug, Clone)]
+pub(crate) struct BackwardBitReader<'a> {
+    /// The bitstream data (borrowed).
+    data: &'a [u8],
     /// Current bit position: counts bits from the MSB end of the last byte.
     /// Starts after the init-marker bit.
     bit_pos: usize,
@@ -82,10 +75,10 @@ pub(crate) struct BackwardBitReader {
     total_bits: usize,
 }
 
-impl BackwardBitReader {
+impl<'a> BackwardBitReader<'a> {
     /// Create a new backward bit reader from the given data.
     /// Finds the leading 1-bit in the last byte (the init marker).
-    pub fn new(data: &[u8]) -> Result<Self, &'static str> {
+    pub fn new(data: &'a [u8]) -> Result<Self, &'static str> {
         if data.is_empty() {
             return Err("empty bitstream");
         }
@@ -100,19 +93,21 @@ impl BackwardBitReader {
         let total_bits = (data.len() - 1) * 8 + highest_bit;
 
         Ok(Self {
-            data: data.to_vec(),
+            data,
             bit_pos: 0,
             total_bits,
         })
     }
 
     /// How many bits are still available to read.
+    #[inline]
     pub fn bits_remaining(&self) -> usize {
         self.total_bits.saturating_sub(self.bit_pos)
     }
 
     /// Read `n` bits from the bitstream (MSB first from the end of data).
     /// Returns the value as a usize.
+    #[inline]
     pub fn read_bits(&mut self, n: u32) -> Result<usize, &'static str> {
         if n == 0 {
             return Ok(0);
@@ -122,21 +117,51 @@ impl BackwardBitReader {
             return Err("not enough bits in backward bitstream");
         }
 
-        let mut result: usize = 0;
-        for _ in 0..n {
-            result <<= 1;
-            // Read one bit from position (total_bits - 1 - bit_pos) counting
-            // from bit 0 = LSB of byte 0.
-            let abs_bit = self.total_bits - 1 - self.bit_pos;
-            let byte_idx = abs_bit / 8;
-            let bit_idx = abs_bit % 8;
-            if (self.data[byte_idx] >> bit_idx) & 1 != 0 {
-                result |= 1;
-            }
-            self.bit_pos += 1;
-        }
+        // Bits are numbered from 0 = LSB of byte[0]. We read n consecutive
+        // bits from [low_abs, low_abs + n) where low_abs is the lowest
+        // position, giving us the result with low_abs as LSB.
+        let low_abs = self.total_bits - n - self.bit_pos;
+        let byte_idx = low_abs / 8;
+        let bit_idx = low_abs & 7;
+
+        // Load up to 8 bytes from byte_idx into a u64 for bulk extraction.
+        let mut buf = [0u8; 8];
+        let bytes_avail = self.data.len() - byte_idx;
+        let bytes_to_copy = bytes_avail.min(8);
+        buf[..bytes_to_copy].copy_from_slice(&self.data[byte_idx..byte_idx + bytes_to_copy]);
+        let val = u64::from_le_bytes(buf);
+
+        let result = ((val >> bit_idx) & ((1u64 << n) - 1)) as usize;
+        self.bit_pos += n;
         Ok(result)
     }
+}
+
+/// Read n bits from a backward bitstream in bulk.
+/// Used by Huffman and FSE decoders for peek/read operations.
+/// `total_bits` is the number of valid data bits (excluding init marker).
+/// `bit_pos` counts bits consumed from the MSB end.
+#[inline(always)]
+pub(crate) fn read_bits_backward_bulk(
+    data: &[u8],
+    total_bits: usize,
+    bit_pos: usize,
+    n: usize,
+) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let low_abs = total_bits - n - bit_pos;
+    let byte_idx = low_abs / 8;
+    let bit_idx = low_abs & 7;
+
+    let mut buf = [0u8; 8];
+    let bytes_avail = data.len() - byte_idx;
+    let bytes_to_copy = bytes_avail.min(8);
+    buf[..bytes_to_copy].copy_from_slice(&data[byte_idx..byte_idx + bytes_to_copy]);
+    let val = u64::from_le_bytes(buf);
+
+    (val >> bit_idx) & ((1u64 << n) - 1)
 }
 
 /// Compute floor(log2(x)) for x > 0.

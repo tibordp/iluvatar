@@ -436,36 +436,50 @@ pub(crate) fn execute_sequences(
 
         // Copy match_length bytes from offset back in the output/window
         if seq.match_length > 0 {
-            let current_output_len = output.len();
-            if seq.offset > current_output_len + window.len() {
+            let output_len = output.len();
+            if seq.offset > output_len + window.len() {
                 return Err(format!(
                     "sequence {} offset {} exceeds available history ({} output + {} window)",
                     i,
                     seq.offset,
-                    current_output_len,
+                    output_len,
                     window.len()
                 ));
             }
 
-            // Copy byte-by-byte to handle overlapping copies correctly
-            for _ in 0..seq.match_length {
-                let out_len = output.len();
-                if seq.offset <= out_len {
-                    // Copy from current output
-                    let src_pos = out_len - seq.offset;
-                    let byte = output[src_pos];
-                    output.push(byte);
+            let mut remaining = seq.match_length;
+            output.reserve(remaining);
+
+            // Phase 1: Copy from window if offset reaches into history
+            if seq.offset > output_len {
+                let window_bytes = seq.offset - output_len;
+                let window_start = window.len() - window_bytes;
+                let from_window = remaining.min(window_bytes);
+                output.extend_from_slice(&window[window_start..window_start + from_window]);
+                remaining -= from_window;
+            }
+
+            // Phase 2: Copy from output using bulk operations
+            if remaining > 0 {
+                if seq.offset >= remaining {
+                    // Non-overlapping: single bulk copy
+                    let start = output.len() - seq.offset;
+                    output.extend_from_within(start..start + remaining);
                 } else {
-                    // Copy from window (history before current block)
-                    let window_offset = seq.offset - out_len;
-                    if window_offset > window.len() {
-                        return Err(format!(
-                            "match reference extends beyond window: offset={}, out_len={}, window_len={}",
-                            seq.offset, out_len, window.len()
-                        ));
+                    // Overlapping: copy in expanding chunks (doubling strategy)
+                    let start = output.len() - seq.offset;
+                    let initial = remaining.min(seq.offset);
+                    output.extend_from_within(start..start + initial);
+                    remaining -= initial;
+
+                    let mut copied = initial;
+                    while remaining > 0 {
+                        let chunk = remaining.min(copied);
+                        let start = output.len() - copied;
+                        output.extend_from_within(start..start + chunk);
+                        remaining -= chunk;
+                        copied += chunk;
                     }
-                    let byte = window[window.len() - window_offset];
-                    output.push(byte);
                 }
             }
         }

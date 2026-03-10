@@ -128,6 +128,25 @@ pub(crate) fn decompress_block(
     }
 }
 
+/// Cached default FSE tables (built once, reused across all blocks).
+fn default_ll_table() -> &'static FseTable {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<FseTable> = OnceLock::new();
+    TABLE.get_or_init(fse::build_default_ll_table)
+}
+
+fn default_of_table() -> &'static FseTable {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<FseTable> = OnceLock::new();
+    TABLE.get_or_init(fse::build_default_of_table)
+}
+
+fn default_ml_table() -> &'static FseTable {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<FseTable> = OnceLock::new();
+    TABLE.get_or_init(fse::build_default_ml_table)
+}
+
 /// Decompress a compressed block.
 fn decompress_compressed_block(
     data: &[u8],
@@ -150,28 +169,24 @@ fn decompress_compressed_block(
 
     // 2. Decode sequences section
     let seq_data = &block_data[lit_consumed..];
-    let default_ll = fse::build_default_ll_table();
-    let default_of = fse::build_default_of_table();
-    let default_ml = fse::build_default_ml_table();
 
     let seq_header = parse_sequences_header(
         seq_data,
         state.ll_table.as_ref(),
         state.of_table.as_ref(),
         state.ml_table.as_ref(),
-        &default_ll,
-        &default_of,
-        &default_ml,
+        default_ll_table(),
+        default_of_table(),
+        default_ml_table(),
     )?;
-
-    // Save tables for future Repeat mode
-    state.ll_table = Some(seq_header.ll_table.clone());
-    state.of_table = Some(seq_header.of_table.clone());
-    state.ml_table = Some(seq_header.ml_table.clone());
 
     if seq_header.num_sequences == 0 {
         // No sequences: output is just the literals
         output.extend_from_slice(&literals);
+        // Save tables for future Repeat mode (move, not clone)
+        state.ll_table = Some(seq_header.ll_table);
+        state.of_table = Some(seq_header.of_table);
+        state.ml_table = Some(seq_header.ml_table);
         return Ok(());
     }
 
@@ -189,6 +204,11 @@ fn decompress_compressed_block(
 
     // 3. Execute sequences
     execute_sequences(&sequences, &literals, window, output)?;
+
+    // Save tables for future Repeat mode (move, not clone)
+    state.ll_table = Some(seq_header.ll_table);
+    state.of_table = Some(seq_header.of_table);
+    state.ml_table = Some(seq_header.ml_table);
 
     Ok(())
 }
