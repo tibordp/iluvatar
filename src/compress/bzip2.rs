@@ -16,6 +16,7 @@ const MAGIC_MASK: u64 = (1u64 << 48) - 1;
 ///
 /// bzip2 blocks can start at arbitrary bit positions (not byte-aligned),
 /// so we maintain a 48-bit sliding window across the bitstream.
+#[derive(Clone)]
 struct MagicScanner {
     /// 48-bit sliding window (low 48 bits).
     window: u64,
@@ -37,6 +38,8 @@ struct BlockBoundary {
     bit_offset: u8,
     /// Block index (1-indexed; block 0 is the stream start).
     block_index: u64,
+    /// Total uncompressed bytes output before this block.
+    uncompressed_offset: u64,
 }
 
 impl MagicScanner {
@@ -50,37 +53,62 @@ impl MagicScanner {
         }
     }
 
-    /// Feed compressed bytes to the scanner.
-    fn feed(&mut self, data: &[u8]) {
-        for &byte in data {
-            // Process bits MSB-first (bzip2 bit order)
-            for bit_idx in (0..8).rev() {
-                let bit = ((byte >> bit_idx) & 1) as u64;
-                self.window = ((self.window << 1) | bit) & MAGIC_MASK;
-                self.total_bits += 1;
+    /// Process a single byte, returning true if a new block boundary was
+    /// detected (retrievable via `take_boundary`).
+    fn scan_byte(&mut self, byte: u8) -> bool {
+        let mut found = false;
+        for bit_idx in (0..8).rev() {
+            let bit = ((byte >> bit_idx) & 1) as u64;
+            self.window = ((self.window << 1) | bit) & MAGIC_MASK;
+            self.total_bits += 1;
 
-                if self.total_bits < 48 {
-                    continue;
+            if self.total_bits < 48 {
+                continue;
+            }
+
+            if self.window == BLOCK_MAGIC {
+                self.block_count += 1;
+                if self.block_count > 1 {
+                    let start_bit = self.total_bits - 48;
+                    self.last_boundary = Some(BlockBoundary {
+                        byte_offset: start_bit / 8,
+                        bit_offset: (start_bit % 8) as u8,
+                        block_index: self.block_count - 1,
+                        uncompressed_offset: 0, // filled in later
+                    });
+                    found = true;
                 }
+            } else if self.window == EOS_MAGIC {
+                self.eos_found = true;
+            }
+        }
+        found
+    }
 
-                if self.window == BLOCK_MAGIC {
-                    self.block_count += 1;
-                    // Record boundary for blocks after the first.
-                    // Block 0 starts at byte 4 (after the stream header),
-                    // which is not useful for checkpointing.
-                    if self.block_count > 1 {
-                        let start_bit = self.total_bits - 48;
-                        self.last_boundary = Some(BlockBoundary {
-                            byte_offset: start_bit / 8,
-                            bit_offset: (start_bit % 8) as u8,
-                            block_index: self.block_count - 1,
-                        });
-                    }
-                } else if self.window == EOS_MAGIC {
-                    self.eos_found = true;
+    /// Feed compressed bytes to the scanner, recording `total_out` as the
+    /// uncompressed offset for any boundary detected.
+    fn feed(&mut self, data: &[u8], total_out: u64) {
+        for &byte in data {
+            if self.scan_byte(byte) {
+                if let Some(ref mut b) = self.last_boundary {
+                    b.uncompressed_offset = total_out;
                 }
             }
         }
+    }
+
+    /// Pre-scan `data` (without modifying self) and return byte indices within
+    /// `data` where block boundaries are detected.  Cheap bit-manipulation only.
+    fn find_boundary_positions(&self, data: &[u8]) -> Vec<usize> {
+        let mut clone = self.clone();
+        let mut positions = Vec::new();
+        for (i, &byte) in data.iter().enumerate() {
+            if clone.scan_byte(byte) {
+                positions.push(i);
+                clone.last_boundary = None; // don't accumulate
+            }
+        }
+        positions
     }
 
     fn take_boundary(&mut self) -> Option<BlockBoundary> {
@@ -188,27 +216,10 @@ impl Bzip2Decompressor {
     }
 }
 
-impl Default for Bzip2Decompressor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decompressor for Bzip2Decompressor {
-    fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
-        // ── Restore mode: bit-shift input and prepend header ──
-        if self.restore_active {
-            return self.decompress_restore(input, output);
-        }
-
-        // ── Normal mode ──
-
-        // Capture the stream level from the header if not yet parsed
-        if !self.header_parsed && input.len() >= 4 && &input[0..2] == b"BZ" && input[2] == b'h' {
-            self.stream_level = input[3];
-            self.header_parsed = true;
-        }
-
+impl Bzip2Decompressor {
+    /// Decompress a chunk normally (single call to inner decompressor) and
+    /// feed consumed bytes to the scanner with the post-call `total_out`.
+    fn decompress_and_scan(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
         let before_in = self.inner.total_in();
         let before_out = self.inner.total_out();
 
@@ -222,9 +233,8 @@ impl Decompressor for Bzip2Decompressor {
         self.total_in += consumed as u64;
         self.total_out += produced as u64;
 
-        // Feed consumed bytes to the block scanner for boundary detection
         if consumed > 0 {
-            self.scanner.feed(&input[..consumed]);
+            self.scanner.feed(&input[..consumed], self.total_out);
             if let Some(boundary) = self.scanner.take_boundary() {
                 self.block_count = boundary.block_index;
                 self.last_block_boundary = Some(boundary);
@@ -246,21 +256,111 @@ impl Decompressor for Bzip2Decompressor {
             status,
         })
     }
+}
+
+impl Default for Bzip2Decompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decompressor for Bzip2Decompressor {
+    fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
+        // ── Restore mode: bit-shift input and prepend header ──
+        if self.restore_active {
+            return self.decompress_restore(input, output);
+        }
+
+        // ── Normal mode ──
+
+        // Capture the stream level from the header if not yet parsed
+        if !self.header_parsed && input.len() >= 4 && &input[0..2] == b"BZ" && input[2] == b'h' {
+            self.stream_level = input[3];
+            self.header_parsed = true;
+        }
+
+        // Pre-scan the input for block boundary positions (cheap bit ops only).
+        // If none are found, decompress the whole chunk in one call (fast path).
+        // If boundaries exist, split the decompression at each boundary byte so
+        // that total_out is precise when the scanner records the boundary.
+        let boundary_positions = self.scanner.find_boundary_positions(input);
+
+        if boundary_positions.is_empty() {
+            return self.decompress_and_scan(input, output);
+        }
+
+        // Build segment endpoints: each boundary detection byte ends a segment,
+        // plus one final segment for the remainder.
+        let mut total_consumed = 0;
+        let mut total_produced = 0;
+        let mut final_status = DecompressStatus::Continue;
+
+        let mut segment_starts: Vec<usize> = vec![0];
+        for &pos in &boundary_positions {
+            segment_starts.push(pos + 1);
+        }
+
+        for (seg_idx, &seg_start) in segment_starts.iter().enumerate() {
+            let seg_end = if seg_idx < boundary_positions.len() {
+                boundary_positions[seg_idx] + 1
+            } else {
+                input.len()
+            };
+            if seg_start >= input.len() || seg_start >= seg_end {
+                break;
+            }
+
+            // Decompress this segment (may need multiple calls if the
+            // decompressor doesn't consume it all at once).
+            let mut seg_consumed = 0;
+            while seg_start + seg_consumed < seg_end {
+                let seg_input = &input[seg_start + seg_consumed..seg_end];
+                let out_slice = &mut output[total_produced..];
+                if out_slice.is_empty() {
+                    // Output buffer full — report partial progress.
+                    return Ok(DecompressResult {
+                        bytes_consumed: total_consumed + seg_consumed,
+                        bytes_produced: total_produced,
+                        status: final_status,
+                    });
+                }
+                let result = self.decompress_and_scan(seg_input, out_slice)?;
+                seg_consumed += result.bytes_consumed;
+                total_produced += result.bytes_produced;
+                if result.status == DecompressStatus::StreamEnd {
+                    final_status = DecompressStatus::StreamEnd;
+                    break;
+                }
+                if result.bytes_consumed == 0 && result.bytes_produced == 0 {
+                    // Inner decoder cannot make progress with current input/output;
+                    // return partial progress so the caller can provide more data.
+                    return Ok(DecompressResult {
+                        bytes_consumed: total_consumed + seg_consumed,
+                        bytes_produced: total_produced,
+                        status: final_status,
+                    });
+                }
+            }
+            total_consumed += seg_consumed;
+            if final_status == DecompressStatus::StreamEnd {
+                break;
+            }
+        }
+
+        Ok(DecompressResult {
+            bytes_consumed: total_consumed,
+            bytes_produced: total_produced,
+            status: final_status,
+        })
+    }
 
     fn checkpoint(&self, _compressed_offset: u64, _uncompressed_offset: u64) -> Result<Checkpoint> {
         // Return the last block boundary (like gzip/xz pattern).
         if let Some(ref boundary) = self.last_block_boundary {
-            // Compute exact uncompressed offset from block index.
-            // bzip2 blocks hold exactly (blockSize100k * 100000 - 19) bytes
-            // of uncompressed data (except the last block which may be smaller).
-            let block_size_100k = (self.stream_level - b'0') as u64;
-            let block_capacity = block_size_100k * 100000 - 19;
-            let uncompressed_offset = boundary.block_index * block_capacity;
-
             Ok(Checkpoint {
                 compressed_offset: boundary.byte_offset,
                 bit_offset: boundary.bit_offset,
-                uncompressed_offset,
+                uncompressed_offset: boundary.uncompressed_offset,
                 state: CheckpointState::Bzip2(Bzip2CheckpointState {
                     block_number: boundary.block_index,
                     stream_header: vec![b'B', b'Z', b'h', self.stream_level],
@@ -769,13 +869,11 @@ mod tests {
 
         // Restore from the FIRST boundary
         let boundary = &boundaries[0];
-        let block_capacity = 99981u64; // blocksize 1
-        let uncompressed_offset = boundary.block_index * block_capacity;
 
         let cp = Checkpoint {
             compressed_offset: boundary.byte_offset,
             bit_offset: boundary.bit_offset,
-            uncompressed_offset,
+            uncompressed_offset: boundary.uncompressed_offset,
             state: CheckpointState::Bzip2(Bzip2CheckpointState {
                 block_number: boundary.block_index,
                 stream_header: vec![b'B', b'Z', b'h', b'1'],
@@ -807,11 +905,100 @@ mod tests {
             }
         }
 
-        let expected_tail = &original[uncompressed_offset as usize..];
+        let expected_tail = &original[boundary.uncompressed_offset as usize..];
         assert_eq!(
             restored_output.len(),
             expected_tail.len(),
             "restored {} bytes, expected {} bytes",
+            restored_output.len(),
+            expected_tail.len()
+        );
+        assert_eq!(
+            restored_output, expected_tail,
+            "restored output doesn't match expected tail"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_restore_with_rle_data() {
+        // Data with many 4-byte repeated runs triggers bzip2's RLE1 step,
+        // which changes the byte count per block.  A formula-based
+        // uncompressed_offset (block_index * block_capacity) will drift;
+        // only tracking actual decompressor output is correct.
+        let mut original = Vec::with_capacity(400_000);
+        for i in 0..400_000u32 {
+            // Mix normal bytes with long runs of identical bytes
+            if i % 500 < 20 {
+                original.push(0xAA); // runs of 20 identical bytes
+            } else {
+                original.push((i % 251) as u8);
+            }
+        }
+        let compressed = compress_bz2_small_blocks(&original);
+
+        // Full decompress to capture checkpoint
+        let mut dec = Bzip2Decompressor::new();
+        let mut all_output = Vec::new();
+        let mut offset = 0;
+        loop {
+            let end = (offset + 4096).min(compressed.len());
+            let input = if offset < compressed.len() {
+                &compressed[offset..end]
+            } else {
+                &[]
+            };
+            let mut out = vec![0u8; 1024 * 1024];
+            let result = dec.decompress(input, &mut out).unwrap();
+            all_output.extend_from_slice(&out[..result.bytes_produced]);
+            offset += result.bytes_consumed;
+            if result.status == DecompressStatus::StreamEnd
+                || (result.bytes_consumed == 0
+                    && result.bytes_produced == 0
+                    && offset >= compressed.len())
+            {
+                break;
+            }
+        }
+        assert_eq!(all_output, original);
+
+        let cp = dec.checkpoint(0, 0).unwrap();
+        if cp.compressed_offset == 0 {
+            return; // single block, nothing to test
+        }
+
+        // The tracked offset must NOT equal the formula-based one
+        // (RLE changes byte counts), unless they happen to coincide.
+        // More importantly: restore + decompress must match.
+        let mut dec2 = Bzip2Decompressor::new();
+        dec2.restore(&cp).unwrap();
+
+        let mut restored_output = Vec::new();
+        let mut off2 = cp.compressed_offset as usize;
+        loop {
+            let end = (off2 + 4096).min(compressed.len());
+            let input = if off2 < compressed.len() {
+                &compressed[off2..end]
+            } else {
+                &[]
+            };
+            let mut out = vec![0u8; 1024 * 1024];
+            let result = dec2.decompress(input, &mut out).unwrap();
+            restored_output.extend_from_slice(&out[..result.bytes_produced]);
+            off2 += result.bytes_consumed;
+            if result.status == DecompressStatus::StreamEnd
+                || (result.bytes_consumed == 0
+                    && result.bytes_produced == 0
+                    && off2 >= compressed.len())
+            {
+                break;
+            }
+        }
+
+        let expected_tail = &original[cp.uncompressed_offset as usize..];
+        assert_eq!(
+            restored_output.len(),
+            expected_tail.len(),
+            "restored output length ({}) doesn't match expected tail ({})",
             restored_output.len(),
             expected_tail.len()
         );
