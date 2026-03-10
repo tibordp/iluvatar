@@ -47,6 +47,16 @@ fn create_tar_bz2(files: &[(&str, &[u8])]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+/// Create a bzip2-compressed tar archive with the smallest block size (100KB)
+/// so that the data spans multiple blocks.
+#[cfg(feature = "bz2")]
+fn create_tar_bz2_small_blocks(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let tar_data = create_tar_bytes(files);
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(1));
+    encoder.write_all(&tar_data).unwrap();
+    encoder.finish().unwrap()
+}
+
 /// Create an xz-compressed tar archive.
 #[cfg(feature = "xz")]
 fn create_tar_xz(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -288,6 +298,56 @@ fn test_bzip2_index_and_read() {
 
         let content = read_in_memory(&compressed, &index, path);
         assert_eq!(&content, expected, "content mismatch for {}", path);
+    }
+}
+
+/// Regression test: bzip2 checkpoint offsets must be based on actual
+/// decompressor output, not `block_index * block_capacity`.  The formula
+/// drifts when bzip2's RLE1 step changes the byte count per block, which
+/// happens with any real-world data that contains repeated characters.
+/// Using block-size 1 (100 KB blocks) and >1 MiB of data ensures multiple
+/// blocks AND multiple checkpoints (the default bzip2 interval is 1 MiB).
+#[cfg(feature = "bz2")]
+#[test]
+fn test_bzip2_multiblock_index_and_read() {
+    // Build files whose total tar size exceeds the 1 MiB checkpoint interval.
+    // Include data with repeated bytes to exercise bzip2's RLE1 step.
+    let make_data = |seed: u8, len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|i| {
+                // Periodic runs of identical bytes trigger RLE1
+                if i % 400 < 16 {
+                    seed
+                } else {
+                    ((i + seed as usize) % 251) as u8
+                }
+            })
+            .collect()
+    };
+
+    let file_a = make_data(0x20, 500_000);
+    let file_b = make_data(b'\n', 500_000);
+    let file_c = make_data(b'\t', 500_000);
+
+    let files: Vec<(&str, &[u8])> =
+        vec![("a.bin", &file_a), ("b.bin", &file_b), ("c.bin", &file_c)];
+    let compressed = create_tar_bz2_small_blocks(&files);
+
+    let index = index_in_memory(&compressed, CompressionFormat::Bzip2);
+    assert_eq!(index.entries.len(), 3);
+
+    // Verify that at least one mid-stream checkpoint exists.
+    assert!(
+        index.checkpoints.len() > 1,
+        "expected multiple checkpoints, got {}",
+        index.checkpoints.len()
+    );
+
+    // Read every file and compare.
+    for (path, expected) in &files {
+        let content = read_in_memory(&compressed, &index, path);
+        assert_eq!(content.len(), expected.len(), "size mismatch for {}", path);
+        assert_eq!(&content, *expected, "content mismatch for {}", path);
     }
 }
 
