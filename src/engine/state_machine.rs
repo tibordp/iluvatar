@@ -210,14 +210,25 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
 
     /// Drive the state machine forward. Returns what the engine needs next.
     pub fn step(&mut self) -> EngineRequest {
+        loop {
+            match self.step_once() {
+                Some(request) => return request,
+                None => continue,
+            }
+        }
+    }
+
+    /// One decompress-and-parse iteration. Returns `None` when there is
+    /// unconsumed input left to keep processing (the caller loops).
+    fn step_once(&mut self) -> Option<EngineRequest> {
         match self.state {
-            IndexingState::Done => return EngineRequest::Done,
+            IndexingState::Done => return Some(EngineRequest::Done),
             IndexingState::NeedInput => {
                 if self.eof {
                     self.state = IndexingState::Done;
-                    return EngineRequest::Done;
+                    return Some(EngineRequest::Done);
                 }
-                return EngineRequest::NeedInput;
+                return Some(EngineRequest::NeedInput);
             }
             IndexingState::Processing => {}
         }
@@ -229,7 +240,7 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
             &[]
         } else {
             self.state = IndexingState::NeedInput;
-            return EngineRequest::NeedInput;
+            return Some(EngineRequest::NeedInput);
         };
 
         let result = match self
@@ -237,7 +248,7 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
             .decompress(input, &mut self.decompress_buf)
         {
             Ok(r) => r,
-            Err(e) => return EngineRequest::Error(e),
+            Err(e) => return Some(EngineRequest::Error(e)),
         };
 
         self.input_pos += result.bytes_consumed;
@@ -265,7 +276,7 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
                     // Feed accumulated detection bytes to the parser
                     let detect_data = std::mem::take(&mut self.detect_buf);
                     if let Err(e) = self.feed_to_parser(&detect_data) {
-                        return EngineRequest::Error(e);
+                        return Some(EngineRequest::Error(e));
                     }
                 }
                 // Not enough data yet — continue decompressing
@@ -300,7 +311,7 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
                             };
                             self.strategy.on_checkpoint_created(&ctx, cp_size);
                         }
-                        Err(e) => return EngineRequest::Error(e),
+                        Err(e) => return Some(EngineRequest::Error(e)),
                     }
                 }
 
@@ -309,18 +320,18 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
                 // (feed_to_parser needs &mut self while decompress_buf is &self).
                 let bytes_produced = result.bytes_produced;
                 if let Err(e) = self.feed_to_parser_from_buf(bytes_produced) {
-                    return EngineRequest::Error(e);
+                    return Some(EngineRequest::Error(e));
                 }
             }
 
             if matches!(self.state, IndexingState::Done) {
-                return EngineRequest::Done;
+                return Some(EngineRequest::Done);
             }
         }
 
         if result.status == DecompressStatus::StreamEnd {
             self.state = IndexingState::Done;
-            return EngineRequest::Done;
+            return Some(EngineRequest::Done);
         }
 
         // If we consumed all input, need more
@@ -330,20 +341,28 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
                 // It may have internally buffered output that needs draining.
                 if result.bytes_consumed == 0 && result.bytes_produced == 0 {
                     self.state = IndexingState::Done;
-                    EngineRequest::Done
+                    Some(EngineRequest::Done)
                 } else {
                     // Keep processing to drain buffered output
-                    EngineRequest::NeedInput
+                    Some(EngineRequest::NeedInput)
                 }
             } else {
                 self.state = IndexingState::NeedInput;
-                EngineRequest::NeedInput
+                Some(EngineRequest::NeedInput)
             }
         } else {
             // Still have unconsumed input — keep processing.
             // (Returning NeedInput here would cause the caller to overwrite
             //  unconsumed bytes via provide_data.)
-            self.step()
+            if result.bytes_consumed == 0 && result.bytes_produced == 0 {
+                // A decompressor with input available and a whole output
+                // buffer to write into must make progress; treat a stall as
+                // malformed data instead of looping forever.
+                return Some(EngineRequest::Error(Error::DecompressionError(
+                    "decompressor made no progress with input remaining".into(),
+                )));
+            }
+            None
         }
     }
 
@@ -548,6 +567,8 @@ pub struct ReadEngine {
     state: ReadState,
     /// Decompressed output buffer.
     output_buf: Vec<u8>,
+    /// Scratch buffer for decompressing skipped data (reused across steps).
+    skip_buf: Vec<u8>,
     /// How many valid bytes are in output_buf.
     output_len: usize,
     /// How many bytes have been read from output_buf by the caller.
@@ -582,6 +603,7 @@ impl ReadEngine {
             target_size,
             state: ReadState::SeekToCheckpoint,
             output_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
+            skip_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
             output_len: 0,
             output_read: 0,
             input_buf: Vec::new(),
@@ -618,6 +640,7 @@ impl ReadEngine {
                 target_size: 0,
                 state: ReadState::Done,
                 output_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
+                skip_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
                 output_len: 0,
                 output_read: 0,
                 input_buf: Vec::new(),
@@ -638,6 +661,7 @@ impl ReadEngine {
             target_size: read_len,
             state: ReadState::SeekToCheckpoint,
             output_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
+            skip_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
             output_len: 0,
             output_read: 0,
             input_buf: Vec::new(),
@@ -649,11 +673,22 @@ impl ReadEngine {
 
     /// Drive the state machine forward.
     pub fn step(&mut self) -> EngineRequest {
-        match &self.state {
+        loop {
+            match self.step_once() {
+                Some(request) => return request,
+                None => continue,
+            }
+        }
+    }
+
+    /// One iteration of the read state machine. Returns `None` when there
+    /// is unconsumed input left to keep processing (the caller loops).
+    fn step_once(&mut self) -> Option<EngineRequest> {
+        Some(match &self.state {
             ReadState::SeekToCheckpoint => {
                 // Restore decompressor from checkpoint
                 if let Err(e) = self.decompressor.restore(&self.checkpoint) {
-                    return EngineRequest::Error(e);
+                    return Some(EngineRequest::Error(e));
                 }
 
                 // Determine actual start position and skip amount.
@@ -711,16 +746,16 @@ impl ReadEngine {
 
             ReadState::DecompressingToTarget { skip_remaining } => {
                 let skip_remaining = *skip_remaining;
-                self.decompress_and_skip(skip_remaining)
+                return self.decompress_and_skip(skip_remaining);
             }
 
             ReadState::EmittingData { data_remaining } => {
                 let data_remaining = *data_remaining;
-                self.decompress_and_emit(data_remaining)
+                return self.decompress_and_emit(data_remaining);
             }
 
             ReadState::Done => EngineRequest::Done,
-        }
+        })
     }
 
     /// Provide compressed data to the engine.
@@ -775,11 +810,16 @@ impl ReadEngine {
         n
     }
 
-    fn decompress_and_skip(&mut self, mut skip_remaining: u64) -> EngineRequest {
+    fn decompress_and_skip(&mut self, mut skip_remaining: u64) -> Option<EngineRequest> {
         let input = &self.input_buf[self.input_pos..];
         let had_input = !input.is_empty();
-        let mut temp_buf = vec![0u8; DECOMPRESS_BUF_SIZE];
-        match self.decompressor.decompress(input, &mut temp_buf) {
+        if !had_input && !self.eof {
+            // Don't drive the decompressor with empty input unless the
+            // stream has actually ended; ask the caller for more instead.
+            self.state = ReadState::NeedInput { skip_remaining };
+            return Some(EngineRequest::NeedInput);
+        }
+        match self.decompressor.decompress(input, &mut self.skip_buf) {
             Ok(result) => {
                 self.input_pos += result.bytes_consumed;
                 let produced = result.bytes_produced as u64;
@@ -794,7 +834,7 @@ impl ReadEngine {
                             };
                         } else {
                             self.state = ReadState::Done;
-                            return EngineRequest::Done;
+                            return Some(EngineRequest::Done);
                         }
                     } else {
                         self.state = ReadState::DecompressingToTarget { skip_remaining };
@@ -808,7 +848,7 @@ impl ReadEngine {
                     self.output_len = file_bytes;
                     self.output_read = 0;
                     self.output_buf[..file_bytes]
-                        .copy_from_slice(&temp_buf[file_start..file_start + file_bytes]);
+                        .copy_from_slice(&self.skip_buf[file_start..file_start + file_bytes]);
 
                     let remaining = self.target_size - file_bytes as u64;
                     if remaining == 0 {
@@ -818,13 +858,13 @@ impl ReadEngine {
                             data_remaining: remaining,
                         };
                     }
-                    return EngineRequest::OutputReady;
+                    return Some(EngineRequest::OutputReady);
                 }
                 // produced == 0 falls through
 
                 if result.status == DecompressStatus::StreamEnd && had_input {
                     self.state = ReadState::Done;
-                    return EngineRequest::Done;
+                    return Some(EngineRequest::Done);
                 }
 
                 if self.input_pos >= self.input_buf.len() {
@@ -833,7 +873,7 @@ impl ReadEngine {
                         // It may have internally buffered output to drain.
                         if result.bytes_consumed == 0 && result.bytes_produced == 0 {
                             self.state = ReadState::Done;
-                            return EngineRequest::Done;
+                            return Some(EngineRequest::Done);
                         }
                         // Keep trying - decompressor may have more buffered output
                     } else {
@@ -849,19 +889,32 @@ impl ReadEngine {
                             _ => {}
                         }
                     }
-                    EngineRequest::NeedInput
+                    Some(EngineRequest::NeedInput)
                 } else {
-                    self.step()
+                    // Unconsumed input remains: a stalled decompressor here
+                    // would loop forever, so treat it as malformed data.
+                    if result.bytes_consumed == 0 && result.bytes_produced == 0 {
+                        return Some(EngineRequest::Error(Error::DecompressionError(
+                            "decompressor made no progress with input remaining".into(),
+                        )));
+                    }
+                    None
                 }
             }
-            Err(e) => EngineRequest::Error(e),
+            Err(e) => Some(EngineRequest::Error(e)),
         }
     }
 
-    fn decompress_and_emit(&mut self, data_remaining: u64) -> EngineRequest {
+    fn decompress_and_emit(&mut self, data_remaining: u64) -> Option<EngineRequest> {
         let input = &self.input_buf[self.input_pos..];
 
         let had_input = !input.is_empty();
+        if !had_input && !self.eof {
+            // Don't drive the decompressor with empty input unless the
+            // stream has actually ended; ask the caller for more instead.
+            self.state = ReadState::NeedInputEmitting { data_remaining };
+            return Some(EngineRequest::NeedInput);
+        }
         let max_output = (data_remaining as usize).min(self.output_buf.len());
         match self
             .decompressor
@@ -883,14 +936,14 @@ impl ReadEngine {
                             data_remaining: remaining,
                         };
                     }
-                    return EngineRequest::OutputReady;
+                    return Some(EngineRequest::OutputReady);
                 }
 
                 // No output produced
                 if result.status == DecompressStatus::StreamEnd && had_input {
                     // Decompressor genuinely reached end of stream
                     self.state = ReadState::Done;
-                    return EngineRequest::Done;
+                    return Some(EngineRequest::Done);
                 }
 
                 // Need more input
@@ -898,18 +951,25 @@ impl ReadEngine {
                     if self.eof {
                         if result.bytes_consumed == 0 && result.bytes_produced == 0 {
                             self.state = ReadState::Done;
-                            return EngineRequest::Done;
+                            return Some(EngineRequest::Done);
                         }
                         // Keep trying - decompressor may have more buffered output
                     } else {
                         self.state = ReadState::NeedInputEmitting { data_remaining };
                     }
-                    EngineRequest::NeedInput
+                    Some(EngineRequest::NeedInput)
                 } else {
-                    self.step()
+                    // Unconsumed input remains: a stalled decompressor here
+                    // would loop forever, so treat it as malformed data.
+                    if result.bytes_consumed == 0 && result.bytes_produced == 0 {
+                        return Some(EngineRequest::Error(Error::DecompressionError(
+                            "decompressor made no progress with input remaining".into(),
+                        )));
+                    }
+                    None
                 }
             }
-            Err(e) => EngineRequest::Error(e),
+            Err(e) => Some(EngineRequest::Error(e)),
         }
     }
 }

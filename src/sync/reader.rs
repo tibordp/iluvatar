@@ -301,6 +301,7 @@ impl<R: Read + Seek> Archive<R> {
         let mut engine = ReadEngine::new(&self.index, path)?;
         let mut result = Vec::new();
         let mut buf = vec![0u8; BUF_SIZE];
+        let mut out_buf = vec![0u8; BUF_SIZE];
 
         loop {
             match engine.step() {
@@ -322,16 +323,13 @@ impl<R: Read + Seek> Archive<R> {
                         engine.provide_data(&buf[..n]);
                     }
                 }
-                EngineRequest::OutputReady => {
-                    let mut out_buf = vec![0u8; BUF_SIZE];
-                    loop {
-                        let n = engine.read_output(&mut out_buf);
-                        if n == 0 {
-                            break;
-                        }
-                        result.extend_from_slice(&out_buf[..n]);
+                EngineRequest::OutputReady => loop {
+                    let n = engine.read_output(&mut out_buf);
+                    if n == 0 {
+                        break;
                     }
-                }
+                    result.extend_from_slice(&out_buf[..n]);
+                },
                 EngineRequest::Done => break,
                 EngineRequest::Error(e) => return Err(e),
             }
@@ -362,6 +360,7 @@ impl<R: Read + Seek> Archive<R> {
         let mut engine = ReadEngine::new_range(&self.index, path, offset, len)?;
         let mut result = Vec::new();
         let mut buf = vec![0u8; BUF_SIZE];
+        let mut out_buf = vec![0u8; BUF_SIZE];
 
         loop {
             match engine.step() {
@@ -383,16 +382,13 @@ impl<R: Read + Seek> Archive<R> {
                         engine.provide_data(&buf[..n]);
                     }
                 }
-                EngineRequest::OutputReady => {
-                    let mut out_buf = vec![0u8; BUF_SIZE];
-                    loop {
-                        let n = engine.read_output(&mut out_buf);
-                        if n == 0 {
-                            break;
-                        }
-                        result.extend_from_slice(&out_buf[..n]);
+                EngineRequest::OutputReady => loop {
+                    let n = engine.read_output(&mut out_buf);
+                    if n == 0 {
+                        break;
                     }
-                }
+                    result.extend_from_slice(&out_buf[..n]);
+                },
                 EngineRequest::Done => break,
                 EngineRequest::Error(e) => return Err(e),
             }
