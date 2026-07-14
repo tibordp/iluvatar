@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **xz/LZMA checkpoints shrank by ~500x.** Checkpoints previously
+  serialized the LZMA dictionary at its full allocated size — 64 MiB at
+  xz preset 9 — including the unwritten zero tail. They now store only the
+  live window contents (~130 KB after decoding ~115 KB at preset 9),
+  scaling with decoded data instead of dictionary size, which makes
+  frequent checkpointing practical. This changes the checkpoint format,
+  so **the index format version is bumped to 4**; indexes built by
+  earlier versions are rejected on load and must be rebuilt. XZ checkpoint
+  size estimation also now accounts for staged output.
+- cpio hardlinks are now resolved correctly for the standard newc layout
+  (file data stored with the last member of a hardlink set): earlier
+  members are emitted as `HardLink` entries pointing at the data-bearing
+  path. Previously no cpio hardlinks were ever detected.
+- Unknown/corrupt index files, tar headers, and cpio headers are rejected
+  with errors instead of risking panics or unbounded allocations (see
+  Fixed).
+
+### Fixed
+
+- **gzip: truncated or corrupt deflate streams reported as clean EOF.**
+  Inflate failures were mapped to a successful end-of-stream, so corrupt
+  gzip archives indexed "successfully" with silently missing data. They
+  now surface as decompression errors, including during indexing.
+- **Engines could recurse unboundedly on malformed data.** The
+  step-recursion in the indexing and read engines had no forward-progress
+  guard; a stalled decompressor now produces an error instead of a stack
+  overflow. The read engine also no longer drives the decompressor with
+  empty input mid-stream.
+- **Index entries could reference a checkpoint starting after their data.**
+  `ArchiveIndex::checkpoint_for` would then mis-seek. Entries are now
+  associated with the latest checkpoint at or before their data offset.
+- **`ArchiveIndex::from_bytes` hardened against untrusted input:** bincode
+  reads are size-limited (no allocation bombs from corrupt length
+  prefixes) and indexes with no checkpoints or out-of-range checkpoint
+  references are rejected instead of panicking later.
+- **tar parser hardening:** GNU sparse entries (typeflag 'S') are rejected
+  instead of silently desynchronizing all subsequent offsets; sizes that
+  would overflow block padding are rejected; PAX/long-name metadata sizes
+  are capped (no attacker-controlled allocations); PAX records are parsed
+  by their length prefix, so values containing newlines or spaces survive
+  intact; contiguous files (typeflag '7') index as regular files.
+- **cpio parser hardening:** odc headers arriving in small chunks no
+  longer cause an arithmetic underflow (sub-format is now detected from
+  the magic bytes before sizing the header); namesize and symlink-target
+  sizes are capped.
+- Read-path performance: the read engine reuses its skip buffer instead of
+  allocating 64 KiB per skipped chunk (~80k allocations for a multi-GB
+  seek), and the sync/tokio readers hoist their output buffers out of the
+  event loop.
+
 ## 0.2.0 — 2026-07-14
 
 ### Changed

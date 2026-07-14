@@ -181,6 +181,7 @@ impl CheckpointState {
                     + s.stream_header.len()
                     + s.lzma2_state.as_ref().map_or(0, |v| v.len())
                     + s.buffer.len()
+                    + s.staged_output.len()
                     + 32
             }
             CheckpointState::Zstd(s) => {

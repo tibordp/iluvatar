@@ -196,3 +196,54 @@ fn test_xz_randomized_chunks_and_checkpoints() {
         }
     }
 }
+
+#[cfg(feature = "xz")]
+#[test]
+fn test_xz_checkpoint_size_is_proportional_to_decoded_data() {
+    // The LZMA dictionary buffer is allocated at full dict_size up front
+    // (64 MiB at preset 9). Checkpoints must serialize only the live window,
+    // not the zero-filled tail — otherwise every checkpoint costs dict_size
+    // bytes and frequent checkpointing becomes impractical.
+    let original = build_data(4242, 200_000);
+    let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 9);
+    encoder.write_all(&original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut dec = XzDecompressor::new();
+    let mut out = vec![0u8; 64 * 1024];
+    let mut offset = 0;
+    let mut produced = 0u64;
+    // Decode roughly half the stream.
+    while produced < 100_000 {
+        let end = (offset + 4096).min(compressed.len());
+        let result = dec.decompress(&compressed[offset..end], &mut out).unwrap();
+        offset = end.min(offset + result.bytes_consumed.max(1));
+        produced += result.bytes_produced as u64;
+        if result.status == DecompressStatus::StreamEnd {
+            break;
+        }
+    }
+
+    let cp = dec.checkpoint(offset as u64, produced).unwrap();
+    let size = cp.estimated_size();
+    // The window can hold at most `produced` bytes plus decoder tables
+    // (~16 KiB of probabilities) and small buffers. With the full 64 MiB
+    // dictionary serialized this would be > 64_000_000.
+    assert!(
+        size < 1_000_000,
+        "checkpoint unexpectedly large: {} bytes for {} decoded",
+        size,
+        produced
+    );
+
+    // And the checkpoint must actually work: restore + finish the stream.
+    let mut dec2 = XzDecompressor::new();
+    dec2.restore(&cp).unwrap();
+    let mut rng = Rng(1);
+    let (tail, _) = decompress_random_chunks(&mut dec2, &compressed[offset..], &mut rng, None);
+    assert_eq!(
+        &tail[..],
+        &original[produced as usize..],
+        "restored tail mismatch"
+    );
+}

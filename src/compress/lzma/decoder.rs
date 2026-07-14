@@ -133,7 +133,13 @@ impl LzmaProperties {
 // ─── Sliding Window ─────────────────────────────────────────────────
 
 /// Cyclic sliding window buffer for LZMA decoding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Serialization uses a compact representation that stores only the live
+/// portion of the dictionary (see [`SlidingWindowRepr`]): the buffer itself
+/// is allocated at the full dictionary size up front, and serializing the
+/// unwritten zero tail would bloat every checkpoint to `dict_size` bytes
+/// (64 MiB at xz -9) regardless of how little has been decoded.
+#[derive(Debug, Clone)]
 pub struct SlidingWindow {
     buf: Vec<u8>,
     pos: usize,
@@ -142,6 +148,63 @@ pub struct SlidingWindow {
     pub total_pos: u64,
     /// How many output bytes are pending to be copied to the caller.
     pending_out: Vec<u8>,
+}
+
+/// Compact serialized form of [`SlidingWindow`]: the live dictionary
+/// contents in logical order (oldest first) instead of the raw circular
+/// buffer with its zero-filled tail.
+#[derive(Serialize, Deserialize)]
+struct SlidingWindowRepr {
+    size: u64,
+    total_pos: u64,
+    data: Vec<u8>,
+    pending_out: Vec<u8>,
+}
+
+impl Serialize for SlidingWindow {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let repr = SlidingWindowRepr {
+            size: self.size as u64,
+            total_pos: self.total_pos,
+            data: self.get_window_data(),
+            pending_out: self.pending_out.clone(),
+        };
+        repr.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SlidingWindow {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let repr = SlidingWindowRepr::deserialize(deserializer)?;
+        let size = usize::try_from(repr.size)
+            .ok()
+            .filter(|&s| s > 0 && s <= (1 << 31))
+            .ok_or_else(|| D::Error::custom("implausible LZMA window size"))?;
+        if repr.data.len() > size {
+            return Err(D::Error::custom("LZMA window data exceeds window size"));
+        }
+
+        // Relinearized layout: logical bytes at the front, cursor after them.
+        // Equivalent to the original circular state under rotation.
+        let mut buf = vec![0u8; size];
+        buf[..repr.data.len()].copy_from_slice(&repr.data);
+        let is_full = repr.data.len() == size;
+        Ok(SlidingWindow {
+            pos: if is_full { 0 } else { repr.data.len() },
+            buf,
+            size,
+            is_full,
+            total_pos: repr.total_pos,
+            pending_out: repr.pending_out,
+        })
+    }
 }
 
 impl SlidingWindow {
@@ -299,8 +362,8 @@ impl SlidingWindow {
         self.pending_out.len()
     }
 
-    /// Get the last `dict_size` bytes of the window for checkpointing.
-    #[allow(dead_code)]
+    /// Get the live window contents (linearized, oldest-first) for
+    /// checkpointing.
     pub fn get_window_data(&self) -> Vec<u8> {
         if !self.is_full {
             self.buf[..self.pos].to_vec()
@@ -1947,5 +2010,86 @@ mod tests {
         assert_eq!(data.len(), 100);
         assert_eq!(data[0], 0);
         assert_eq!(data[99], 99);
+    }
+
+    #[test]
+    fn test_sliding_window_serde_roundtrip_partial() {
+        // Window not yet full: only the written prefix is meaningful.
+        let mut w = SlidingWindow::new(K_DIC_MIN);
+        for i in 0..100u32 {
+            w.put_byte_direct(i as u8);
+        }
+        let bytes = bincode::serialize(&w).unwrap();
+        // Compact: must not serialize the zero-filled 4 KiB tail.
+        assert!(bytes.len() < 200, "serialized {} bytes", bytes.len());
+
+        let r: SlidingWindow = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(r.total_pos, w.total_pos);
+        for dist in 1..=100u32 {
+            assert_eq!(r.get_byte(dist), w.get_byte(dist), "dist {}", dist);
+        }
+        assert_eq!(r.is_empty(), w.is_empty());
+        assert_eq!(r.check_distance(50), w.check_distance(50));
+        assert_eq!(r.check_distance(5000), w.check_distance(5000));
+    }
+
+    #[test]
+    fn test_sliding_window_serde_roundtrip_wrapped() {
+        // Window wrapped: full dictionary is live, cursor mid-buffer.
+        let mut w = SlidingWindow::new(K_DIC_MIN);
+        // (w stays mutable for the continued-write check below)
+        let n = K_DIC_MIN as usize * 2 + 1234;
+        for i in 0..n {
+            w.put_byte_direct((i as u32).wrapping_mul(2654435761) as u8);
+        }
+        let bytes = bincode::serialize(&w).unwrap();
+
+        let mut r: SlidingWindow = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(r.total_pos, w.total_pos);
+        for dist in 1..=K_DIC_MIN {
+            assert_eq!(r.get_byte(dist), w.get_byte(dist), "dist {}", dist);
+        }
+        assert_eq!(
+            r.check_distance(K_DIC_MIN - 1),
+            w.check_distance(K_DIC_MIN - 1)
+        );
+
+        // Continued writes behave identically.
+        for i in 0..500u32 {
+            let b = (i * 31) as u8;
+            w.put_byte_direct(b);
+            r.put_byte_direct(b);
+        }
+        for dist in 1..=K_DIC_MIN {
+            assert_eq!(
+                r.get_byte(dist),
+                w.get_byte(dist),
+                "post-write dist {}",
+                dist
+            );
+        }
+    }
+
+    #[test]
+    fn test_sliding_window_deserialize_rejects_bad_data() {
+        // data longer than the declared window size must be rejected.
+        let repr = super::SlidingWindowRepr {
+            size: 16,
+            total_pos: 100,
+            data: vec![0u8; 32],
+            pending_out: Vec::new(),
+        };
+        let bytes = bincode::serialize(&repr).unwrap();
+        assert!(bincode::deserialize::<SlidingWindow>(&bytes).is_err());
+
+        // Implausibly huge window size must not allocate.
+        let repr = super::SlidingWindowRepr {
+            size: u64::MAX,
+            total_pos: 0,
+            data: Vec::new(),
+            pending_out: Vec::new(),
+        };
+        let bytes = bincode::serialize(&repr).unwrap();
+        assert!(bincode::deserialize::<SlidingWindow>(&bytes).is_err());
     }
 }
