@@ -464,6 +464,7 @@ impl Decompressor for XzDecompressor {
             block_header_size: self.block_header_size,
             lzma2_state: lzma2_checkpoint.map(|s| bincode::serialize(&s).unwrap_or_default()),
             buffer: self.buffer.clone(),
+            staged_output: self.staged_output[self.staged_pos..].to_vec(),
         };
 
         Ok(Checkpoint {
@@ -486,7 +487,7 @@ impl Decompressor for XzDecompressor {
                 self.block_data_bytes = state.block_data_bytes;
                 self.block_header_size = state.block_header_size;
                 self.buffer = state.buffer.clone();
-                self.staged_output.clear();
+                self.staged_output = state.staged_output.clone();
                 self.staged_pos = 0;
                 self.finished = false;
                 self.total_in = checkpoint.compressed_offset;

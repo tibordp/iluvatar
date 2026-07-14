@@ -116,6 +116,9 @@ pub struct XzFullCheckpointState {
     /// Internal input buffer.
     #[serde(default)]
     pub buffer: Vec<u8>,
+    /// Decoded output not yet delivered to the caller at checkpoint time.
+    #[serde(default)]
+    pub staged_output: Vec<u8>,
 }
 
 /// Zstd checkpoint: full decompressor state for mid-stream resume.

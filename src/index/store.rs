@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Current index format version.
-pub(crate) const INDEX_VERSION: u32 = 2;
+pub(crate) const INDEX_VERSION: u32 = 3;
 
 /// Metadata about the indexed archive.
 ///

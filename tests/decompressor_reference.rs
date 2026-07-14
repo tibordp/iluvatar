@@ -440,6 +440,38 @@ fn test_xz_checkpoint_range_reads() {
 
 #[cfg(feature = "xz")]
 #[test]
+fn test_xz_checkpoint_highly_compressible() {
+    // Regression test: highly compressible data can stage more decoded output
+    // in the decompressor than the engine drains per step, so checkpoints get
+    // taken while output is still buffered. Restoring such a checkpoint must
+    // not lose the undelivered bytes. The data is position-distinct (long
+    // runs of an incrementing byte) so lost/shifted output is detectable.
+    let file_data: Vec<u8> = (0..2_000_000usize).map(|i| (i >> 9) as u8).collect();
+    let tar = create_tar_bytes(&[("zeros.bin", &file_data)]);
+    let compressed = compress_tar_xz(&tar, 6);
+
+    let index = index_in_memory_chunked(&compressed, CompressionFormat::Xz, 8192, 65_536);
+    assert!(
+        index.checkpoints.len() > 1,
+        "expected multiple checkpoints, got {}",
+        index.checkpoints.len()
+    );
+
+    let full = read_in_memory(&compressed, &index, "zeros.bin");
+    assert_eq!(full, file_data);
+
+    for &(offset, len) in &[(0u64, 1000u64), (500_000, 100_000), (1_900_000, 100_000)] {
+        let range = read_range_in_memory(&compressed, &index, "zeros.bin", offset, len);
+        let expected = &file_data[offset as usize..(offset + len) as usize];
+        assert_eq!(
+            range, expected,
+            "range read mismatch at offset={offset}, len={len}"
+        );
+    }
+}
+
+#[cfg(feature = "xz")]
+#[test]
 fn test_xz_edge_cases() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("empty.bin", vec![]),
