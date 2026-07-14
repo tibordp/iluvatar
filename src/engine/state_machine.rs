@@ -377,8 +377,7 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
             parse_offset += consumed;
             match event {
                 ArchiveEvent::Entry(entry) => {
-                    let cp_idx = self.index_builder.checkpoint_count().saturating_sub(1);
-                    self.index_builder.add_entry(entry, cp_idx);
+                    self.index_builder.add_entry(entry);
                 }
                 ArchiveEvent::NeedData => {
                     if consumed == 0 {
@@ -404,8 +403,7 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
             parse_offset += consumed;
             match event {
                 ArchiveEvent::Entry(entry) => {
-                    let cp_idx = self.index_builder.checkpoint_count().saturating_sub(1);
-                    self.index_builder.add_entry(entry, cp_idx);
+                    self.index_builder.add_entry(entry);
                 }
                 ArchiveEvent::NeedData => {
                     if consumed == 0 {

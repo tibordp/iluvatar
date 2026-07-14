@@ -33,7 +33,17 @@ impl IndexBuilder {
     }
 
     /// Add an archive entry to the index.
-    pub fn add_entry(&mut self, entry: ArchiveEntry, checkpoint_index: usize) {
+    ///
+    /// The entry is associated with the latest checkpoint whose uncompressed
+    /// offset does not exceed the entry's data offset — a later checkpoint
+    /// (e.g. one taken at the end of the decompressed chunk in which this
+    /// entry was discovered) cannot be used to read the entry.
+    pub fn add_entry(&mut self, entry: ArchiveEntry) {
+        let checkpoint_index = self
+            .checkpoints
+            .iter()
+            .rposition(|cp| cp.uncompressed_offset <= entry.data_offset)
+            .unwrap_or(0);
         self.last_entry_path = Some(entry.path.clone());
         let index_entry = IndexEntry {
             path: entry.path.clone(),
@@ -157,7 +167,7 @@ mod tests {
             state: CheckpointState::None,
         });
 
-        builder.add_entry(make_entry("test.txt", 100, 512), 0);
+        builder.add_entry(make_entry("test.txt", 100, 512));
 
         assert_eq!(builder.checkpoint_count(), 1);
         assert_eq!(builder.entry_count(), 1);
@@ -181,7 +191,7 @@ mod tests {
             state: CheckpointState::None,
         });
 
-        builder.add_entry(make_entry("a.txt", 100, 512), 0);
+        builder.add_entry(make_entry("a.txt", 100, 512));
 
         let snap = builder.snapshot(1024);
         assert_eq!(snap.entries.len(), 1);
@@ -189,7 +199,7 @@ mod tests {
         assert!(snap.get("a.txt").is_some());
 
         // Builder is still usable
-        builder.add_entry(make_entry("b.txt", 200, 2048), 0);
+        builder.add_entry(make_entry("b.txt", 200, 2048));
         assert_eq!(builder.entry_count(), 2);
 
         let final_index = builder.finish(4096);
@@ -202,10 +212,10 @@ mod tests {
         let mut builder = IndexBuilder::new(CompressionFormat::None, ArchiveFormat::Tar, 0);
         assert_eq!(builder.last_entry_path(), None);
 
-        builder.add_entry(make_entry("first.txt", 10, 512), 0);
+        builder.add_entry(make_entry("first.txt", 10, 512));
         assert_eq!(builder.last_entry_path(), Some("first.txt"));
 
-        builder.add_entry(make_entry("second.txt", 20, 1024), 0);
+        builder.add_entry(make_entry("second.txt", 20, 1024));
         assert_eq!(builder.last_entry_path(), Some("second.txt"));
     }
 
@@ -218,10 +228,42 @@ mod tests {
             uncompressed_offset: 0,
             state: CheckpointState::None,
         });
-        builder.add_entry(make_entry("file.txt", 100, 512), 0);
+        builder.add_entry(make_entry("file.txt", 100, 512));
 
         let index = builder.finish_partial(1024);
         assert!(!index.metadata.complete);
         assert_eq!(index.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_entry_associated_with_checkpoint_at_or_before_data() {
+        let mut builder = IndexBuilder::new(CompressionFormat::Gzip, ArchiveFormat::Tar, 1000);
+        builder.add_checkpoint(Checkpoint {
+            compressed_offset: 0,
+            bit_offset: 0,
+            uncompressed_offset: 0,
+            state: CheckpointState::None,
+        });
+        builder.add_checkpoint(Checkpoint {
+            compressed_offset: 500,
+            bit_offset: 0,
+            uncompressed_offset: 1000,
+            state: CheckpointState::None,
+        });
+
+        // Entry data starts BEFORE the latest checkpoint: must use the earlier one.
+        builder.add_entry(make_entry("early.txt", 100, 800));
+        // Entry data starts after the latest checkpoint: uses it.
+        builder.add_entry(make_entry("late.txt", 100, 1500));
+
+        let index = builder.finish(4096);
+        let early = index.get("early.txt").unwrap();
+        let late = index.get("late.txt").unwrap();
+        assert_eq!(early.checkpoint_index, 0);
+        assert_eq!(late.checkpoint_index, 1);
+        assert!(
+            index.checkpoints[early.checkpoint_index].uncompressed_offset
+                <= early.uncompressed_offset
+        );
     }
 }

@@ -42,6 +42,8 @@ impl ArchiveIndex {
     /// # }
     /// ```
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        use bincode::Options;
+
         if data.len() < INDEX_MAGIC.len() {
             return Err(Error::IndexError("data too short".into()));
         }
@@ -50,7 +52,16 @@ impl ArchiveIndex {
             return Err(Error::IndexError("invalid index magic".into()));
         }
 
-        let index: ArchiveIndex = bincode::deserialize(&data[INDEX_MAGIC.len()..])
+        // Same wire format as `bincode::deserialize` (fixint, trailing bytes
+        // allowed) but with a read limit so corrupt length prefixes cannot
+        // request absurd allocations. Serialized data is never smaller than
+        // the content it encodes, so the input length bounds the content.
+        let payload = &data[INDEX_MAGIC.len()..];
+        let index: ArchiveIndex = bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(payload.len() as u64)
+            .deserialize(payload)
             .map_err(|e| Error::Serialization(e.to_string()))?;
 
         if index.metadata.version != INDEX_VERSION {
@@ -58,6 +69,22 @@ impl ArchiveIndex {
                 expected: INDEX_VERSION,
                 got: index.metadata.version,
             });
+        }
+
+        // Consistency checks so a corrupt/crafted index cannot cause panics
+        // downstream (checkpoint lookups index into `checkpoints` directly).
+        if index.checkpoints.is_empty() {
+            return Err(Error::IndexError("index contains no checkpoints".into()));
+        }
+        for entry in index.entries.values() {
+            if entry.checkpoint_index >= index.checkpoints.len() {
+                return Err(Error::IndexError(format!(
+                    "entry '{}' references checkpoint {} of {}",
+                    entry.path,
+                    entry.checkpoint_index,
+                    index.checkpoints.len()
+                )));
+            }
         }
 
         Ok(index)
@@ -162,5 +189,63 @@ mod tests {
         let bytes = index.to_bytes().unwrap();
         // Should be relatively compact
         assert!(bytes.len() < 1000);
+    }
+
+    #[test]
+    fn test_out_of_range_checkpoint_index_rejected() {
+        let mut index = make_test_index();
+        index.entries.get_mut("test.txt").unwrap().checkpoint_index = 99;
+        let bytes = index.to_bytes().unwrap();
+        assert!(ArchiveIndex::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_empty_checkpoints_rejected() {
+        let mut index = make_test_index();
+        index.checkpoints.clear();
+        index.entries.clear(); // keep entry refs valid
+        let bytes = index.to_bytes().unwrap();
+        assert!(ArchiveIndex::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_length_prefix_bomb_rejected() {
+        // A crafted payload whose collection length prefix claims far more
+        // data than exists must fail cleanly instead of attempting a huge
+        // allocation.
+        let mut bytes = INDEX_MAGIC.to_vec();
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // "version"
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // bogus length prefix
+        bytes.extend_from_slice(&[0xAA; 64]);
+        assert!(ArchiveIndex::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_truncated_payload_rejected() {
+        let index = make_test_index();
+        let bytes = index.to_bytes().unwrap();
+        for cut in [bytes.len() / 4, bytes.len() / 2, bytes.len() - 3] {
+            assert!(
+                ArchiveIndex::from_bytes(&bytes[..cut]).is_err(),
+                "truncation at {} accepted",
+                cut
+            );
+        }
+    }
+
+    #[test]
+    fn test_random_garbage_rejected_without_panic() {
+        let mut state = 0xDEADBEEFu64;
+        for len in [16usize, 64, 256, 4096] {
+            let mut bytes = INDEX_MAGIC.to_vec();
+            for _ in 0..len {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                bytes.push((state >> 33) as u8);
+            }
+            // Must return (usually Err) — never panic or hang.
+            let _ = ArchiveIndex::from_bytes(&bytes);
+        }
     }
 }

@@ -1734,3 +1734,66 @@ fn test_truncated_gzip_archive_errors_during_indexing() {
     assert!(saw_error, "truncated gzip archive indexed without error");
 }
 
+#[cfg(feature = "gzip")]
+#[test]
+fn test_entry_checkpoints_usable_for_reading() {
+    // Every entry's assigned checkpoint must start at or before the entry's
+    // data (a later checkpoint cannot be used to read it). Small checkpoint
+    // interval forces checkpoints to interleave with entry discovery.
+    let files: Vec<(String, Vec<u8>)> = (0..30)
+        .map(|i| {
+            let mut rng = i as u64 + 1;
+            let content: Vec<u8> = (0..10_000)
+                .map(|_| {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (rng >> 33) as u8
+                })
+                .collect();
+            (format!("f{:02}.bin", i), content)
+        })
+        .collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
+    let compressed = create_tar_gz(&refs);
+
+    let mut engine = IndexingEngine::with_strategy(
+        CompressionFormat::Gzip,
+        None,
+        iluvatar::FixedInterval::new(16 * 1024),
+        compressed.len() as u64,
+    )
+    .unwrap();
+    let mut offset = 0;
+    loop {
+        match engine.step() {
+            EngineRequest::NeedInput => {
+                if offset >= compressed.len() {
+                    engine.signal_eof();
+                } else {
+                    let end = (offset + 8192).min(compressed.len());
+                    engine.provide_data(&compressed[offset..end]);
+                    offset = end;
+                }
+            }
+            EngineRequest::Done => break,
+            EngineRequest::Error(e) => panic!("indexing error: {}", e),
+            _ => {}
+        }
+    }
+    let index = engine.finish();
+    assert!(index.checkpoints.len() > 2, "want several checkpoints");
+
+    for entry in index.entries.values() {
+        let cp = &index.checkpoints[entry.checkpoint_index];
+        assert!(
+            cp.uncompressed_offset <= entry.uncompressed_offset,
+            "entry '{}' at {} assigned checkpoint {} starting at {}",
+            entry.path,
+            entry.uncompressed_offset,
+            entry.checkpoint_index,
+            cp.uncompressed_offset
+        );
+    }
+}
