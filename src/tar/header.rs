@@ -11,6 +11,11 @@ pub fn parse_octal(field: &[u8]) -> Result<u64> {
     if !field.is_empty() && field[0] & 0x80 != 0 {
         let mut value: u64 = 0;
         for &b in &field[1..] {
+            if value >> 56 != 0 {
+                return Err(Error::InvalidTarHeader(
+                    "binary numeric field exceeds u64".into(),
+                ));
+            }
             value = value << 8 | b as u64;
         }
         return Ok(value);
@@ -86,7 +91,25 @@ pub fn parse_header(header: &[u8; BLOCK_SIZE], data_offset: u64) -> Result<TarEn
     let typeflag = header[156];
     let linkname = parse_string(&header[157..257]);
 
+    // Reject sizes that cannot be padded to a block boundary without
+    // overflowing; no real archive comes anywhere near this.
+    if size > u64::MAX - BLOCK_SIZE as u64 {
+        return Err(Error::InvalidTarHeader(format!(
+            "entry size {} too large",
+            size
+        )));
+    }
+
     let entry_type = TarEntryType::from_byte(typeflag);
+
+    // Old-style GNU sparse entries store fewer bytes in the archive than the
+    // logical file size; skipping by size would desynchronize every
+    // subsequent offset, so reject them explicitly.
+    if entry_type == TarEntryType::Other(b'S') {
+        return Err(Error::InvalidTarHeader(
+            "GNU sparse entries (typeflag 'S') are not supported".into(),
+        ));
+    }
 
     // Check for ustar magic
     let is_ustar = &header[257..262] == b"ustar";

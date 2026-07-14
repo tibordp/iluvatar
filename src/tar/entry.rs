@@ -26,7 +26,9 @@ impl TarEntryType {
     /// Parse from the typeflag byte in a tar header.
     pub fn from_byte(b: u8) -> Self {
         match b {
-            b'0' | 0 => TarEntryType::Regular,
+            // '7' is a contiguous file — read it as a regular file, like
+            // every mainstream tar implementation does.
+            b'0' | 0 | b'7' => TarEntryType::Regular,
             b'1' => TarEntryType::HardLink,
             b'2' => TarEntryType::SymLink,
             b'3' => TarEntryType::CharDevice,
