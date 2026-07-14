@@ -448,9 +448,8 @@ mod tests {
     /// Create a newc-format cpio archive in memory.
     fn create_newc_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut archive = Vec::new();
-        let mut ino = 1u64;
 
-        for (path, content) in files {
+        for (ino, (path, content)) in (1u64..).zip(files.iter()) {
             let namesize = path.len() + 1; // include null terminator
             let filesize = content.len();
 
@@ -501,8 +500,6 @@ mod tests {
             // Pad data to 4-byte boundary
             let data_padded = (filesize + 3) & !3;
             archive.resize(archive.len() + data_padded - filesize, 0);
-
-            ino += 1;
         }
 
         // Trailer
@@ -643,10 +640,8 @@ mod tests {
                     found_end = true;
                     break;
                 }
-                ArchiveEvent::NeedData => {
-                    if offset >= archive.len() {
-                        break;
-                    }
+                ArchiveEvent::NeedData if offset >= archive.len() => {
+                    break;
                 }
                 _ => {}
             }

@@ -1446,9 +1446,8 @@ fn test_from_reader_all_formats() {
 /// Create a newc-format cpio archive in memory.
 fn create_cpio_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut archive = Vec::new();
-    let mut ino = 1u64;
 
-    for (path, content) in files {
+    for (ino, (path, content)) in (1u64..).zip(files.iter()) {
         let namesize = path.len() + 1; // include null terminator
         let filesize = content.len();
 
@@ -1483,8 +1482,6 @@ fn create_cpio_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
         archive.extend_from_slice(content);
         let data_padded = (filesize + 3) & !3;
         archive.resize(archive.len() + data_padded - filesize, 0);
-
-        ino += 1;
     }
 
     // Trailer

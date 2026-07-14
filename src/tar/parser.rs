@@ -485,10 +485,8 @@ mod tests {
             offset += consumed;
             match event {
                 TarEvent::EndOfArchive => break,
-                TarEvent::NeedData => {
-                    if offset >= tar_data.len() {
-                        break;
-                    }
+                TarEvent::NeedData if offset >= tar_data.len() => {
+                    break;
                 }
                 _ => {}
             }
