@@ -5,7 +5,12 @@ use crate::cpio::header::{
     ODC_HEADER_SIZE, ODC_MAGIC, TRAILER_NAME,
 };
 use crate::error::{Error, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+
+/// Maximum accepted filename / symlink-target size. Paths are never
+/// anywhere near this; the limit keeps a crafted header from forcing a
+/// huge allocation.
+const MAX_NAME_SIZE: usize = 1 << 16;
 
 /// Internal parser state.
 enum CpioState {
@@ -22,6 +27,9 @@ enum CpioState {
     SkippingNamePad {
         entry: ArchiveEntry,
         remaining: usize,
+        /// Inode and link count, for hardlink resolution at emission time.
+        ino: u64,
+        nlink: u32,
     },
     /// Reading symlink target (stored as file data in cpio).
     ReadingLinkTarget {
@@ -49,8 +57,15 @@ pub struct CpioParser {
     stream_pos: u64,
     /// Detected sub-format (set after first header).
     sub_format: Option<CpioSubFormat>,
-    /// Map inode -> first path, for hardlink resolution.
-    inode_paths: HashMap<u64, String>,
+    /// Inode -> path of the data-bearing member, for hardlink resolution.
+    resolved_inodes: HashMap<u64, String>,
+    /// Zero-size hardlink members seen before their inode's data-bearing
+    /// member; emitted (as HardLink) once it arrives. In newc archives the
+    /// file data is stored with the LAST member of a hardlink set, so the
+    /// earlier members must be deferred. BTreeMap for deterministic order.
+    deferred_links: BTreeMap<u64, Vec<ArchiveEntry>>,
+    /// Entries ready to be emitted on subsequent feed() calls.
+    pending: VecDeque<ArchiveEntry>,
 }
 
 impl CpioParser {
@@ -60,7 +75,44 @@ impl CpioParser {
             header_buf: Vec::with_capacity(NEWC_HEADER_SIZE),
             stream_pos: 0,
             sub_format: None,
-            inode_paths: HashMap::new(),
+            resolved_inodes: HashMap::new(),
+            deferred_links: BTreeMap::new(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Hardlink resolution at emission time. Returns the entry to emit now,
+    /// or `None` if it was deferred until its inode's data-bearing member
+    /// arrives (which also queues the deferred members onto `pending`).
+    fn apply_hardlink_policy(
+        &mut self,
+        mut entry: ArchiveEntry,
+        ino: u64,
+        nlink: u32,
+    ) -> Option<ArchiveEntry> {
+        if entry.entry_type != EntryType::Regular || nlink <= 1 {
+            return Some(entry);
+        }
+        if entry.size > 0 {
+            // Data-bearing member: this is the canonical path for the inode.
+            self.resolved_inodes.insert(ino, entry.path.clone());
+            if let Some(deferred) = self.deferred_links.remove(&ino) {
+                for mut d in deferred {
+                    d.entry_type = EntryType::HardLink;
+                    d.link_target = Some(entry.path.clone());
+                    self.pending.push_back(d);
+                }
+            }
+            Some(entry)
+        } else if let Some(path) = self.resolved_inodes.get(&ino) {
+            // Data member already seen (data-first layout).
+            entry.entry_type = EntryType::HardLink;
+            entry.link_target = Some(path.clone());
+            Some(entry)
+        } else {
+            // Data member not seen yet (the usual newc layout): defer.
+            self.deferred_links.entry(ino).or_default().push(entry);
+            None
         }
     }
 
@@ -85,46 +137,49 @@ impl CpioParser {
             return Ok((0, ArchiveEvent::NeedData));
         }
 
+        let mut consumed = 0usize;
+
+        // Detect the sub-format from the 6 magic bytes BEFORE deciding how
+        // many header bytes to read; odc headers are shorter than newc ones,
+        // so buffering a newc-sized header first would over-consume when the
+        // header arrives in small chunks.
+        if self.sub_format.is_none() {
+            let need_magic = 6usize.saturating_sub(self.header_buf.len());
+            if need_magic > 0 {
+                let take = data.len().min(need_magic);
+                self.header_buf.extend_from_slice(&data[..take]);
+                self.stream_pos += take as u64;
+                consumed += take;
+                if self.header_buf.len() < 6 {
+                    return Ok((consumed, ArchiveEvent::NeedData));
+                }
+            }
+            self.sub_format = Some(match &self.header_buf[0..6] {
+                m if m == NEWC_MAGIC => CpioSubFormat::Newc,
+                m if m == NEWC_CRC_MAGIC => CpioSubFormat::NewcCrc,
+                m if m == ODC_MAGIC => CpioSubFormat::Odc,
+                other => {
+                    return Err(Error::InvalidCpioHeader(format!(
+                        "unrecognized cpio magic: {:?}",
+                        other
+                    )));
+                }
+            });
+        }
+
         let header_size = self.header_size();
         let needed = header_size - self.header_buf.len();
-        let available = data.len().min(needed);
-        self.header_buf.extend_from_slice(&data[..available]);
+        let available = (data.len() - consumed).min(needed);
+        self.header_buf
+            .extend_from_slice(&data[consumed..consumed + available]);
         self.stream_pos += available as u64;
+        consumed += available;
 
         if self.header_buf.len() < header_size {
-            return Ok((available, ArchiveEvent::NeedData));
+            return Ok((consumed, ArchiveEvent::NeedData));
         }
 
-        // Detect sub-format from magic if this is the first header
-        if self.sub_format.is_none() && self.header_buf.len() >= 6 {
-            if &self.header_buf[0..6] == NEWC_MAGIC {
-                self.sub_format = Some(CpioSubFormat::Newc);
-            } else if &self.header_buf[0..6] == NEWC_CRC_MAGIC {
-                self.sub_format = Some(CpioSubFormat::NewcCrc);
-            } else if &self.header_buf[0..6] == ODC_MAGIC {
-                self.sub_format = Some(CpioSubFormat::Odc);
-                // odc header is shorter — if we over-read, we'll handle below
-                if self.header_buf.len() > ODC_HEADER_SIZE {
-                    // We read too many bytes (assumed newc size).
-                    // Return only what we need and rewind.
-                    let excess = self.header_buf.len() - ODC_HEADER_SIZE;
-                    self.stream_pos -= excess as u64;
-                    self.header_buf.truncate(ODC_HEADER_SIZE);
-                    let consumed = available - excess;
-                    return self.process_header(consumed);
-                } else if self.header_buf.len() < ODC_HEADER_SIZE {
-                    // Need more data for odc header
-                    return Ok((available, ArchiveEvent::NeedData));
-                }
-            } else {
-                return Err(Error::InvalidCpioHeader(format!(
-                    "unrecognized cpio magic: {:?}",
-                    &self.header_buf[0..6]
-                )));
-            }
-        }
-
-        self.process_header(available)
+        self.process_header(consumed)
     }
 
     fn process_header(&mut self, consumed: usize) -> Result<(usize, ArchiveEvent)> {
@@ -134,6 +189,12 @@ impl CpioParser {
         };
 
         let namesize = hdr.namesize as usize;
+        if namesize > MAX_NAME_SIZE {
+            return Err(Error::InvalidCpioHeader(format!(
+                "implausible namesize {}",
+                namesize
+            )));
+        }
         self.header_buf.clear();
 
         self.state = CpioState::ReadingFilename {
@@ -177,7 +238,15 @@ impl CpioParser {
 
         // Check for end-of-archive trailer
         if filename == TRAILER_NAME {
+            // Flush hardlink members whose data-bearing member never arrived
+            // (nonstandard/malformed archives) so they are not lost; they
+            // stay as the zero-size regular entries the archive declared.
+            let deferred = std::mem::take(&mut self.deferred_links);
+            self.pending.extend(deferred.into_values().flatten());
             self.state = CpioState::End;
+            if let Some(entry) = self.pending.pop_front() {
+                return Ok((take, ArchiveEvent::Entry(entry)));
+            }
             return Ok((take, ArchiveEvent::EndOfArchive));
         }
 
@@ -192,36 +261,15 @@ impl CpioParser {
         // Data starts after filename + alignment padding
         let data_offset = self.stream_pos + name_pad as u64;
 
-        // Handle hardlinks via inode tracking
-        let link_target = if entry_type == EntryType::Regular && hdr.nlink > 1 {
-            if hdr.filesize == 0 {
-                // This is a hardlink to a previously seen inode
-                self.inode_paths.get(&hdr.ino).cloned()
-            } else {
-                // First occurrence — record the path
-                self.inode_paths.insert(hdr.ino, filename.clone());
-                None
-            }
-        } else {
-            None
-        };
-
-        let is_hardlink = link_target.is_some() && hdr.filesize == 0;
-        let actual_entry_type = if is_hardlink {
-            EntryType::HardLink
-        } else {
-            entry_type
-        };
-
-        let mut entry = ArchiveEntry {
+        let entry = ArchiveEntry {
             path: filename,
             size: hdr.filesize,
-            entry_type: actual_entry_type,
+            entry_type,
             mode: hdr.mode & 0o7777, // Strip S_IFMT bits, keep permission bits
             uid: hdr.uid,
             gid: hdr.gid,
             mtime: hdr.mtime,
-            link_target,
+            link_target: None,
             data_offset,
         };
 
@@ -230,12 +278,14 @@ impl CpioParser {
             self.state = CpioState::SkippingNamePad {
                 entry,
                 remaining: name_pad,
+                ino: hdr.ino,
+                nlink: hdr.nlink,
             };
             return Ok((take, ArchiveEvent::NeedData));
         }
 
         // No padding — go directly to data handling
-        self.transition_to_data(&mut entry, &hdr)
+        self.transition_to_data(entry, &hdr)
             .map(|event| (take, event))
     }
 
@@ -258,8 +308,10 @@ impl CpioParser {
         }
 
         // Padding done — update data_offset to current position
-        let mut entry = match std::mem::replace(&mut self.state, CpioState::End) {
-            CpioState::SkippingNamePad { entry, .. } => entry,
+        let (mut entry, ino, nlink) = match std::mem::replace(&mut self.state, CpioState::End) {
+            CpioState::SkippingNamePad {
+                entry, ino, nlink, ..
+            } => (entry, ino, nlink),
             _ => unreachable!(),
         };
         entry.data_offset = self.stream_pos;
@@ -270,6 +322,12 @@ impl CpioParser {
         let entry_type = entry.entry_type;
 
         if entry_type == EntryType::SymLink && filesize > 0 {
+            if filesize as usize > MAX_NAME_SIZE {
+                return Err(Error::InvalidCpioHeader(format!(
+                    "implausible symlink target size {}",
+                    filesize
+                )));
+            }
             self.state = CpioState::ReadingLinkTarget {
                 entry,
                 remaining: filesize as usize,
@@ -287,24 +345,35 @@ impl CpioParser {
             self.state = CpioState::SkippingData {
                 remaining: total_skip,
             };
-            Ok((skip, ArchiveEvent::Entry(entry)))
+            match self.apply_hardlink_policy(entry, ino, nlink) {
+                Some(entry) => Ok((skip, ArchiveEvent::Entry(entry))),
+                None => Ok((skip, ArchiveEvent::NeedData)),
+            }
         } else {
             self.state = CpioState::ReadingHeader;
-            Ok((skip, ArchiveEvent::Entry(entry)))
+            match self.apply_hardlink_policy(entry, ino, nlink) {
+                Some(entry) => Ok((skip, ArchiveEvent::Entry(entry))),
+                None => Ok((skip, ArchiveEvent::NeedData)),
+            }
         }
     }
 
     fn transition_to_data(
         &mut self,
-        entry: &mut ArchiveEntry,
+        mut entry: ArchiveEntry,
         hdr: &CpioHeader,
     ) -> Result<ArchiveEvent> {
         entry.data_offset = self.stream_pos;
 
         if entry.entry_type == EntryType::SymLink && hdr.filesize > 0 {
-            let entry_clone = entry.clone();
+            if hdr.filesize as usize > MAX_NAME_SIZE {
+                return Err(Error::InvalidCpioHeader(format!(
+                    "implausible symlink target size {}",
+                    hdr.filesize
+                )));
+            }
             self.state = CpioState::ReadingLinkTarget {
-                entry: entry_clone,
+                entry,
                 remaining: hdr.filesize as usize,
                 buf: Vec::with_capacity(hdr.filesize as usize),
             };
@@ -319,10 +388,16 @@ impl CpioParser {
             self.state = CpioState::SkippingData {
                 remaining: total_skip,
             };
-            Ok(ArchiveEvent::Entry(entry.clone()))
+            match self.apply_hardlink_policy(entry, hdr.ino, hdr.nlink) {
+                Some(entry) => Ok(ArchiveEvent::Entry(entry)),
+                None => Ok(ArchiveEvent::NeedData),
+            }
         } else {
             self.state = CpioState::ReadingHeader;
-            Ok(ArchiveEvent::Entry(entry.clone()))
+            match self.apply_hardlink_policy(entry, hdr.ino, hdr.nlink) {
+                Some(entry) => Ok(ArchiveEvent::Entry(entry)),
+                None => Ok(ArchiveEvent::NeedData),
+            }
         }
     }
 
@@ -425,6 +500,10 @@ impl Default for CpioParser {
 
 impl ArchiveParser for CpioParser {
     fn feed(&mut self, data: &[u8]) -> Result<(usize, ArchiveEvent)> {
+        // Deliver any entries queued by hardlink resolution first.
+        if let Some(entry) = self.pending.pop_front() {
+            return Ok((0, ArchiveEvent::Entry(entry)));
+        }
         match &self.state {
             CpioState::ReadingHeader => self.feed_header(data),
             CpioState::ReadingFilename { .. } => self.feed_filename(data),
@@ -747,5 +826,234 @@ mod tests {
         assert_eq!(entries[0].path, "mydir");
         assert_eq!(entries[0].entry_type, EntryType::Directory);
         assert_eq!(entries[0].mode, 0o755);
+    }
+
+    // ─── Hardening & hardlink tests ───
+
+    /// Write a single newc record with full control over the header fields.
+    #[allow(clippy::too_many_arguments)]
+    fn write_newc_record(
+        archive: &mut Vec<u8>,
+        path: &str,
+        content: &[u8],
+        ino: u64,
+        mode: u32,
+        nlink: u32,
+        namesize_override: Option<u32>,
+        filesize_override: Option<u64>,
+    ) {
+        let namesize = namesize_override.unwrap_or(path.len() as u32 + 1);
+        let filesize = filesize_override.unwrap_or(content.len() as u64);
+        let header =
+            format!(
+            "070701{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}",
+            ino, mode, 1000u32, 1000u32, nlink, 1700000000u32, filesize, 0u32, 0u32, 0u32, 0u32,
+            namesize, 0u32,
+        );
+        archive.extend_from_slice(header.as_bytes());
+        archive.extend_from_slice(path.as_bytes());
+        archive.push(0);
+        let total = 110 + path.len() + 1;
+        let padded = (total + 3) & !3;
+        archive.resize(archive.len() + padded - total, 0);
+        archive.extend_from_slice(content);
+        let data_padded = (content.len() + 3) & !3;
+        archive.resize(archive.len() + data_padded - content.len(), 0);
+    }
+
+    fn write_newc_trailer(archive: &mut Vec<u8>) {
+        write_newc_record(archive, "TRAILER!!!", b"", 0, 0, 1, None, None);
+    }
+
+    /// Create an odc-format cpio archive in memory.
+    fn create_odc_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        let mut write_record = |path: &str, content: &[u8], ino: u64| {
+            let header = format!(
+                "070707{:06o}{:06o}{:06o}{:06o}{:06o}{:06o}{:06o}{:011o}{:06o}{:011o}",
+                0u32,           // dev
+                ino,            // ino
+                0o100644u32,    // mode
+                1000u32,        // uid
+                1000u32,        // gid
+                1u32,           // nlink
+                0u32,           // rdev
+                1700000000u64,  // mtime
+                path.len() + 1, // namesize
+                content.len(),  // filesize
+            );
+            assert_eq!(header.len(), 76);
+            archive.extend_from_slice(header.as_bytes());
+            archive.extend_from_slice(path.as_bytes());
+            archive.push(0);
+            archive.extend_from_slice(content);
+        };
+        for (ino, (path, content)) in (1u64..).zip(files.iter()) {
+            write_record(path, content, ino);
+        }
+        write_record("TRAILER!!!", b"", 0);
+        archive
+    }
+
+    /// Drive the parser over data in fixed-size chunks; collect entries.
+    fn parse_chunked(data: &[u8], chunk: usize) -> Result<Vec<ArchiveEntry>> {
+        let mut parser = CpioParser::new();
+        let mut offset = 0;
+        let mut entries = Vec::new();
+        loop {
+            let end = (offset + chunk).min(data.len());
+            let (consumed, event) = parser.feed(&data[offset..end])?;
+            offset += consumed;
+            match event {
+                ArchiveEvent::Entry(entry) => entries.push(entry),
+                ArchiveEvent::NeedData => {
+                    if offset >= data.len() {
+                        break;
+                    }
+                }
+                ArchiveEvent::EndOfArchive => break,
+            }
+        }
+        Ok(entries)
+    }
+
+    #[test]
+    fn test_odc_byte_by_byte() {
+        // odc headers are shorter than newc; feeding one byte at a time used
+        // to underflow the consumed-bytes computation once the sub-format
+        // was detected mid-header.
+        let archive = create_odc_archive(&[("a.txt", b"hello"), ("b.txt", b"world!")]);
+        for chunk in [1, 2, 3, 7, 33, 75, 76, 77] {
+            let entries = parse_chunked(&archive, chunk).unwrap();
+            assert_eq!(entries.len(), 2, "chunk size {}", chunk);
+            assert_eq!(entries[0].path, "a.txt");
+            assert_eq!(entries[0].size, 5);
+            assert_eq!(entries[1].path, "b.txt");
+            assert_eq!(entries[1].size, 6);
+        }
+    }
+
+    #[test]
+    fn test_newc_hardlinks_data_last() {
+        // newc stores hardlink data with the LAST member of the set; the
+        // earlier members are zero-size. All members must resolve.
+        let mut archive = Vec::new();
+        write_newc_record(&mut archive, "dir/link1", b"", 42, 0o100644, 3, None, None);
+        write_newc_record(&mut archive, "dir/link2", b"", 42, 0o100644, 3, None, None);
+        write_newc_record(
+            &mut archive,
+            "dir/last",
+            b"shared content",
+            42,
+            0o100644,
+            3,
+            None,
+            None,
+        );
+        write_newc_record(
+            &mut archive,
+            "other.txt",
+            b"xyz",
+            43,
+            0o100644,
+            1,
+            None,
+            None,
+        );
+        write_newc_trailer(&mut archive);
+
+        for chunk in [usize::MAX, 1, 13] {
+            let entries = parse_chunked(&archive, chunk.min(archive.len())).unwrap();
+            assert_eq!(entries.len(), 4, "chunk {}", chunk);
+
+            let by_path: std::collections::HashMap<_, _> =
+                entries.iter().map(|e| (e.path.as_str(), e)).collect();
+
+            let last = by_path["dir/last"];
+            assert_eq!(last.entry_type, EntryType::Regular);
+            assert_eq!(last.size, 14);
+
+            for link in ["dir/link1", "dir/link2"] {
+                let e = by_path[link];
+                assert_eq!(e.entry_type, EntryType::HardLink, "{}", link);
+                assert_eq!(e.link_target.as_deref(), Some("dir/last"), "{}", link);
+            }
+
+            assert_eq!(by_path["other.txt"].entry_type, EntryType::Regular);
+        }
+    }
+
+    #[test]
+    fn test_newc_hardlinks_data_first() {
+        // Nonstandard layout: data-bearing member first. Later zero-size
+        // members must immediately resolve as hardlinks to it.
+        let mut archive = Vec::new();
+        write_newc_record(
+            &mut archive,
+            "first",
+            b"data here",
+            7,
+            0o100644,
+            2,
+            None,
+            None,
+        );
+        write_newc_record(&mut archive, "second", b"", 7, 0o100644, 2, None, None);
+        write_newc_trailer(&mut archive);
+
+        let entries = parse_chunked(&archive, archive.len()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "first");
+        assert_eq!(entries[0].entry_type, EntryType::Regular);
+        assert_eq!(entries[1].path, "second");
+        assert_eq!(entries[1].entry_type, EntryType::HardLink);
+        assert_eq!(entries[1].link_target.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn test_newc_hardlink_unresolved_flushed_at_trailer() {
+        // A hardlink member whose data-bearing member never appears must
+        // still be emitted (as the zero-size entry the archive declared),
+        // not silently dropped.
+        let mut archive = Vec::new();
+        write_newc_record(&mut archive, "orphan", b"", 9, 0o100644, 2, None, None);
+        write_newc_trailer(&mut archive);
+
+        let entries = parse_chunked(&archive, archive.len()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "orphan");
+        assert_eq!(entries[0].size, 0);
+    }
+
+    #[test]
+    fn test_implausible_namesize_rejected() {
+        let mut archive = Vec::new();
+        write_newc_record(
+            &mut archive,
+            "x",
+            b"",
+            1,
+            0o100644,
+            1,
+            Some(0x40000000), // 1 GiB namesize
+            None,
+        );
+        assert!(parse_chunked(&archive, archive.len()).is_err());
+    }
+
+    #[test]
+    fn test_implausible_symlink_target_rejected() {
+        let mut archive = Vec::new();
+        write_newc_record(
+            &mut archive,
+            "link",
+            b"",
+            1,
+            0o120777, // symlink mode
+            1,
+            None,
+            Some(1 << 32), // 4 GiB "target"
+        );
+        assert!(parse_chunked(&archive, archive.len()).is_err());
     }
 }
