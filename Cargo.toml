@@ -46,3 +46,8 @@ all-features = true
 name = "iluvatar"
 path = "src/main.rs"
 required-features = ["cli"]
+
+[[bench]]
+name = "throughput"
+harness = false
+required-features = ["zstandard", "xz"]

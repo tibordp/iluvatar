@@ -10,7 +10,8 @@
 //! decompressor state, which C library wrappers don't expose.
 
 pub mod checkpoint;
-pub(crate) mod decompressor;
+#[doc(hidden)]
+pub mod decompressor;
 pub(crate) mod detect;
 
 #[cfg(feature = "gzip")]
@@ -23,10 +24,12 @@ pub(crate) mod bzip2;
 pub(crate) mod lzma;
 
 #[cfg(feature = "xz")]
-pub(crate) mod xz;
+#[doc(hidden)]
+pub mod xz;
 
 #[cfg(feature = "zstandard")]
-pub(crate) mod zstd_dec;
+#[doc(hidden)]
+pub mod zstd_dec;
 
 pub(crate) mod none;
 
