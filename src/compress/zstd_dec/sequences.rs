@@ -4,7 +4,8 @@
 //! reconstruct the output from literals and back-references. Each sequence
 //! is a triplet (literal_length, offset, match_length).
 
-use super::bits::BackwardBitReader;
+use super::bits::SeqBitReader;
+use super::block::BlockDecoderState;
 use super::fse::{
     build_fse_table, build_rle_fse_table, read_ncount, FseTable, LL_BASE, LL_BITS, LL_FSE_LOG,
     MAX_LL, MAX_ML, MAX_OFF, ML_BASE, ML_BITS, ML_FSE_LOG, OFF_FSE_LOG, OF_BASE, OF_BITS,
@@ -31,34 +32,15 @@ impl SymbolCompressionMode {
     }
 }
 
-/// A decoded sequence (literal_length, offset, match_length).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Sequence {
-    pub literal_length: usize,
-    pub offset: usize,
-    pub match_length: usize,
-}
-
-/// Parsed sequences header: number of sequences and the three FSE tables.
-pub(crate) struct SequencesHeader {
-    pub num_sequences: usize,
-    pub ll_table: FseTable,
-    pub of_table: FseTable,
-    pub ml_table: FseTable,
-    pub bytes_consumed: usize,
-}
-
-/// Parse the sequences section header and build FSE tables.
-/// `prev_ll`, `prev_of`, `prev_ml` are previously used tables (for Repeat mode).
+/// Parse the sequences section header, updating the FSE tables stored in
+/// `state` in place. Returns `(num_sequences, bytes_consumed)`.
+///
+/// When the block declares zero sequences the header stops after the count
+/// byte and the previously-used tables in `state` are left untouched.
 pub(crate) fn parse_sequences_header(
     data: &[u8],
-    prev_ll: Option<&FseTable>,
-    prev_of: Option<&FseTable>,
-    prev_ml: Option<&FseTable>,
-    default_ll: &FseTable,
-    default_of: &FseTable,
-    default_ml: &FseTable,
-) -> Result<SequencesHeader, String> {
+    state: &mut BlockDecoderState,
+) -> Result<(usize, usize), String> {
     if data.is_empty() {
         return Err("empty sequences section".into());
     }
@@ -70,13 +52,7 @@ pub(crate) fn parse_sequences_header(
     pos += 1;
     let num_sequences;
     if first_byte == 0 {
-        return Ok(SequencesHeader {
-            num_sequences: 0,
-            ll_table: default_ll.clone(),
-            of_table: default_of.clone(),
-            ml_table: default_ml.clone(),
-            bytes_consumed: pos,
-        });
+        return Ok((0, pos));
     } else if first_byte < 128 {
         num_sequences = first_byte;
     } else if first_byte == 255 {
@@ -95,13 +71,7 @@ pub(crate) fn parse_sequences_header(
     }
 
     if num_sequences == 0 {
-        return Ok(SequencesHeader {
-            num_sequences: 0,
-            ll_table: default_ll.clone(),
-            of_table: default_of.clone(),
-            ml_table: default_ml.clone(),
-            bytes_consumed: pos,
-        });
+        return Ok((0, pos));
     }
 
     // Symbol compression modes byte
@@ -120,54 +90,47 @@ pub(crate) fn parse_sequences_header(
     let of_mode = SymbolCompressionMode::from_u8((modes_byte >> 4) & 3)?;
     let ml_mode = SymbolCompressionMode::from_u8((modes_byte >> 2) & 3)?;
 
-    // Build LL table
-    let ll_table = build_seq_table(
+    build_seq_table(
         ll_mode,
-        &data[pos..],
+        data,
         MAX_LL,
         LL_FSE_LOG,
         &LL_BASE,
         &LL_BITS,
-        default_ll,
-        prev_ll,
+        super::block::default_ll_table(),
+        &mut state.ll_table,
         &mut pos,
     )?;
 
-    // Build OF table
-    let of_table = build_seq_table(
+    build_seq_table(
         of_mode,
-        &data[pos..],
+        data,
         MAX_OFF,
         OFF_FSE_LOG,
         &OF_BASE,
         &OF_BITS,
-        default_of,
-        prev_of,
+        super::block::default_of_table(),
+        &mut state.of_table,
         &mut pos,
     )?;
 
-    // Build ML table
-    let ml_table = build_seq_table(
+    build_seq_table(
         ml_mode,
-        &data[pos..],
+        data,
         MAX_ML,
         ML_FSE_LOG,
         &ML_BASE,
         &ML_BITS,
-        default_ml,
-        prev_ml,
+        super::block::default_ml_table(),
+        &mut state.ml_table,
         &mut pos,
     )?;
 
-    Ok(SequencesHeader {
-        num_sequences,
-        ll_table,
-        of_table,
-        ml_table,
-        bytes_consumed: pos,
-    })
+    Ok((num_sequences, pos))
 }
 
+/// Set `table` according to the block's compression mode for one symbol type.
+/// `pos` indexes into `data` and is advanced past any table description bytes.
 #[allow(clippy::too_many_arguments)]
 fn build_seq_table(
     mode: SymbolCompressionMode,
@@ -177,11 +140,15 @@ fn build_seq_table(
     base_values: &[u32],
     nb_add_bits: &[u8],
     default_table: &FseTable,
-    prev_table: Option<&FseTable>,
+    table: &mut Option<FseTable>,
     pos: &mut usize,
-) -> Result<FseTable, String> {
+) -> Result<(), String> {
+    let data = &data[*pos..];
     match mode {
-        SymbolCompressionMode::Predefined => Ok(default_table.clone()),
+        SymbolCompressionMode::Predefined => {
+            *table = Some(default_table.clone());
+            Ok(())
+        }
         SymbolCompressionMode::Rle => {
             if data.is_empty() {
                 return Err("RLE mode but no data for symbol".into());
@@ -191,11 +158,12 @@ fn build_seq_table(
                 return Err(format!("RLE symbol {} exceeds max {}", symbol, max_symbol));
             }
             *pos += 1;
-            Ok(build_rle_fse_table(
+            *table = Some(build_rle_fse_table(
                 symbol,
                 Some(base_values),
                 Some(nb_add_bits),
-            ))
+            ));
+            Ok(())
         }
         SymbolCompressionMode::FseCompressed => {
             let (norm, actual_max, table_log, header_size) = read_ncount(data, max_symbol)?;
@@ -205,60 +173,83 @@ fn build_seq_table(
                     table_log, max_log
                 ));
             }
-            let table = build_fse_table(
+            *table = Some(build_fse_table(
                 &norm,
                 actual_max,
                 table_log,
                 Some(base_values),
                 Some(nb_add_bits),
-            )?;
+            )?);
             *pos += header_size;
-            Ok(table)
+            Ok(())
         }
-        SymbolCompressionMode::Repeat => prev_table
-            .cloned()
-            .ok_or_else(|| "Repeat mode but no previous table".into()),
+        SymbolCompressionMode::Repeat => {
+            if table.is_none() {
+                return Err("Repeat mode but no previous table".into());
+            }
+            Ok(())
+        }
     }
 }
 
-/// Decode all sequences from the bitstream data.
-pub(crate) fn decode_sequences(
+/// Decode all sequences from the bitstream data and execute them, appending
+/// the reconstructed block output to `output`.
+///
+/// `output` holds the decoding history: bytes before `output.len()` at entry
+/// are the window from previous blocks. `max_back` limits how far before the
+/// block start a match may reference (i.e. `min(history_len, window_size)`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_and_execute_sequences(
     data: &[u8],
     num_sequences: usize,
     ll_table: &FseTable,
     of_table: &FseTable,
     ml_table: &FseTable,
     rep_offsets: &mut [u32; 3],
-) -> Result<Vec<Sequence>, String> {
+    literals: &[u8],
+    output: &mut Vec<u8>,
+    max_back: usize,
+) -> Result<(), String> {
     if num_sequences == 0 {
-        return Ok(Vec::new());
+        output.extend_from_slice(literals);
+        return Ok(());
     }
     if data.is_empty() {
         return Err("empty sequence bitstream data".into());
     }
 
-    let mut reader = BackwardBitReader::new(data)?;
+    let block_start = output.len();
+    debug_assert!(max_back <= block_start);
+    let mut lit_pos = 0usize;
+
+    // A zstd block regenerates at most 128 KiB; reserving upfront keeps the
+    // copy fast paths below from triggering reallocation checks mid-loop.
+    output.reserve(128 * 1024 + 32);
+
+    let mut reader = SeqBitReader::new(data)?;
 
     // Initialize FSE states
     let mut ll_state = reader
-        .read_bits(ll_table.table_log)
-        .map_err(|e| format!("init LL state: {}", e))?;
+        .read(ll_table.table_log as usize)
+        .map_err(|_| "init LL state: not enough bits".to_string())?;
     let mut of_state = reader
-        .read_bits(of_table.table_log)
-        .map_err(|e| format!("init OF state: {}", e))?;
+        .read(of_table.table_log as usize)
+        .map_err(|_| "init OF state: not enough bits".to_string())?;
     let mut ml_state = reader
-        .read_bits(ml_table.table_log)
-        .map_err(|e| format!("init ML state: {}", e))?;
+        .read(ml_table.table_log as usize)
+        .map_err(|_| "init ML state: not enough bits".to_string())?;
 
-    let mut sequences = Vec::with_capacity(num_sequences);
+    let ll_entries = &ll_table.entries[..];
+    let of_entries = &of_table.entries[..];
+    let ml_entries = &ml_table.entries[..];
 
     for i in 0..num_sequences {
         let is_last = i == num_sequences - 1;
 
         // Read values from current states
-        let of_entry = of_table.decode(of_state);
-        let ll_entry = ll_table.decode(ll_state);
-        let ml_entry = ml_table.decode(ml_state);
+        let of_entry = of_entries[of_state];
+        let ll_entry = ll_entries[ll_state];
+        let ml_entry = ml_entries[ml_state];
 
         // Compute Offset_Value per RFC 8878 Section 3.1.1.3.2.1.1:
         //   if (code > 0) Offset_Value = (1 << code) + readNBits(code)
@@ -268,66 +259,125 @@ pub(crate) fn decode_sequences(
             1usize
         } else {
             let extra = reader
-                .read_bits(of_code)
-                .map_err(|e| format!("offset extra bits: {}", e))?;
+                .read(of_code as usize)
+                .map_err(|_| "offset extra bits: not enough bits".to_string())?;
             (1usize << of_code) + extra
         };
 
         // Read match length extra bits (MSB-first from backward bitstream)
-        let ml_bits = ml_entry.nb_additional_bits;
-        let match_length = if ml_bits > 0 {
-            let extra = reader
-                .read_bits(ml_bits as u32)
-                .map_err(|e| format!("ML extra bits: {}", e))?;
-            ml_entry.base_value as usize + extra
-        } else {
-            ml_entry.base_value as usize
-        };
+        let match_length = ml_entry.base_value as usize
+            + reader
+                .read(ml_entry.nb_additional_bits as usize)
+                .map_err(|_| "ML extra bits: not enough bits".to_string())?;
 
         // Read literal length extra bits (MSB-first from backward bitstream)
-        let ll_bits = ll_entry.nb_additional_bits;
-        let literal_length = if ll_bits > 0 {
-            let extra = reader
-                .read_bits(ll_bits as u32)
-                .map_err(|e| format!("LL extra bits: {}", e))?;
-            ll_entry.base_value as usize + extra
-        } else {
-            ll_entry.base_value as usize
-        };
+        let literal_length = ll_entry.base_value as usize
+            + reader
+                .read(ll_entry.nb_additional_bits as usize)
+                .map_err(|_| "LL extra bits: not enough bits".to_string())?;
 
         // Resolve offset (handle repeat offsets per RFC 8878 Section 3.1.1.5)
         let offset = resolve_offset(offset_value, literal_length, rep_offsets)?;
 
-        sequences.push(Sequence {
-            literal_length,
-            offset,
-            match_length,
-        });
+        // Execute: copy literals
+        if literal_length > 0 {
+            if lit_pos + literal_length > literals.len() {
+                return Err(format!(
+                    "sequence {} literal length {} exceeds available literals (at {}, have {})",
+                    i,
+                    literal_length,
+                    lit_pos,
+                    literals.len()
+                ));
+            }
+            // Short literal runs dominate; a fixed-size 16-byte copy compiles
+            // to two load/store pairs instead of a memmove call.
+            if literal_length <= 16 && lit_pos + 16 <= literals.len() {
+                let chunk: [u8; 16] = literals[lit_pos..lit_pos + 16].try_into().unwrap();
+                let keep = output.len() + literal_length;
+                output.extend_from_slice(&chunk);
+                output.truncate(keep);
+            } else {
+                output.extend_from_slice(&literals[lit_pos..lit_pos + literal_length]);
+            }
+            lit_pos += literal_length;
+        }
+
+        // Execute: copy match
+        if match_length > 0 {
+            let out_len = output.len();
+            // History available: bytes produced in this block plus up to
+            // max_back bytes of window before the block start.
+            if offset > (out_len - block_start) + max_back {
+                return Err(format!(
+                    "sequence {} offset {} exceeds available history ({} output + {} window)",
+                    i,
+                    offset,
+                    out_len - block_start,
+                    max_back
+                ));
+            }
+            // Fast path for short non-overlapping matches (same trick).
+            if match_length <= 16 && offset >= 16 {
+                let start = out_len - offset;
+                let chunk: [u8; 16] = output[start..start + 16].try_into().unwrap();
+                output.extend_from_slice(&chunk);
+                output.truncate(out_len + match_length);
+            } else {
+                copy_match(output, offset, match_length);
+            }
+        }
 
         // Update FSE states (but not for the last sequence)
         if !is_last {
-            let ll_nb = ll_entry.nb_bits;
-            let ml_nb = ml_entry.nb_bits;
-            let of_nb = of_entry.nb_bits;
-
             let ll_new_bits = reader
-                .read_bits(ll_nb as u32)
-                .map_err(|e| format!("LL state bits: {}", e))?;
+                .read(ll_entry.nb_bits as usize)
+                .map_err(|_| "LL state bits: not enough bits".to_string())?;
             ll_state = ll_entry.next_state as usize + ll_new_bits;
 
             let ml_new_bits = reader
-                .read_bits(ml_nb as u32)
-                .map_err(|e| format!("ML state bits: {}", e))?;
+                .read(ml_entry.nb_bits as usize)
+                .map_err(|_| "ML state bits: not enough bits".to_string())?;
             ml_state = ml_entry.next_state as usize + ml_new_bits;
 
             let of_new_bits = reader
-                .read_bits(of_nb as u32)
-                .map_err(|e| format!("OF state bits: {}", e))?;
+                .read(of_entry.nb_bits as usize)
+                .map_err(|_| "OF state bits: not enough bits".to_string())?;
             of_state = of_entry.next_state as usize + of_new_bits;
         }
     }
 
-    Ok(sequences)
+    // Remaining literals after all sequences
+    if lit_pos < literals.len() {
+        output.extend_from_slice(&literals[lit_pos..]);
+    }
+
+    Ok(())
+}
+
+/// Append `match_length` bytes copied from `offset` bytes back in `output`.
+/// Handles overlapping copies (offset < match_length) with the standard
+/// pattern-replication approach; callers must ensure `offset <= output.len()`.
+#[inline]
+fn copy_match(output: &mut Vec<u8>, offset: usize, match_length: usize) {
+    let start = output.len() - offset;
+    if offset >= match_length {
+        // Non-overlapping: single memcpy.
+        output.extend_from_within(start..start + match_length);
+    } else if offset == 1 {
+        // Run of a single byte.
+        let b = output[start];
+        output.resize(output.len() + match_length, b);
+    } else {
+        // Overlapping: repeatedly copy the (growing) region starting at
+        // `start`; each pass at least doubles the copied span.
+        let mut copied = 0;
+        while copied < match_length {
+            let chunk = (output.len() - start).min(match_length - copied);
+            output.extend_from_within(start..start + chunk);
+            copied += chunk;
+        }
+    }
 }
 
 /// Resolve the offset value, handling repeat offsets.
@@ -409,76 +459,6 @@ fn resolve_offset(
     }
 }
 
-/// Execute sequences: copy literals and back-references to produce output.
-pub(crate) fn execute_sequences(
-    sequences: &[Sequence],
-    literals: &[u8],
-    window: &[u8],
-    output: &mut Vec<u8>,
-) -> Result<(), String> {
-    let mut lit_pos = 0;
-
-    for (i, seq) in sequences.iter().enumerate() {
-        // Copy literal_length bytes from literals
-        if seq.literal_length > 0 {
-            if lit_pos + seq.literal_length > literals.len() {
-                return Err(format!(
-                    "sequence {} literal length {} exceeds available literals (at {}, have {})",
-                    i,
-                    seq.literal_length,
-                    lit_pos,
-                    literals.len()
-                ));
-            }
-            output.extend_from_slice(&literals[lit_pos..lit_pos + seq.literal_length]);
-            lit_pos += seq.literal_length;
-        }
-
-        // Copy match_length bytes from offset back in the output/window
-        if seq.match_length > 0 {
-            let current_output_len = output.len();
-            if seq.offset > current_output_len + window.len() {
-                return Err(format!(
-                    "sequence {} offset {} exceeds available history ({} output + {} window)",
-                    i,
-                    seq.offset,
-                    current_output_len,
-                    window.len()
-                ));
-            }
-
-            // Copy byte-by-byte to handle overlapping copies correctly
-            for _ in 0..seq.match_length {
-                let out_len = output.len();
-                if seq.offset <= out_len {
-                    // Copy from current output
-                    let src_pos = out_len - seq.offset;
-                    let byte = output[src_pos];
-                    output.push(byte);
-                } else {
-                    // Copy from window (history before current block)
-                    let window_offset = seq.offset - out_len;
-                    if window_offset > window.len() {
-                        return Err(format!(
-                            "match reference extends beyond window: offset={}, out_len={}, window_len={}",
-                            seq.offset, out_len, window.len()
-                        ));
-                    }
-                    let byte = window[window.len() - window_offset];
-                    output.push(byte);
-                }
-            }
-        }
-    }
-
-    // Remaining literals after all sequences
-    if lit_pos < literals.len() {
-        output.extend_from_slice(&literals[lit_pos..]);
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,51 +500,33 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_simple() {
-        let sequences = vec![Sequence {
-            literal_length: 3,
-            offset: 0,
-            match_length: 0,
-        }];
-        let literals = b"abc";
-        let mut output = Vec::new();
-        // offset 0, match_length 0 is fine (no match copy)
-        execute_sequences(&sequences, literals, &[], &mut output).unwrap();
-        assert_eq!(output, b"abc");
-    }
-
-    #[test]
-    fn test_execute_with_match() {
-        // First write "abcd", then copy 3 bytes from offset 4 (= "abc")
-        let sequences = vec![
-            Sequence {
-                literal_length: 4,
-                offset: 0,
-                match_length: 0,
-            },
-            Sequence {
-                literal_length: 0,
-                offset: 4,
-                match_length: 3,
-            },
-        ];
-        let literals = b"abcd";
-        let mut output = Vec::new();
-        execute_sequences(&sequences, literals, &[], &mut output).unwrap();
+    fn test_copy_match_simple() {
+        // "abcd", copy 3 bytes from offset 4 -> "abcdabc"
+        let mut output = b"abcd".to_vec();
+        copy_match(&mut output, 4, 3);
         assert_eq!(output, b"abcdabc");
     }
 
     #[test]
-    fn test_execute_overlapping_match() {
-        // Write "a", then copy 4 bytes from offset 1 -> "aaaa"
-        let sequences = vec![Sequence {
-            literal_length: 1,
-            offset: 1,
-            match_length: 4,
-        }];
-        let literals = b"a";
-        let mut output = Vec::new();
-        execute_sequences(&sequences, literals, &[], &mut output).unwrap();
+    fn test_copy_match_overlapping() {
+        // "a", copy 4 bytes from offset 1 -> "aaaaa"
+        let mut output = b"a".to_vec();
+        copy_match(&mut output, 1, 4);
         assert_eq!(output, b"aaaaa");
+    }
+
+    #[test]
+    fn test_copy_match_overlapping_pattern() {
+        // "ab", copy 7 bytes from offset 2 -> "ababababa"
+        let mut output = b"ab".to_vec();
+        copy_match(&mut output, 2, 7);
+        assert_eq!(output, b"ababababa");
+
+        // Period-3 pattern with a long replication.
+        let mut output = b"xyz".to_vec();
+        copy_match(&mut output, 3, 100);
+        for (i, &b) in output.iter().enumerate() {
+            assert_eq!(b, b"xyz"[i % 3]);
+        }
     }
 }

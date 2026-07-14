@@ -5,11 +5,29 @@
 //!
 //! Compressed blocks contain a literals section followed by a sequences section.
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 
 use super::fse::{self, FseTable};
 use super::huffman::{self, decompress_huffman_1stream, decompress_huffman_4streams, HuffmanTable};
-use super::sequences::{decode_sequences, execute_sequences, parse_sequences_header};
+use super::sequences::{decode_and_execute_sequences, parse_sequences_header};
+
+/// Predefined (default) FSE tables, built once and shared.
+pub(crate) fn default_ll_table() -> &'static FseTable {
+    static TABLE: OnceLock<FseTable> = OnceLock::new();
+    TABLE.get_or_init(fse::build_default_ll_table)
+}
+
+pub(crate) fn default_of_table() -> &'static FseTable {
+    static TABLE: OnceLock<FseTable> = OnceLock::new();
+    TABLE.get_or_init(fse::build_default_of_table)
+}
+
+pub(crate) fn default_ml_table() -> &'static FseTable {
+    static TABLE: OnceLock<FseTable> = OnceLock::new();
+    TABLE.get_or_init(fse::build_default_ml_table)
+}
 
 /// Block types as specified in the zstd format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +100,10 @@ pub(crate) struct BlockDecoderState {
     pub ml_table: Option<FseTable>,
     /// Repeat offsets.
     pub rep_offsets: [u32; 3],
+    /// Scratch buffer for decoded literals, reused across blocks.
+    /// Not part of checkpoint state.
+    #[serde(skip)]
+    pub literals_buf: Vec<u8>,
 }
 
 impl BlockDecoderState {
@@ -92,18 +114,23 @@ impl BlockDecoderState {
             of_table: None,
             ml_table: None,
             rep_offsets: [1, 4, 8], // Default repeat offsets per spec
+            literals_buf: Vec::new(),
         }
     }
 }
 
-/// Decompress a single block into the output vector.
+/// Decompress a single block, appending its output to `output`.
+///
+/// `output` also serves as the decoding history: its existing contents are
+/// the window from previous blocks. `max_back` limits how far before the
+/// block start a match may reference (`min(history_len, window_size)`).
 /// Updates the `state` with any new tables (Huffman, FSE) learned from this block.
 pub(crate) fn decompress_block(
     header: &BlockHeader,
     block_data: &[u8],
     state: &mut BlockDecoderState,
-    window: &[u8],
     output: &mut Vec<u8>,
+    max_back: usize,
 ) -> Result<(), String> {
     match header.block_type {
         BlockType::Raw => {
@@ -118,11 +145,11 @@ pub(crate) fn decompress_block(
                 return Err("RLE block needs at least 1 byte".into());
             }
             let byte = block_data[0];
-            output.extend(std::iter::repeat(byte).take(header.block_size));
+            output.resize(output.len() + header.block_size, byte);
             Ok(())
         }
         BlockType::Compressed => {
-            decompress_compressed_block(block_data, header.block_size, state, window, output)
+            decompress_compressed_block(block_data, header.block_size, state, output, max_back)
         }
         BlockType::Reserved => Err("cannot decompress reserved block".into()),
     }
@@ -133,8 +160,8 @@ fn decompress_compressed_block(
     data: &[u8],
     block_size: usize,
     state: &mut BlockDecoderState,
-    window: &[u8],
     output: &mut Vec<u8>,
+    max_back: usize,
 ) -> Result<(), String> {
     if data.len() < block_size {
         return Err(format!(
@@ -145,60 +172,58 @@ fn decompress_compressed_block(
     }
     let block_data = &data[..block_size];
 
-    // 1. Decode literals section
-    let (literals, lit_consumed) = decode_literals_section(block_data, state)?;
+    // 1. Decode literals section into the reusable scratch buffer.
+    // Take the buffer out of `state` so the literals can be borrowed while
+    // `state` is used mutably below.
+    let mut literals = std::mem::take(&mut state.literals_buf);
+    literals.clear();
+    let lit_consumed = decode_literals_section(block_data, state, &mut literals)?;
 
-    // 2. Decode sequences section
+    // 2. Parse the sequences section header, updating the FSE tables in `state`.
     let seq_data = &block_data[lit_consumed..];
-    let default_ll = fse::build_default_ll_table();
-    let default_of = fse::build_default_of_table();
-    let default_ml = fse::build_default_ml_table();
+    let (num_sequences, header_consumed) = parse_sequences_header(seq_data, state)?;
 
-    let seq_header = parse_sequences_header(
-        seq_data,
-        state.ll_table.as_ref(),
-        state.of_table.as_ref(),
-        state.ml_table.as_ref(),
-        &default_ll,
-        &default_of,
-        &default_ml,
-    )?;
-
-    // Save tables for future Repeat mode
-    state.ll_table = Some(seq_header.ll_table.clone());
-    state.of_table = Some(seq_header.of_table.clone());
-    state.ml_table = Some(seq_header.ml_table.clone());
-
-    if seq_header.num_sequences == 0 {
+    // 3. Decode and execute sequences.
+    let result = if num_sequences == 0 {
         // No sequences: output is just the literals
         output.extend_from_slice(&literals);
-        return Ok(());
-    }
+        Ok(())
+    } else {
+        // The remaining bytes after the sequences header are the compressed
+        // sequences bitstream.
+        let bitstream_data = &seq_data[header_consumed..];
+        let BlockDecoderState {
+            ll_table,
+            of_table,
+            ml_table,
+            rep_offsets,
+            ..
+        } = state;
+        decode_and_execute_sequences(
+            bitstream_data,
+            num_sequences,
+            ll_table.as_ref().expect("LL table set by header parse"),
+            of_table.as_ref().expect("OF table set by header parse"),
+            ml_table.as_ref().expect("ML table set by header parse"),
+            rep_offsets,
+            &literals,
+            output,
+            max_back,
+        )
+    };
 
-    // The remaining bytes after the sequences header are the compressed sequences bitstream
-    let bitstream_data = &seq_data[seq_header.bytes_consumed..];
-
-    let sequences = decode_sequences(
-        bitstream_data,
-        seq_header.num_sequences,
-        &seq_header.ll_table,
-        &seq_header.of_table,
-        &seq_header.ml_table,
-        &mut state.rep_offsets,
-    )?;
-
-    // 3. Execute sequences
-    execute_sequences(&sequences, &literals, window, output)?;
-
-    Ok(())
+    // Return the scratch buffer for reuse.
+    state.literals_buf = literals;
+    result
 }
 
-/// Decode the literals section of a compressed block.
-/// Returns (literals_bytes, bytes_consumed_from_block).
+/// Decode the literals section of a compressed block into `literals`.
+/// Returns the number of bytes consumed from the block.
 fn decode_literals_section(
     data: &[u8],
     state: &mut BlockDecoderState,
-) -> Result<(Vec<u8>, usize), String> {
+    literals: &mut Vec<u8>,
+) -> Result<usize, String> {
     if data.is_empty() {
         return Err("empty literals section".into());
     }
@@ -207,16 +232,16 @@ fn decode_literals_section(
     let lit_block_type = first_byte & 3;
 
     match lit_block_type {
-        0 => decode_raw_literals(data),
-        1 => decode_rle_literals(data),
-        2 => decode_compressed_literals(data, state, false),
-        3 => decode_compressed_literals(data, state, true), // Treeless (repeat Huffman)
+        0 => decode_raw_literals(data, literals),
+        1 => decode_rle_literals(data, literals),
+        2 => decode_compressed_literals(data, state, false, literals),
+        3 => decode_compressed_literals(data, state, true, literals), // Treeless (repeat Huffman)
         _ => unreachable!(),
     }
 }
 
 /// Decode raw literals (type 0).
-fn decode_raw_literals(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
+fn decode_raw_literals(data: &[u8], literals: &mut Vec<u8>) -> Result<usize, String> {
     let first_byte = data[0];
     let size_format = (first_byte >> 2) & 3;
 
@@ -250,12 +275,12 @@ fn decode_raw_literals(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
         return Err("raw literals extend past block".into());
     }
 
-    let literals = data[header_size..header_size + lit_size].to_vec();
-    Ok((literals, header_size + lit_size))
+    literals.extend_from_slice(&data[header_size..header_size + lit_size]);
+    Ok(header_size + lit_size)
 }
 
 /// Decode RLE literals (type 1).
-fn decode_rle_literals(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
+fn decode_rle_literals(data: &[u8], literals: &mut Vec<u8>) -> Result<usize, String> {
     let first_byte = data[0];
     let size_format = (first_byte >> 2) & 3;
 
@@ -287,8 +312,8 @@ fn decode_rle_literals(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
     }
 
     let byte = data[header_size];
-    let literals = vec![byte; lit_size];
-    Ok((literals, header_size + 1))
+    literals.resize(lit_size, byte);
+    Ok(header_size + 1)
 }
 
 /// Decode compressed or treeless literals (types 2 and 3).
@@ -296,7 +321,8 @@ fn decode_compressed_literals(
     data: &[u8],
     state: &mut BlockDecoderState,
     treeless: bool,
-) -> Result<(Vec<u8>, usize), String> {
+    literals: &mut Vec<u8>,
+) -> Result<usize, String> {
     if data.len() < 3 {
         return Err("compressed literals header too short".into());
     }
@@ -342,32 +368,31 @@ fn decode_compressed_literals(
 
     let compressed_data = &data[header_size..header_size + compressed_size];
 
-    // Get or build Huffman table
-    let (huf_table, huf_consumed) = if treeless {
-        // Reuse previous Huffman table
-        let table = state
-            .huffman_table
-            .as_ref()
-            .ok_or("treeless literals but no previous Huffman table")?
-            .clone();
-        (table, 0)
+    // Get or build Huffman table (stored in state for treeless reuse)
+    let huf_consumed = if treeless {
+        if state.huffman_table.is_none() {
+            return Err("treeless literals but no previous Huffman table".into());
+        }
+        0
     } else {
         // Read new Huffman table from compressed data
         let (table, consumed) = huffman::read_huffman_table(compressed_data)?;
-        state.huffman_table = Some(table.clone());
-        (table, consumed)
+        state.huffman_table = Some(table);
+        consumed
     };
+    let huf_table = state.huffman_table.as_ref().expect("huffman table present");
 
     let huf_stream = &compressed_data[huf_consumed..];
 
     // Decompress using Huffman coding
-    let literals = if single_stream {
-        decompress_huffman_1stream(&huf_table, huf_stream, regen_size)?
+    literals.resize(regen_size, 0);
+    if single_stream {
+        decompress_huffman_1stream(huf_table, huf_stream, literals)?;
     } else {
-        decompress_huffman_4streams(&huf_table, huf_stream, regen_size)?
-    };
+        decompress_huffman_4streams(huf_table, huf_stream, literals)?;
+    }
 
-    Ok((literals, header_size + compressed_size))
+    Ok(header_size + compressed_size)
 }
 
 #[cfg(test)]
@@ -435,7 +460,7 @@ mod tests {
         let data = b"hello world";
         let mut state = BlockDecoderState::new();
         let mut output = Vec::new();
-        decompress_block(&header, data, &mut state, &[], &mut output).unwrap();
+        decompress_block(&header, data, &mut state, &mut output, 0).unwrap();
         assert_eq!(&output, b"hello");
     }
 
@@ -449,7 +474,7 @@ mod tests {
         let data = [0x41]; // 'A'
         let mut state = BlockDecoderState::new();
         let mut output = Vec::new();
-        decompress_block(&header, &data, &mut state, &[], &mut output).unwrap();
+        decompress_block(&header, &data, &mut state, &mut output, 0).unwrap();
         assert_eq!(output, vec![0x41; 10]);
     }
 }

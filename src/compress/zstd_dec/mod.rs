@@ -86,14 +86,15 @@ pub struct ZstdDecompressor {
     frame_header: Option<FrameHeader>,
     /// Block-level decoder state (FSE/Huffman tables, repeat offsets).
     block_state: BlockDecoderState,
-    /// Window: recent output for back-references.
-    window: Vec<u8>,
+    /// Decoding history: recent output for back-references. Blocks decode
+    /// directly into this buffer; it is trimmed (amortized) so it never grows
+    /// much beyond twice the window size. Bytes at `delivered..` are decoded
+    /// output not yet handed to the caller.
+    history: Vec<u8>,
+    /// Index into `history` of the first byte not yet delivered to the caller.
+    delivered: usize,
     /// Maximum window size for current frame.
     window_size: usize,
-    /// Staged output: decoded bytes not yet delivered to the caller.
-    staged_output: Vec<u8>,
-    /// Position within staged_output.
-    staged_pos: usize,
     /// Total compressed bytes consumed.
     total_in: u64,
     /// Total uncompressed bytes produced.
@@ -116,46 +117,55 @@ impl ZstdDecompressor {
             buffer: Vec::new(),
             frame_header: None,
             block_state: BlockDecoderState::new(),
-            window: Vec::new(),
+            history: Vec::new(),
+            delivered: 0,
             window_size: 0,
-            staged_output: Vec::new(),
-            staged_pos: 0,
             total_in: 0,
             total_out: 0,
             finished: false,
         }
     }
 
-    /// Deliver staged output to the caller's output buffer.
+    /// Deliver pending decoded output (history[delivered..]) to the caller.
     fn drain_staged(&mut self, output: &mut [u8]) -> usize {
-        let available = self.staged_output.len() - self.staged_pos;
+        let available = self.history.len() - self.delivered;
         let to_copy = available.min(output.len());
         if to_copy > 0 {
             output[..to_copy]
-                .copy_from_slice(&self.staged_output[self.staged_pos..self.staged_pos + to_copy]);
-            self.staged_pos += to_copy;
-            if self.staged_pos >= self.staged_output.len() {
-                self.staged_output.clear();
-                self.staged_pos = 0;
-            }
+                .copy_from_slice(&self.history[self.delivered..self.delivered + to_copy]);
+            self.delivered += to_copy;
         }
         to_copy
     }
 
-    /// Append data to the window, maintaining max window_size.
-    fn append_to_window(&mut self, data: &[u8]) {
-        self.window.extend_from_slice(data);
-        if self.window.len() > self.window_size {
-            let excess = self.window.len() - self.window_size;
-            self.window.drain(..excess);
+    /// How many decoded bytes are waiting to be delivered.
+    fn staged_len(&self) -> usize {
+        self.history.len() - self.delivered
+    }
+
+    /// Trim the history buffer (amortized) so it stays bounded while always
+    /// keeping at least `window_size` bytes of back-reference history and
+    /// never discarding undelivered output.
+    fn trim_history(&mut self) {
+        let keep = self.window_size;
+        if self.history.len() > keep.saturating_mul(2).saturating_add(64 * 1024) {
+            let cut = (self.history.len() - keep).min(self.delivered);
+            if cut > 0 {
+                self.history.copy_within(cut.., 0);
+                self.history.truncate(self.history.len() - cut);
+                self.delivered -= cut;
+            }
         }
     }
 
     /// Get the serializable state for checkpointing.
     fn get_checkpoint_state(&self) -> ZstdFullCheckpointState {
+        // Both the window and the undelivered output are suffixes of the
+        // history buffer; serialize each (they may overlap).
+        let keep = self.history.len().min(self.window_size);
         ZstdFullCheckpointState {
             block_state: bincode::serialize(&self.block_state).unwrap_or_default(),
-            window: self.window.clone(),
+            window: self.history[self.history.len() - keep..].to_vec(),
             window_size: self.window_size,
             phase: bincode::serialize(&self.phase).unwrap_or_default(),
             frame_header: self
@@ -163,8 +173,8 @@ impl ZstdDecompressor {
                 .as_ref()
                 .map(|h| bincode::serialize(h).unwrap_or_default()),
             buffer: self.buffer.clone(),
-            staged_output: self.staged_output.clone(),
-            staged_pos: self.staged_pos,
+            staged_output: self.history[self.delivered..].to_vec(),
+            staged_pos: 0,
         }
     }
 
@@ -172,7 +182,6 @@ impl ZstdDecompressor {
     fn restore_from_checkpoint_state(&mut self, state: &ZstdFullCheckpointState) -> Result<()> {
         self.block_state = bincode::deserialize(&state.block_state)
             .map_err(|e| Error::CheckpointError(format!("deserialize block_state: {}", e)))?;
-        self.window = state.window.clone();
         self.window_size = state.window_size;
         self.phase = bincode::deserialize(&state.phase)
             .map_err(|e| Error::CheckpointError(format!("deserialize phase: {}", e)))?;
@@ -185,8 +194,18 @@ impl ZstdDecompressor {
                 None
             };
         self.buffer = state.buffer.clone();
-        self.staged_output = state.staged_output.clone();
-        self.staged_pos = state.staged_pos;
+
+        // Rebuild history: both `window` and the undelivered output are
+        // suffixes of the original history, so the longer one contains the
+        // shorter as its own suffix.
+        let staged = &state.staged_output[state.staged_pos.min(state.staged_output.len())..];
+        if staged.len() >= state.window.len() {
+            self.history = staged.to_vec();
+            self.delivered = 0;
+        } else {
+            self.history = state.window.clone();
+            self.delivered = self.history.len() - staged.len();
+        }
         self.finished = false;
         Ok(())
     }
@@ -195,13 +214,13 @@ impl ZstdDecompressor {
 impl Decompressor for ZstdDecompressor {
     fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
         // If we have staged output from a previous call, deliver it first
-        if self.staged_pos < self.staged_output.len() {
+        if self.staged_len() > 0 {
             let produced = self.drain_staged(output);
             self.total_out += produced as u64;
             return Ok(DecompressResult {
                 bytes_consumed: 0,
                 bytes_produced: produced,
-                status: if self.finished && self.staged_pos >= self.staged_output.len() {
+                status: if self.finished && self.staged_len() == 0 {
                     DecompressStatus::StreamEnd
                 } else {
                     DecompressStatus::Continue
@@ -326,24 +345,23 @@ impl Decompressor for ZstdDecompressor {
                     };
 
                     let block_data = &self.buffer[pos..pos + compressed_size];
-                    let mut block_output = Vec::new();
+                    let block_start = self.history.len();
+                    let max_back = block_start.min(self.window_size);
 
                     decompress_block(
                         &block_header,
                         block_data,
                         &mut self.block_state,
-                        &self.window,
-                        &mut block_output,
+                        &mut self.history,
+                        max_back,
                     )
                     .map_err(|e| Error::DecompressionError(format!("block decompress: {}", e)))?;
 
                     pos += compressed_size;
 
-                    // Append output to window
-                    self.append_to_window(&block_output);
-
-                    // Stage the output for delivery
-                    self.staged_output.extend_from_slice(&block_output);
+                    // The block's output (history[block_start..]) is now
+                    // pending delivery; trim delivered history (amortized).
+                    self.trim_history();
 
                     if header_last {
                         // Frame's last block
@@ -393,7 +411,7 @@ impl Decompressor for ZstdDecompressor {
         let produced = self.drain_staged(output);
         self.total_out += produced as u64;
 
-        let status = if self.finished && self.staged_pos >= self.staged_output.len() {
+        let status = if self.finished && self.staged_len() == 0 {
             DecompressStatus::StreamEnd
         } else {
             DecompressStatus::Continue
@@ -441,10 +459,9 @@ impl ZstdDecompressor {
         self.buffer.clear();
         self.frame_header = None;
         self.block_state = BlockDecoderState::new();
-        self.window.clear();
+        self.history.clear();
+        self.delivered = 0;
         self.window_size = 0;
-        self.staged_output.clear();
-        self.staged_pos = 0;
         self.total_in = 0;
         self.total_out = 0;
         self.finished = false;

@@ -1,11 +1,9 @@
-//! Bit reader for zstd backward bitstreams.
+//! Bit readers for zstd bitstreams.
 //!
-//! Zstd sequences use a backward bitstream: bits are read from the END of
-//! the compressed data toward the beginning. The reader initializes by
-//! finding the leading 1-bit in the last byte, then reads bits in that
-//! reversed order.
-
-use serde::{Deserialize, Serialize};
+//! Zstd sequences and Huffman literals use a backward bitstream: bits are
+//! read from the END of the compressed data toward the beginning. The reader
+//! initializes by finding the leading 1-bit in the last byte, then reads bits
+//! in that reversed order.
 
 /// A forward bit reader (reads bits left-to-right from a byte slice).
 /// Used for FSE NCount header decoding.
@@ -67,25 +65,55 @@ impl<'a> ForwardBitReader<'a> {
     }
 }
 
-/// Backward bit reader for zstd sequence bitstreams.
+/// Load up to 8 bytes little-endian starting at `byte_idx`, zero-padding
+/// past the end of `data`.
+#[inline(always)]
+fn load_u64_le(data: &[u8], byte_idx: usize) -> u64 {
+    if byte_idx + 8 <= data.len() {
+        // Safe unaligned little-endian load.
+        u64::from_le_bytes(data[byte_idx..byte_idx + 8].try_into().unwrap())
+    } else {
+        let mut buf = [0u8; 8];
+        if byte_idx < data.len() {
+            let n = data.len() - byte_idx;
+            buf[..n].copy_from_slice(&data[byte_idx..]);
+        }
+        u64::from_le_bytes(buf)
+    }
+}
+
+/// Extract `n` bits starting at absolute bit index `lo` from `data`
+/// (bit 0 = LSB of byte 0). `n <= 56`. Bits past the end read as zero.
+#[inline(always)]
+pub(crate) fn extract_bits(data: &[u8], lo: usize, n: usize) -> usize {
+    debug_assert!(n <= 56);
+    if n == 0 {
+        return 0;
+    }
+    let v = load_u64_le(data, lo >> 3);
+    ((v >> (lo & 7)) as usize) & ((1usize << n) - 1)
+}
+
+/// Backward bit reader for zstd sequence and Huffman bitstreams.
 ///
 /// The bitstream is read from the end. Initialization finds the leading 1-bit
 /// in the last byte and starts reading from there toward the beginning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct BackwardBitReader {
-    /// The full data of the bitstream (stored for serialization).
-    data: Vec<u8>,
-    /// Current bit position: counts bits from the MSB end of the last byte.
-    /// Starts after the init-marker bit.
-    bit_pos: usize,
+///
+/// Reads are implemented as unaligned 64-bit loads, so a read of up to
+/// 56 bits costs a load + shift + mask instead of a per-bit loop.
+#[derive(Debug, Clone)]
+pub(crate) struct BackwardBitReader<'a> {
+    data: &'a [u8],
     /// Total number of valid bits (after removing the init-marker).
     total_bits: usize,
+    /// Current bit position: counts bits consumed from the MSB end.
+    bit_pos: usize,
 }
 
-impl BackwardBitReader {
+impl<'a> BackwardBitReader<'a> {
     /// Create a new backward bit reader from the given data.
     /// Finds the leading 1-bit in the last byte (the init marker).
-    pub fn new(data: &[u8]) -> Result<Self, &'static str> {
+    pub fn new(data: &'a [u8]) -> Result<Self, &'static str> {
         if data.is_empty() {
             return Err("empty bitstream");
         }
@@ -100,42 +128,117 @@ impl BackwardBitReader {
         let total_bits = (data.len() - 1) * 8 + highest_bit;
 
         Ok(Self {
-            data: data.to_vec(),
-            bit_pos: 0,
+            data,
             total_bits,
+            bit_pos: 0,
         })
     }
 
     /// How many bits are still available to read.
+    #[inline(always)]
     pub fn bits_remaining(&self) -> usize {
         self.total_bits.saturating_sub(self.bit_pos)
     }
 
+    /// Whether reads have gone past the end of the stream (only possible via
+    /// `read_bits_padded`).
+    #[inline(always)]
+    pub fn is_overflowed(&self) -> bool {
+        self.bit_pos > self.total_bits
+    }
+
+    /// Peek `n` bits (MSB first from the end of data) without consuming.
+    /// If fewer than `n` bits remain, the missing low bits read as zero.
+    /// `n` must be <= 56.
+    #[inline(always)]
+    pub fn peek_bits_padded(&self, n: u32) -> usize {
+        debug_assert!(n <= 56);
+        if n == 0 {
+            return 0;
+        }
+        let n = n as usize;
+        let remaining = self.total_bits.saturating_sub(self.bit_pos);
+        if remaining >= n {
+            // Value occupies absolute bits [remaining - n, remaining).
+            let lo = remaining - n;
+            let v = load_u64_le(self.data, lo >> 3);
+            ((v >> (lo & 7)) as usize) & ((1usize << n) - 1)
+        } else {
+            // Fewer than n real bits: real bits form the MSBs, zeros pad the rest.
+            let v = (load_u64_le(self.data, 0) as usize) & ((1usize << remaining) - 1);
+            v << (n - remaining)
+        }
+    }
+
     /// Read `n` bits from the bitstream (MSB first from the end of data).
-    /// Returns the value as a usize.
+    /// Returns an error if fewer than `n` bits remain. `n` must be <= 56.
+    #[inline(always)]
     pub fn read_bits(&mut self, n: u32) -> Result<usize, &'static str> {
+        if (n as usize) > self.bits_remaining() {
+            return Err("not enough bits in backward bitstream");
+        }
+        let v = self.peek_bits_padded(n);
+        self.bit_pos += n as usize;
+        Ok(v)
+    }
+
+    /// Read `n` bits, zero-padding past the end of the stream. This matches
+    /// the reference behavior where BIT_readBits continues reading from the
+    /// bit container past the logical end; `is_overflowed` reports it.
+    #[inline(always)]
+    pub fn read_bits_padded(&mut self, n: u32) -> usize {
+        let v = self.peek_bits_padded(n);
+        self.bit_pos += n as usize;
+        v
+    }
+}
+
+/// Backward bit reader that keeps up to 56 upcoming bits in a u64 register,
+/// refilling from memory only when the cache runs dry. Used for the sequence
+/// bitstream where reads are strict (reading past the end is an error).
+#[derive(Debug, Clone)]
+pub(crate) struct SeqBitReader<'a> {
+    data: &'a [u8],
+    /// Bits not yet consumed (including the cached ones).
+    rem: usize,
+    /// MSB-aligned cache of the next `cbits` bits.
+    cache: u64,
+    cbits: usize,
+}
+
+impl<'a> SeqBitReader<'a> {
+    pub fn new(data: &'a [u8]) -> Result<Self, &'static str> {
+        let reader = BackwardBitReader::new(data)?;
+        Ok(Self {
+            data,
+            rem: reader.bits_remaining(),
+            cache: 0,
+            cbits: 0,
+        })
+    }
+
+    /// Read `n` bits MSB-first (n <= 56). Errors if fewer than `n` remain.
+    #[inline(always)]
+    pub fn read(&mut self, n: usize) -> Result<usize, ()> {
         if n == 0 {
             return Ok(0);
         }
-        let n = n as usize;
-        if n > self.bits_remaining() {
-            return Err("not enough bits in backward bitstream");
-        }
-
-        let mut result: usize = 0;
-        for _ in 0..n {
-            result <<= 1;
-            // Read one bit from position (total_bits - 1 - bit_pos) counting
-            // from bit 0 = LSB of byte 0.
-            let abs_bit = self.total_bits - 1 - self.bit_pos;
-            let byte_idx = abs_bit / 8;
-            let bit_idx = abs_bit % 8;
-            if (self.data[byte_idx] >> bit_idx) & 1 != 0 {
-                result |= 1;
+        if self.cbits < n {
+            if self.rem < n {
+                return Err(());
             }
-            self.bit_pos += 1;
+            // Refill: cache the next min(rem, 56) unconsumed bits. The
+            // already-cached bits are re-read (idempotent).
+            let avail = self.rem.min(56);
+            let bits = extract_bits(self.data, self.rem - avail, avail);
+            self.cache = (bits as u64) << (64 - avail);
+            self.cbits = avail;
         }
-        Ok(result)
+        let v = (self.cache >> (64 - n)) as usize;
+        self.cache <<= n;
+        self.cbits -= n;
+        self.rem -= n;
+        Ok(v)
     }
 }
 
@@ -148,11 +251,6 @@ pub(crate) fn highest_bit(x: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_dummy_to_check_compilation() {
-        assert_eq!(1, 1);
-    }
 
     #[test]
     fn test_forward_bit_reader_basic() {
@@ -214,6 +312,41 @@ mod tests {
         assert_eq!(val, 0); // 7 zeros from byte 1
         let val = reader.read_bits(8).unwrap();
         assert_eq!(val, 5); // byte 0 = 0x05, read MSB first: 00000101
+    }
+
+    #[test]
+    fn test_backward_bit_by_bit_equivalence() {
+        // Compare wide reads against per-bit reads on a pseudo-random buffer.
+        let data: Vec<u8> = (0..64u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .chain(std::iter::once(0x95))
+            .collect();
+
+        let mut wide = BackwardBitReader::new(&data).unwrap();
+        let mut narrow = BackwardBitReader::new(&data).unwrap();
+
+        for n in [1u32, 3, 7, 8, 13, 16, 25, 31, 40, 56, 5, 2] {
+            if (n as usize) > wide.bits_remaining() {
+                break;
+            }
+            let a = wide.read_bits(n).unwrap();
+            let mut b = 0usize;
+            for _ in 0..n {
+                b = (b << 1) | narrow.read_bits(1).unwrap();
+            }
+            assert_eq!(a, b, "mismatch at width {n}");
+        }
+    }
+
+    #[test]
+    fn test_backward_padded_reads() {
+        let data = [0x05, 0x80]; // 15 valid bits
+        let mut reader = BackwardBitReader::new(&data).unwrap();
+        reader.read_bits(7).unwrap();
+        // 8 bits remain; ask for 12 padded: value = 0x05 << 4
+        let v = reader.read_bits_padded(12);
+        assert_eq!(v, 0x05 << 4);
+        assert!(reader.is_overflowed());
     }
 
     #[test]
