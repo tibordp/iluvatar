@@ -123,6 +123,8 @@ pub struct XzDecompressor {
     /// Staged output waiting to be delivered.
     staged_output: Vec<u8>,
     staged_pos: usize,
+    /// Reusable scratch buffer for LZMA2 output (not checkpointed).
+    lzma2_out: Vec<u8>,
     /// Total compressed bytes consumed.
     total_in: u64,
     /// Total uncompressed bytes produced.
@@ -148,6 +150,7 @@ impl XzDecompressor {
             block_header_size: 0,
             staged_output: Vec::new(),
             staged_pos: 0,
+            lzma2_out: Vec::new(),
             total_in: 0,
             total_out: 0,
             finished: false,
@@ -332,8 +335,9 @@ impl Decompressor for XzDecompressor {
                         break;
                     }
 
-                    let mut lzma2_out = vec![0u8; 256 * 1024];
-                    let result = lzma2.decompress(available, &mut lzma2_out)?;
+                    self.lzma2_out.resize(256 * 1024, 0);
+                    let lzma2_out = &mut self.lzma2_out[..];
+                    let result = lzma2.decompress(available, lzma2_out)?;
                     pos += result.bytes_consumed;
                     self.block_data_bytes += result.bytes_consumed as u64;
 

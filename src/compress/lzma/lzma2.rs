@@ -368,13 +368,12 @@ impl Lzma2Decoder {
                                 status: Lzma2DecodeStatus::Continue,
                             };
                         }
-                        // Copy to window and output
-                        for i in 0..to_copy {
-                            self.decoder.window.put_byte(input[in_pos + i]);
-                        }
-                        let n = self.decoder.window.drain_output(&mut output[out_pos..]);
+                        // Copy to window and output (to_copy <= available_out)
+                        let src = &input[in_pos..in_pos + to_copy];
+                        self.decoder.window.put_slice_direct(src);
+                        output[out_pos..out_pos + to_copy].copy_from_slice(src);
                         in_pos += to_copy;
-                        out_pos += n;
+                        out_pos += to_copy;
                         self.chunk_out_produced += to_copy as u32;
                         if self.chunk_out_produced >= self.unpack_size {
                             self.state = Lzma2State::Control;

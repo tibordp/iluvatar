@@ -187,6 +187,89 @@ impl SlidingWindow {
         }
     }
 
+    /// Fast-path byte write: updates the window without going through the
+    /// pending-output queue (the caller writes the byte to its own output).
+    #[inline(always)]
+    pub fn put_byte_direct(&mut self, b: u8) {
+        self.buf[self.pos] = b;
+        self.pos += 1;
+        self.total_pos += 1;
+        if self.pos == self.size {
+            self.pos = 0;
+            self.is_full = true;
+        }
+    }
+
+    /// Fast-path slice write (no pending-output queue), chunked around the
+    /// circular buffer boundary. Equivalent to repeated `put_byte_direct`.
+    pub fn put_slice_direct(&mut self, data: &[u8]) {
+        let mut src = data;
+        while !src.is_empty() {
+            let n = src.len().min(self.size - self.pos);
+            self.buf[self.pos..self.pos + n].copy_from_slice(&src[..n]);
+            self.pos += n;
+            self.total_pos += n as u64;
+            if self.pos == self.size {
+                self.pos = 0;
+                self.is_full = true;
+            }
+            src = &src[n..];
+        }
+    }
+
+    /// Fast-path match copy: replicate `len` bytes from `dist` back into the
+    /// window AND into `out[..len]`, chunked with memmove-safe spans.
+    /// Equivalent to `len` iterations of `put_byte(get_byte(dist))`.
+    pub fn copy_match_to(&mut self, dist: u32, len: usize, out: &mut [u8]) {
+        debug_assert!(out.len() >= len);
+        let dist = dist as usize;
+        let mut remaining = len;
+        let mut out_off = 0usize;
+
+        if dist == 1 {
+            // Run of a single byte.
+            let b = self.get_byte(1);
+            out[..len].fill(b);
+            while remaining > 0 {
+                let n = remaining.min(self.size - self.pos);
+                self.buf[self.pos..self.pos + n].fill(b);
+                self.pos += n;
+                self.total_pos += n as u64;
+                if self.pos == self.size {
+                    self.pos = 0;
+                    self.is_full = true;
+                }
+                remaining -= n;
+            }
+            return;
+        }
+
+        while remaining > 0 {
+            let src = if dist <= self.pos {
+                self.pos - dist
+            } else {
+                self.size - (dist - self.pos)
+            };
+            // Chunk must not wrap (source or destination) and must not
+            // overlap the write cursor (capped at `dist`) so that a plain
+            // copy has replication semantics.
+            let n = remaining
+                .min(self.size - src)
+                .min(self.size - self.pos)
+                .min(dist);
+            self.buf.copy_within(src..src + n, self.pos);
+            out[out_off..out_off + n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+            self.pos += n;
+            self.total_pos += n as u64;
+            if self.pos == self.size {
+                self.pos = 0;
+                self.is_full = true;
+            }
+            out_off += n;
+            remaining -= n;
+        }
+    }
+
     pub fn check_distance(&self, dist: u32) -> bool {
         let d = dist as usize;
         if self.is_full {
@@ -556,6 +639,14 @@ impl LzmaDecoder {
                 }
 
                 DecodePhase::NewSymbol => {
+                    // Fast path: decode whole symbols while ample input and
+                    // output margins remain. Falls back to the resumable
+                    // machinery below near buffer boundaries.
+                    self.decode_fast(input, &mut in_pos, output, &mut out_pos);
+                    if !matches!(self.phase, DecodePhase::NewSymbol) {
+                        continue;
+                    }
+
                     // Check end conditions
                     if let Some(unpack) = self.unpack_size {
                         if self.decoded_size >= unpack {
@@ -1440,6 +1531,323 @@ impl LzmaDecoder {
                 }
                 Ok(dist + symbol)
             }
+        }
+    }
+
+    /// Fast-path decoding: decode whole symbols with the range coder held in
+    /// local registers while generous input/output margins remain, bypassing
+    /// the resumable state machine and the pending-output queue. Every state
+    /// update matches the slow path exactly; near buffer boundaries this
+    /// returns and the resumable path takes over.
+    ///
+    /// Requires: `self.phase` is `NewSymbol`, range coder initialized, and no
+    /// pending window output.
+    fn decode_fast(
+        &mut self,
+        input: &[u8],
+        in_pos: &mut usize,
+        output: &mut [u8],
+        out_pos: &mut usize,
+    ) {
+        /// Worst-case compressed bytes consumed by one symbol (~50; one byte
+        /// per range-coder normalization).
+        const IN_MARGIN: usize = 64;
+        /// Maximum bytes one symbol can produce (match length <= 273).
+        const OUT_MARGIN: usize = 273;
+
+        const K_TOP_VALUE: u32 = 1 << 24;
+        const K_NUM_BIT_MODEL_TOTAL_BITS: u32 = 11;
+        const K_BIT_MODEL_TOTAL: u32 = 1 << K_NUM_BIT_MODEL_TOTAL_BITS;
+        const K_NUM_MOVE_BITS: u32 = 5;
+
+        debug_assert_eq!(self.window.pending_len(), 0);
+
+        let pb_mask = (1usize << self.props.pb) - 1;
+        let lp_mask = (1usize << self.props.lp) - 1;
+        let lc = self.props.lc as usize;
+        let dict_size = self.dict_size;
+        let unpack_size = self.unpack_size;
+
+        // Hot state in locals; written back on every exit below.
+        let mut range = self.range_decoder.range;
+        let mut code = self.range_decoder.code;
+        let mut corrupted = self.range_decoder.corrupted;
+        let mut state = self.state;
+        let mut reps = self.reps;
+        let mut decoded_size = self.decoded_size;
+        let mut finish: Option<LzmaDecodeStatus> = None;
+
+        {
+            let probs = &mut self.probs[..];
+            let window = &mut self.window;
+
+            // Bit decode with a probability model (see RangeDecoder::decode_bit).
+            macro_rules! bit {
+                ($idx:expr) => {{
+                    if range < K_TOP_VALUE {
+                        range <<= 8;
+                        code = (code << 8) | (input[*in_pos] as u32);
+                        *in_pos += 1;
+                    }
+                    let p = &mut probs[$idx];
+                    let v = *p as u32;
+                    let bound = (range >> K_NUM_BIT_MODEL_TOTAL_BITS) * v;
+                    if code < bound {
+                        *p = (v + ((K_BIT_MODEL_TOTAL - v) >> K_NUM_MOVE_BITS)) as u16;
+                        range = bound;
+                        0u32
+                    } else {
+                        *p = (v - (v >> K_NUM_MOVE_BITS)) as u16;
+                        code -= bound;
+                        range -= bound;
+                        1u32
+                    }
+                }};
+            }
+
+            // Direct bit decode (see RangeDecoder::decode_direct_bit).
+            macro_rules! direct_bit {
+                () => {{
+                    if range < K_TOP_VALUE {
+                        range <<= 8;
+                        code = (code << 8) | (input[*in_pos] as u32);
+                        *in_pos += 1;
+                    }
+                    range >>= 1;
+                    code = code.wrapping_sub(range);
+                    let t = 0u32.wrapping_sub(code >> 31);
+                    code = code.wrapping_add(range & t);
+                    if code == range {
+                        corrupted = true;
+                    }
+                    t.wrapping_add(1)
+                }};
+            }
+
+            // Length decode (see decode_length): returns len - K_MATCH_MIN_LEN.
+            macro_rules! decode_len {
+                ($base:expr, $pos_state:expr) => {{
+                    let base = $base;
+                    if bit!(base) == 0 {
+                        let probs_base = base + 2 + $pos_state * K_LEN_NUM_LOW_SYMBOLS;
+                        let mut m = 1usize;
+                        for _ in 0..K_LEN_NUM_LOW_BITS {
+                            m = (m << 1) + bit!(probs_base + m) as usize;
+                        }
+                        m - K_LEN_NUM_LOW_SYMBOLS
+                    } else if bit!(base + 1) == 0 {
+                        let probs_base = base
+                            + 2
+                            + K_NUM_POS_STATES_MAX * K_LEN_NUM_LOW_SYMBOLS
+                            + $pos_state * K_LEN_NUM_MID_SYMBOLS;
+                        let mut m = 1usize;
+                        for _ in 0..K_LEN_NUM_MID_BITS {
+                            m = (m << 1) + bit!(probs_base + m) as usize;
+                        }
+                        m - K_LEN_NUM_MID_SYMBOLS + K_LEN_NUM_LOW_SYMBOLS
+                    } else {
+                        let probs_base = base
+                            + 2
+                            + K_NUM_POS_STATES_MAX * K_LEN_NUM_LOW_SYMBOLS
+                            + K_NUM_POS_STATES_MAX * K_LEN_NUM_MID_SYMBOLS;
+                        let mut m = 1usize;
+                        for _ in 0..K_LEN_NUM_HIGH_BITS {
+                            m = (m << 1) + bit!(probs_base + m) as usize;
+                        }
+                        m - K_LEN_NUM_HIGH_SYMBOLS + K_LEN_NUM_LOW_SYMBOLS + K_LEN_NUM_MID_SYMBOLS
+                    }
+                }};
+            }
+
+            // Copy a match to window + output, capping at the chunk's unpack
+            // size exactly like start_copy_match.
+            macro_rules! emit_match {
+                ($dist:expr, $len:expr) => {{
+                    let mut actual_len = $len;
+                    if let Some(unpack) = unpack_size {
+                        actual_len = actual_len.min((unpack - decoded_size) as usize);
+                    }
+                    window.copy_match_to(
+                        $dist + 1,
+                        actual_len,
+                        &mut output[*out_pos..*out_pos + actual_len],
+                    );
+                    *out_pos += actual_len;
+                    decoded_size += actual_len as u64;
+                }};
+            }
+
+            loop {
+                if *in_pos + IN_MARGIN > input.len() || *out_pos + OUT_MARGIN > output.len() {
+                    break;
+                }
+                if let Some(unpack) = unpack_size {
+                    if decoded_size >= unpack {
+                        // Let the slow path transition to Finished.
+                        break;
+                    }
+                }
+
+                let pos_state = (window.total_pos as usize) & pb_mask;
+                let st = state as usize;
+
+                // IsMatch
+                if bit!(OFF_IS_MATCH + st * K_NUM_POS_STATES_MAX + pos_state) == 0 {
+                    // ── Literal ──
+                    let prev_byte = if !window.is_empty() {
+                        window.get_byte(1)
+                    } else {
+                        0
+                    } as usize;
+                    let lit_state =
+                        ((window.total_pos as usize & lp_mask) << lc) + (prev_byte >> (8 - lc));
+                    let probs_off = BASE_PROBS_SIZE + K_LZMA_LIT_SIZE * lit_state;
+
+                    let mut symbol: usize = 1;
+                    if state >= 7 {
+                        // Matched literal
+                        let mut match_byte = window.get_byte(reps[0] + 1);
+                        while symbol < 0x100 {
+                            let match_bit = ((match_byte >> 7) & 1) as usize;
+                            match_byte <<= 1;
+                            let b = bit!(probs_off + ((1 + match_bit) << 8) + symbol) as usize;
+                            symbol = (symbol << 1) | b;
+                            if match_bit != b {
+                                break;
+                            }
+                        }
+                    }
+                    while symbol < 0x100 {
+                        symbol = (symbol << 1) | bit!(probs_off + symbol) as usize;
+                    }
+
+                    let b = (symbol - 0x100) as u8;
+                    window.put_byte_direct(b);
+                    output[*out_pos] = b;
+                    *out_pos += 1;
+                    state = update_state_literal(state);
+                    decoded_size += 1;
+                    continue;
+                }
+
+                // ── Match ──
+                if bit!(OFF_IS_REP + st) == 0 {
+                    // Simple match: new distance
+                    reps[3] = reps[2];
+                    reps[2] = reps[1];
+                    reps[1] = reps[0];
+                    state = update_state_match(state);
+
+                    let len = decode_len!(OFF_LEN_CODER, pos_state);
+                    let len_state = len.min(K_NUM_LEN_TO_POS_STATES - 1);
+
+                    // Distance decode (see decode_distance).
+                    let dist = {
+                        let probs_base = OFF_POS_SLOT + len_state * (1 << 6);
+                        let mut m = 1usize;
+                        for _ in 0..6 {
+                            m = (m << 1) + bit!(probs_base + m) as usize;
+                        }
+                        let pos_slot = m - (1 << 6);
+
+                        if pos_slot < K_START_POS_MODEL_INDEX {
+                            pos_slot as u32
+                        } else {
+                            let num_direct_bits = (pos_slot >> 1) - 1;
+                            let dist_initial = (2 | (pos_slot & 1)) as u32;
+
+                            if pos_slot < K_END_POS_MODEL_INDEX {
+                                // Reverse bit tree decode using PosDecoders
+                                let dist_base = dist_initial << num_direct_bits;
+                                let probs_offset =
+                                    OFF_POS_DECODERS + (dist_base as usize) - pos_slot;
+                                let mut m = 1usize;
+                                let mut symbol = 0u32;
+                                for i in 0..num_direct_bits {
+                                    let b = bit!(probs_offset + m);
+                                    m = (m << 1) + b as usize;
+                                    symbol |= b << i;
+                                }
+                                dist_base + symbol
+                            } else {
+                                // Direct bits, then 4 align bits (reverse tree)
+                                let mut dist = dist_initial;
+                                for _ in 0..(num_direct_bits - K_NUM_ALIGN_BITS) {
+                                    dist = (dist << 1) + direct_bit!();
+                                }
+                                dist <<= K_NUM_ALIGN_BITS as u32;
+                                let mut m = 1usize;
+                                let mut symbol = 0u32;
+                                for i in 0..K_NUM_ALIGN_BITS {
+                                    let b = bit!(OFF_ALIGN + m);
+                                    m = (m << 1) + b as usize;
+                                    symbol |= b << i;
+                                }
+                                dist | symbol
+                            }
+                        }
+                    };
+
+                    if dist == 0xFFFF_FFFF {
+                        // End marker
+                        finish = Some(LzmaDecodeStatus::FinishedWithMark);
+                        break;
+                    }
+                    if dist >= dict_size || !window.check_distance(dist) {
+                        finish = Some(LzmaDecodeStatus::FinishedWithMark);
+                        break;
+                    }
+                    reps[0] = dist;
+                    emit_match!(dist, len + K_MATCH_MIN_LEN);
+                    continue;
+                }
+
+                // Rep match
+                if window.is_empty() {
+                    finish = Some(LzmaDecodeStatus::FinishedWithMark);
+                    break;
+                }
+
+                if bit!(OFF_IS_REP_G0 + st) == 0 {
+                    if bit!(OFF_IS_REP0_LONG + st * K_NUM_POS_STATES_MAX + pos_state) == 0 {
+                        // Short rep: single byte at rep0
+                        state = update_state_short_rep(state);
+                        let b = window.get_byte(reps[0] + 1);
+                        window.put_byte_direct(b);
+                        output[*out_pos] = b;
+                        *out_pos += 1;
+                        decoded_size += 1;
+                        continue;
+                    }
+                } else if bit!(OFF_IS_REP_G1 + st) == 0 {
+                    reps.swap(0, 1);
+                } else if bit!(OFF_IS_REP_G2 + st) == 0 {
+                    let dist = reps[2];
+                    reps[2] = reps[1];
+                    reps[1] = reps[0];
+                    reps[0] = dist;
+                } else {
+                    let dist = reps[3];
+                    reps[3] = reps[2];
+                    reps[2] = reps[1];
+                    reps[1] = reps[0];
+                    reps[0] = dist;
+                }
+                state = update_state_rep(state);
+                let len = decode_len!(OFF_REP_LEN_CODER, pos_state);
+                emit_match!(reps[0], len + K_MATCH_MIN_LEN);
+            }
+        }
+
+        // Write back hot state.
+        self.range_decoder.range = range;
+        self.range_decoder.code = code;
+        self.range_decoder.corrupted = corrupted;
+        self.state = state;
+        self.reps = reps;
+        self.decoded_size = decoded_size;
+        if let Some(status) = finish {
+            self.phase = DecodePhase::Finished(status);
         }
     }
 
