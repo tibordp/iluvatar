@@ -1692,3 +1692,45 @@ fn test_cpio_compressed_all_formats() {
         );
     }
 }
+
+#[cfg(feature = "gzip")]
+#[test]
+fn test_truncated_gzip_archive_errors_during_indexing() {
+    // A truncated gzip stream must surface an error during indexing, not
+    // silently produce a partial index that looks complete.
+    let mut rng: u64 = 7;
+    let content: Vec<u8> = (0..100_000)
+        .map(|_| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng >> 33) as u8
+        })
+        .collect();
+    let compressed = create_tar_gz(&[("data.bin", &content)]);
+    let truncated = &compressed[..compressed.len() / 2];
+
+    let mut engine =
+        IndexingEngine::new(CompressionFormat::Gzip, None, truncated.len() as u64).unwrap();
+    let mut offset = 0;
+    let mut saw_error = false;
+    loop {
+        match engine.step() {
+            EngineRequest::NeedInput => {
+                if offset >= truncated.len() {
+                    engine.signal_eof();
+                } else {
+                    let end = (offset + 8192).min(truncated.len());
+                    engine.provide_data(&truncated[offset..end]);
+                    offset = end;
+                }
+            }
+            EngineRequest::Done => break,
+            EngineRequest::Error(_) => {
+                saw_error = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_error, "truncated gzip archive indexed without error");
+}
+

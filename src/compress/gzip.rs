@@ -274,8 +274,12 @@ impl GzipDecompressor {
             | TINFLStatus::HasMoreOutput
             | TINFLStatus::BlockBoundary => DecompressStatus::Continue,
             TINFLStatus::FailedCannotMakeProgress => {
-                self.finished = true;
-                DecompressStatus::StreamEnd
+                // The deflate stream is truncated or corrupt: inflate cannot
+                // proceed even though the caller has no more input. Surface
+                // an error instead of masquerading as a clean end of stream.
+                return Err(Error::DecompressionError(
+                    "truncated or corrupt deflate stream".into(),
+                ));
             }
             _ => {
                 return Err(Error::DecompressionError(format!(
@@ -582,6 +586,70 @@ mod tests {
         let compressed = compress_gzip(&original);
         let output = full_decompress(&compressed, 4096);
         assert_eq!(output, original);
+    }
+
+    /// Drive the decompressor to completion, returning Err if any step errors.
+    fn try_full_decompress(compressed: &[u8]) -> Result<Vec<u8>> {
+        let mut dec = GzipDecompressor::new();
+        let mut all_output = Vec::new();
+        let mut offset = 0;
+        loop {
+            let end = (offset + 4096).min(compressed.len());
+            let input = if offset < compressed.len() {
+                &compressed[offset..end]
+            } else {
+                &[]
+            };
+            let mut output = vec![0u8; 65536];
+            let result = dec.decompress(input, &mut output)?;
+            all_output.extend_from_slice(&output[..result.bytes_produced]);
+            offset += result.bytes_consumed;
+            if result.status == DecompressStatus::StreamEnd {
+                break;
+            }
+            if result.bytes_consumed == 0
+                && result.bytes_produced == 0
+                && offset >= compressed.len()
+            {
+                break;
+            }
+        }
+        Ok(all_output)
+    }
+
+    #[test]
+    fn test_truncated_stream_is_an_error() {
+        // A truncated deflate stream must surface an error, not report a
+        // clean end of stream with silently missing data.
+        let original: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
+        let compressed = compress_gzip(&original);
+        let truncated = &compressed[..compressed.len() - 20];
+
+        match try_full_decompress(truncated) {
+            Err(_) => {}
+            Ok(output) => panic!(
+                "truncated stream decoded 'successfully' with {} of {} bytes",
+                output.len(),
+                original.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn test_corrupted_stream_is_an_error() {
+        let original: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
+        let mut compressed = compress_gzip(&original);
+        // Corrupt a byte in the middle of the deflate payload.
+        let mid = compressed.len() / 2;
+        compressed[mid] ^= 0xFF;
+
+        match try_full_decompress(&compressed) {
+            Err(_) => {}
+            // Bit flips can survive as valid-but-different deflate; if it
+            // decodes, the content must differ in length or bytes (the flip
+            // cannot be a silent no-op on the original data).
+            Ok(output) => assert_ne!(output, original, "corruption was silently ignored"),
+        }
     }
 
     #[test]
