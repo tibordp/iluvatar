@@ -154,7 +154,7 @@ fn build_index(
         eprintln!(
             "\r\x1b[2K\x1b[1;32m done\x1b[0m  {} entries, {} checkpoints, {} compressed",
             index.entries.len(),
-            index.checkpoints.len(),
+            index.checkpoints().len(),
             human_size(size),
         );
     }

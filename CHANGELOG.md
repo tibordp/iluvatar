@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+### Added
+
+- **Stream layer.** Random access no longer requires a tar or cpio container:
+  `StreamIndex` is the checkpoint table of one compressed stream,
+  `StreamIndexer` lays checkpoints over it (in one pass, or in increments
+  with `stop_at` and `resume`), and `StreamReader` decodes any unpacked
+  range from the nearest checkpoint. `IndexingEngine` and `ReadEngine` are
+  now compositions of these and keep their API. `sync::Stream` and
+  `tokio::Stream` wrap a bare `.gz`/`.xz`/`.zst`/`.bz2` file the way
+  `Archive` wraps an archive.
+- **Live readers.** `StreamReader::seek_forward` retargets a reader at a
+  later range without restoring a checkpoint, so sequential range reads
+  cost only the new bytes; `compressed_position` says where the caller
+  should read next.
+- **Codec chains.** `CodecSpec` names a stream's decoding stages in
+  packed-to-unpacked order and builds the decompressor: `Copy`, `Deflate`
+  (gzip-framed or raw), `Bzip2`, raw `Lzma` (LZMA1), raw `Lzma2`, `Xz`,
+  `Zstd`, `Delta`, the BCJ converters for x86, PowerPC, IA-64, ARM,
+  ARM Thumb, SPARC, ARM64 and RISC-V, `Bcj2` (7-Zip's four-stream x86
+  converter; the caller decodes the CALL, JUMP and range-coder side streams
+  whole and hands them over with `set_bcj2_streams`, the main stream flows
+  through the chain) and `AesCbc` (AES-256-CBC, behind the new default-on
+  `aes` feature; the key is never serialized). Chains checkpoint as a
+  whole, including bytes in flight between stages.
+- The `Decompressor` trait, every codec and the checkpoint types are
+  public API; `lzma` gained a raw LZMA1 stage and `gzip` a raw-deflate
+  constructor.
+
+### Changed
+
+- **Checkpoints are exact.** `Decompressor::checkpoint` now returns
+  `Option<Checkpoint>`: a checkpoint carries the caller's offsets, and a
+  codec that can only resume at block boundaries (deflate, bzip2) answers
+  `None` between them instead of returning the last boundary. The indexer
+  simply tries again after later steps. Consequence: gzip and bzip2 streams
+  no longer accumulate duplicate start checkpoints when a strategy fires
+  before the first boundary; a highly compressible gzip stream that fits in
+  one deflate block gets exactly one checkpoint, since there is nowhere to
+  resume from. bzip2 decoding now returns at each block magic so the
+  boundary can be checkpointed before output moves past it.
+- **`ArchiveIndex` holds a `StreamIndex`** (`index.stream`) instead of a
+  bare checkpoint vector; `checkpoints()` is the accessor. The index format
+  version is bumped to 5; indexes built by earlier versions are rejected on
+  load and must be rebuilt.
+- Filters are ported from XZ Utils' simple filters and delta decoder (0BSD);
+  no new C dependency. The `aes` crate is the only dependency added.
+
 ## 0.3.0 — 2026-07-15
 
 ### Changed

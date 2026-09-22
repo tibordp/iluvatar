@@ -1,43 +1,15 @@
 use crate::archive::detect::MIN_DETECT_BYTES;
 use crate::archive::{ArchiveEvent, ArchiveFormat, ArchiveParser};
-use crate::compress::checkpoint::{Checkpoint, CheckpointState};
-use crate::compress::decompressor::{DecompressStatus, Decompressor};
 use crate::compress::CompressionFormat;
 use crate::engine::checkpoint_strategy::{
-    default_interval_for_format, CheckpointContext, CheckpointStrategy, FixedInterval,
+    default_interval_for_format, CheckpointStrategy, FixedInterval,
 };
 use crate::engine::progress::IndexProgress;
 use crate::engine::request::EngineRequest;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::index::builder::IndexBuilder;
 use crate::index::store::ArchiveIndex;
-
-/// Default buffer size for decompression.
-const DECOMPRESS_BUF_SIZE: usize = 64 * 1024;
-
-// ─── Factory for creating decompressors ───
-
-/// Create a boxed decompressor for the given format.
-fn create_decompressor(format: CompressionFormat) -> Result<Box<dyn Decompressor>> {
-    match format {
-        CompressionFormat::None => Ok(Box::new(crate::compress::none::NoneDecompressor::new())),
-
-        #[cfg(feature = "gzip")]
-        CompressionFormat::Gzip => Ok(Box::new(crate::compress::gzip::GzipDecompressor::new())),
-
-        #[cfg(feature = "bz2")]
-        CompressionFormat::Bzip2 => Ok(Box::new(crate::compress::bzip2::Bzip2Decompressor::new())),
-
-        #[cfg(feature = "xz")]
-        CompressionFormat::Xz => Ok(Box::new(crate::compress::xz::XzDecompressor::new())),
-
-        #[cfg(feature = "zstandard")]
-        CompressionFormat::Zstd => Ok(Box::new(crate::compress::zstd_dec::ZstdDecompressor::new())),
-
-        #[allow(unreachable_patterns)]
-        _ => Err(Error::UnsupportedFormat),
-    }
-}
+use crate::stream::{StreamIndexer, StreamReader, BUF_SIZE};
 
 /// Create a boxed archive parser for the given format.
 fn create_archive_parser(format: ArchiveFormat) -> Box<dyn ArchiveParser> {
@@ -49,16 +21,6 @@ fn create_archive_parser(format: ArchiveFormat) -> Box<dyn ArchiveParser> {
 
 // ─── Indexing Engine ───
 
-/// State of the indexing engine.
-enum IndexingState {
-    /// Waiting for compressed input data.
-    NeedInput,
-    /// Processing data (decompressing + parsing).
-    Processing,
-    /// Completed.
-    Done,
-}
-
 /// Linearly scans a compressed archive to build an index.
 ///
 /// This is a sans-I/O state machine. The caller drives it by:
@@ -66,6 +28,9 @@ enum IndexingState {
 /// 2. Fulfilling the request (providing data via [`provide_data()`](Self::provide_data), etc.)
 /// 3. Repeating until [`EngineRequest::Done`]
 /// 4. Calling [`finish()`](Self::finish) to get the completed [`ArchiveIndex`]
+///
+/// Underneath, a [`StreamIndexer`] decodes the stream and lays checkpoints
+/// while the tar or cpio parser reads its output for entries.
 ///
 /// The type parameter `S` controls when decompressor checkpoints are
 /// created. Use [`IndexingEngine::new`] for the format-aware default
@@ -109,26 +74,14 @@ enum IndexingState {
 /// # }
 /// ```
 pub struct IndexingEngine<S: CheckpointStrategy = FixedInterval> {
-    decompressor: Box<dyn Decompressor>,
+    indexer: StreamIndexer<S>,
     archive_parser: Option<Box<dyn ArchiveParser>>,
-    archive_format: Option<ArchiveFormat>,
     index_builder: IndexBuilder,
     /// Buffer for archive format auto-detection.
     detect_buf: Vec<u8>,
-    strategy: S,
-    compression: CompressionFormat,
-    compressed_pos: u64,
-    uncompressed_pos: u64,
-    last_checkpoint_pos: u64,
-    total_checkpoint_data_bytes: u64,
-    archive_size: u64,
-    state: IndexingState,
-    /// Compressed input buffer (data provided by caller).
-    input_buf: Vec<u8>,
-    input_pos: usize,
-    /// Decompressed output buffer (fed to archive parser).
-    decompress_buf: Vec<u8>,
-    eof: bool,
+    /// Scratch for draining indexer output into the parser.
+    chunk: Vec<u8>,
+    done: bool,
 }
 
 impl IndexingEngine<FixedInterval> {
@@ -168,232 +121,91 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
         strategy: S,
         archive_size: u64,
     ) -> Result<Self> {
-        let decompressor = create_decompressor(compression)?;
-
-        let (parser, builder, detect_buf) = if let Some(af) = archive_format {
-            let parser = create_archive_parser(af);
-            let mut builder = IndexBuilder::new(compression, af, archive_size);
-            builder.add_checkpoint(Checkpoint {
-                compressed_offset: 0,
-                bit_offset: 0,
-                uncompressed_offset: 0,
-                state: CheckpointState::None,
-            });
-            (Some(parser), Some(builder), Vec::new())
+        let compressed_len = if archive_size == 0 {
+            None
         } else {
-            (None, None, Vec::with_capacity(MIN_DETECT_BYTES))
+            Some(archive_size)
         };
-
+        let mut indexer = StreamIndexer::new(compression.into(), strategy, compressed_len)?;
+        indexer.emit_output(true);
+        let (parser, detect_buf) = match archive_format {
+            Some(af) => (Some(create_archive_parser(af)), Vec::new()),
+            None => (None, Vec::with_capacity(MIN_DETECT_BYTES)),
+        };
         Ok(Self {
-            decompressor,
+            indexer,
             archive_parser: parser,
-            archive_format,
-            index_builder: builder.unwrap_or_else(|| {
-                // Placeholder; will be replaced after detection.
-                IndexBuilder::new(compression, ArchiveFormat::Tar, archive_size)
-            }),
+            index_builder: IndexBuilder::new(
+                compression,
+                archive_format.unwrap_or(ArchiveFormat::Tar),
+                archive_size,
+            ),
             detect_buf,
-            strategy,
-            compression,
-            compressed_pos: 0,
-            uncompressed_pos: 0,
-            last_checkpoint_pos: 0,
-            total_checkpoint_data_bytes: 0,
-            archive_size,
-            state: IndexingState::NeedInput,
-            input_buf: Vec::new(),
-            input_pos: 0,
-            decompress_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
-            eof: false,
+            chunk: vec![0; BUF_SIZE],
+            done: false,
         })
     }
 
     /// Drive the state machine forward. Returns what the engine needs next.
     pub fn step(&mut self) -> EngineRequest {
         loop {
-            match self.step_once() {
-                Some(request) => return request,
-                None => continue,
+            if self.done {
+                return EngineRequest::Done;
+            }
+            match self.indexer.step() {
+                EngineRequest::OutputReady => {
+                    if let Err(e) = self.drain_output() {
+                        return EngineRequest::Error(e);
+                    }
+                }
+                EngineRequest::Done => {
+                    self.done = true;
+                    return EngineRequest::Done;
+                }
+                other => return other,
             }
         }
     }
 
-    /// One decompress-and-parse iteration. Returns `None` when there is
-    /// unconsumed input left to keep processing (the caller loops).
-    fn step_once(&mut self) -> Option<EngineRequest> {
-        match self.state {
-            IndexingState::Done => return Some(EngineRequest::Done),
-            IndexingState::NeedInput => {
-                if self.eof {
-                    self.state = IndexingState::Done;
-                    return Some(EngineRequest::Done);
-                }
-                return Some(EngineRequest::NeedInput);
+    /// Feed the indexer's pending output through detection and the parser.
+    fn drain_output(&mut self) -> Result<()> {
+        loop {
+            let n = self.indexer.read_output(&mut self.chunk);
+            if n == 0 {
+                return Ok(());
             }
-            IndexingState::Processing => {}
-        }
-
-        // We have data to process — decompress and parse
-        let input = if self.input_pos < self.input_buf.len() {
-            &self.input_buf[self.input_pos..]
-        } else if self.eof {
-            &[]
-        } else {
-            self.state = IndexingState::NeedInput;
-            return Some(EngineRequest::NeedInput);
-        };
-
-        let result = match self
-            .decompressor
-            .decompress(input, &mut self.decompress_buf)
-        {
-            Ok(r) => r,
-            Err(e) => return Some(EngineRequest::Error(e)),
-        };
-
-        self.input_pos += result.bytes_consumed;
-        self.compressed_pos += result.bytes_consumed as u64;
-
-        if result.bytes_produced > 0 {
-            self.uncompressed_pos += result.bytes_produced as u64;
-
-            // Auto-detect archive format if not yet known
+            let mut data: &[u8] = &self.chunk[..n];
             if self.archive_parser.is_none() {
-                self.detect_buf
-                    .extend_from_slice(&self.decompress_buf[..result.bytes_produced]);
-
-                if let Some(af) = crate::archive::detect::detect_archive_format(&self.detect_buf) {
-                    self.archive_format = Some(af);
-                    self.archive_parser = Some(create_archive_parser(af));
-                    self.index_builder = IndexBuilder::new(self.compression, af, self.archive_size);
-                    self.index_builder.add_checkpoint(Checkpoint {
-                        compressed_offset: 0,
-                        bit_offset: 0,
-                        uncompressed_offset: 0,
-                        state: CheckpointState::None,
-                    });
-
-                    // Feed accumulated detection bytes to the parser
-                    let detect_data = std::mem::take(&mut self.detect_buf);
-                    if let Err(e) = self.feed_to_parser(&detect_data) {
-                        return Some(EngineRequest::Error(e));
-                    }
-                }
-                // Not enough data yet — continue decompressing
-            } else {
-                // Check if we should take a checkpoint
-                let ctx = CheckpointContext {
-                    uncompressed_pos: self.uncompressed_pos,
-                    compressed_pos: self.compressed_pos,
-                    last_checkpoint_uncompressed_pos: self.last_checkpoint_pos,
-                    checkpoint_count: self.index_builder.checkpoint_count(),
-                    total_checkpoint_data_bytes: self.total_checkpoint_data_bytes,
-                    archive_size: self.archive_size,
-                };
-                if self.strategy.should_checkpoint(&ctx) {
-                    match self
-                        .decompressor
-                        .checkpoint(self.compressed_pos, self.uncompressed_pos)
-                    {
-                        Ok(cp) => {
-                            let cp_size = cp.estimated_size();
-                            self.total_checkpoint_data_bytes += cp_size as u64;
-                            self.index_builder.add_checkpoint(cp);
-                            self.last_checkpoint_pos = self.uncompressed_pos;
-
-                            let ctx = CheckpointContext {
-                                uncompressed_pos: self.uncompressed_pos,
-                                compressed_pos: self.compressed_pos,
-                                last_checkpoint_uncompressed_pos: self.last_checkpoint_pos,
-                                checkpoint_count: self.index_builder.checkpoint_count(),
-                                total_checkpoint_data_bytes: self.total_checkpoint_data_bytes,
-                                archive_size: self.archive_size,
-                            };
-                            self.strategy.on_checkpoint_created(&ctx, cp_size);
+                self.detect_buf.extend_from_slice(data);
+                match crate::archive::detect::detect_archive_format(&self.detect_buf) {
+                    Some(af) => {
+                        self.archive_parser = Some(create_archive_parser(af));
+                        self.index_builder.set_archive_format(af);
+                        // Replay the detection bytes through the parser.
+                        let detect = std::mem::take(&mut self.detect_buf);
+                        self.feed_to_parser(&detect)?;
+                        if self.done {
+                            return Ok(());
                         }
-                        Err(e) => return Some(EngineRequest::Error(e)),
+                        continue;
                     }
-                }
-
-                // Feed decompressed data to archive parser.
-                // We need to copy the slice to avoid a borrow conflict
-                // (feed_to_parser needs &mut self while decompress_buf is &self).
-                let bytes_produced = result.bytes_produced;
-                if let Err(e) = self.feed_to_parser_from_buf(bytes_produced) {
-                    return Some(EngineRequest::Error(e));
+                    None => continue,
                 }
             }
-
-            if matches!(self.state, IndexingState::Done) {
-                return Some(EngineRequest::Done);
+            if self.done {
+                // Past the archive trailer: the rest of the stream is
+                // padding the parser must not see.
+                continue;
             }
-        }
-
-        if result.status == DecompressStatus::StreamEnd {
-            self.state = IndexingState::Done;
-            return Some(EngineRequest::Done);
-        }
-
-        // If we consumed all input, need more
-        if self.input_pos >= self.input_buf.len() {
-            if self.eof {
-                // Only stop if the decompressor made no progress at all.
-                // It may have internally buffered output that needs draining.
-                if result.bytes_consumed == 0 && result.bytes_produced == 0 {
-                    self.state = IndexingState::Done;
-                    Some(EngineRequest::Done)
-                } else {
-                    // Keep processing to drain buffered output
-                    Some(EngineRequest::NeedInput)
-                }
-            } else {
-                self.state = IndexingState::NeedInput;
-                Some(EngineRequest::NeedInput)
-            }
-        } else {
-            // Still have unconsumed input — keep processing.
-            // (Returning NeedInput here would cause the caller to overwrite
-            //  unconsumed bytes via provide_data.)
-            if result.bytes_consumed == 0 && result.bytes_produced == 0 {
-                // A decompressor with input available and a whole output
-                // buffer to write into must make progress; treat a stall as
-                // malformed data instead of looping forever.
-                return Some(EngineRequest::Error(Error::DecompressionError(
-                    "decompressor made no progress with input remaining".into(),
-                )));
-            }
-            None
+            let chunk = std::mem::take(&mut self.chunk);
+            data = &chunk[..n];
+            let result = self.feed_to_parser(data);
+            self.chunk = chunk;
+            result?;
         }
     }
 
-    /// Feed decompressed data from `self.decompress_buf[..len]` to the archive parser.
-    fn feed_to_parser_from_buf(&mut self, len: usize) -> Result<()> {
-        let parser = self.archive_parser.as_mut().unwrap();
-        let mut parse_offset = 0;
-
-        while parse_offset < len {
-            let data = &self.decompress_buf[parse_offset..len];
-            let (consumed, event) = parser.feed(data)?;
-            parse_offset += consumed;
-            match event {
-                ArchiveEvent::Entry(entry) => {
-                    self.index_builder.add_entry(entry);
-                }
-                ArchiveEvent::NeedData => {
-                    if consumed == 0 {
-                        break;
-                    }
-                }
-                ArchiveEvent::EndOfArchive => {
-                    self.state = IndexingState::Done;
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Feed arbitrary decompressed data to the archive parser.
+    /// Feed decompressed data to the archive parser.
     fn feed_to_parser(&mut self, data: &[u8]) -> Result<()> {
         let parser = self.archive_parser.as_mut().unwrap();
         let mut parse_offset = 0;
@@ -411,7 +223,7 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
                     }
                 }
                 ArchiveEvent::EndOfArchive => {
-                    self.state = IndexingState::Done;
+                    self.done = true;
                     return Ok(());
                 }
             }
@@ -424,10 +236,7 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
     /// Call this after [`step()`](Self::step) returns [`EngineRequest::NeedInput`].
     /// The engine copies the data internally, so the caller's buffer can be reused.
     pub fn provide_data(&mut self, data: &[u8]) {
-        self.input_buf.clear();
-        self.input_buf.extend_from_slice(data);
-        self.input_pos = 0;
-        self.state = IndexingState::Processing;
+        self.indexer.provide_data(data);
     }
 
     /// Signal that the end of the compressed stream has been reached.
@@ -437,30 +246,30 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
     /// a few more [`step()`](Self::step) calls to drain internally
     /// buffered output.
     pub fn signal_eof(&mut self) {
-        self.eof = true;
-        self.state = IndexingState::Processing;
+        self.indexer.signal_eof();
     }
 
     /// Consume the engine and return the completed index.
     ///
     /// Call this after [`step()`](Self::step) returns [`EngineRequest::Done`].
     pub fn finish(self) -> ArchiveIndex {
-        self.index_builder.finish(self.uncompressed_pos)
+        self.index_builder.finish(self.indexer.finish(), true)
     }
 
     /// Return a snapshot of the current indexing progress.
     ///
     /// Cheap to call between any two `step()` calls.
     pub fn progress(&self) -> IndexProgress {
+        let stream = self.indexer.progress();
         IndexProgress {
-            compressed_bytes_processed: self.compressed_pos,
-            compressed_bytes_total: self.index_builder.archive_size(),
-            uncompressed_bytes_processed: self.uncompressed_pos,
+            compressed_bytes_processed: stream.compressed_pos,
+            compressed_bytes_total: stream.compressed_len.unwrap_or(0),
+            uncompressed_bytes_processed: stream.unpacked_pos,
             entries_found: self.index_builder.entry_count(),
-            checkpoints_created: self.index_builder.checkpoint_count(),
-            checkpoint_data_bytes: self.total_checkpoint_data_bytes,
+            checkpoints_created: stream.checkpoints,
+            checkpoint_data_bytes: stream.checkpoint_data_bytes,
             last_entry_path: self.index_builder.last_entry_path().map(|s| s.to_owned()),
-            is_complete: matches!(self.state, IndexingState::Done),
+            is_complete: self.done,
         }
     }
 
@@ -473,7 +282,7 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
     ///
     /// The engine continues to be usable for further indexing.
     pub fn snapshot_index(&self) -> ArchiveIndex {
-        self.index_builder.snapshot(self.uncompressed_pos)
+        self.index_builder.snapshot(self.indexer.snapshot())
     }
 
     /// Cancel indexing and return whatever index has been built so far.
@@ -481,33 +290,17 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
     /// Like `finish()`, this consumes the engine. Unlike `finish()`,
     /// the returned index has `metadata.complete = false`.
     pub fn cancel(self) -> ArchiveIndex {
-        self.index_builder.finish_partial(self.uncompressed_pos)
+        self.index_builder.finish(self.indexer.finish(), false)
     }
 }
 
 // ─── Read Engine ───
 
-/// State of the read engine.
-#[derive(Debug)]
-enum ReadState {
-    /// Need to seek to checkpoint and read compressed data.
-    SeekToCheckpoint,
-    /// Decompressing and skipping until we reach the target file.
-    DecompressingToTarget { skip_remaining: u64 },
-    /// Emitting target file data.
-    EmittingData { data_remaining: u64 },
-    /// Need more compressed input.
-    NeedInput { skip_remaining: u64 },
-    /// Need more compressed input while emitting.
-    NeedInputEmitting { data_remaining: u64 },
-    /// Done.
-    Done,
-}
-
 /// Reads a specific file from a compressed archive using an index.
 ///
-/// Sans-I/O state machine: the caller provides compressed data when
-/// requested and reads decompressed output when available.
+/// A [`StreamReader`] aimed at the file's unpacked range. Sans-I/O: the
+/// caller provides compressed data when requested and reads decompressed
+/// output when available.
 ///
 /// The read loop follows the same pattern as [`IndexingEngine`], but with
 /// the addition of [`EngineRequest::SeekAndRead`] (which asks the caller
@@ -557,27 +350,7 @@ enum ReadState {
 /// # Ok(result)
 /// # }
 /// ```
-pub struct ReadEngine {
-    decompressor: Box<dyn Decompressor>,
-    checkpoint: Checkpoint,
-    target_offset: u64,
-    target_size: u64,
-    state: ReadState,
-    /// Decompressed output buffer.
-    output_buf: Vec<u8>,
-    /// Scratch buffer for decompressing skipped data (reused across steps).
-    skip_buf: Vec<u8>,
-    /// How many valid bytes are in output_buf.
-    output_len: usize,
-    /// How many bytes have been read from output_buf by the caller.
-    output_read: usize,
-    /// Compressed input buffer.
-    input_buf: Vec<u8>,
-    input_pos: usize,
-    /// Current uncompressed position.
-    uncompressed_pos: u64,
-    eof: bool,
-}
+pub struct ReadEngine(StreamReader);
 
 impl ReadEngine {
     /// Create a read engine for a specific file.
@@ -586,29 +359,12 @@ impl ReadEngine {
     pub fn new(index: &ArchiveIndex, path: &str) -> Result<Self> {
         let entry = index
             .get(path)
-            .ok_or_else(|| Error::FileNotFound(path.into()))?;
-
-        let target_offset = entry.uncompressed_offset;
-        let target_size = entry.size;
-        let (_, checkpoint) = index.best_checkpoint_for_offset(target_offset);
-        let checkpoint = checkpoint.clone();
-        let decompressor = create_decompressor(index.metadata.compression)?;
-
-        Ok(Self {
-            decompressor,
-            checkpoint,
-            target_offset,
-            target_size,
-            state: ReadState::SeekToCheckpoint,
-            output_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
-            skip_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
-            output_len: 0,
-            output_read: 0,
-            input_buf: Vec::new(),
-            input_pos: 0,
-            uncompressed_pos: 0,
-            eof: false,
-        })
+            .ok_or_else(|| crate::error::Error::FileNotFound(path.into()))?;
+        Ok(Self(StreamReader::new(
+            &index.stream,
+            entry.uncompressed_offset,
+            entry.size,
+        )?))
     }
 
     /// Create a read engine for a byte range within a file.
@@ -624,136 +380,19 @@ impl ReadEngine {
     pub fn new_range(index: &ArchiveIndex, path: &str, file_offset: u64, len: u64) -> Result<Self> {
         let entry = index
             .get(path)
-            .ok_or_else(|| Error::FileNotFound(path.into()))?;
-
+            .ok_or_else(|| crate::error::Error::FileNotFound(path.into()))?;
         let file_offset = file_offset.min(entry.size);
         let read_len = len.min(entry.size - file_offset);
-
-        if read_len == 0 {
-            let decompressor = create_decompressor(index.metadata.compression)?;
-            return Ok(Self {
-                decompressor,
-                checkpoint: index.checkpoints[0].clone(),
-                target_offset: 0,
-                target_size: 0,
-                state: ReadState::Done,
-                output_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
-                skip_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
-                output_len: 0,
-                output_read: 0,
-                input_buf: Vec::new(),
-                input_pos: 0,
-                uncompressed_pos: 0,
-                eof: false,
-            });
-        }
-
-        let abs_offset = entry.uncompressed_offset + file_offset;
-        let (_, checkpoint) = index.best_checkpoint_for_offset(abs_offset);
-        let decompressor = create_decompressor(index.metadata.compression)?;
-
-        Ok(Self {
-            decompressor,
-            checkpoint: checkpoint.clone(),
-            target_offset: abs_offset,
-            target_size: read_len,
-            state: ReadState::SeekToCheckpoint,
-            output_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
-            skip_buf: vec![0u8; DECOMPRESS_BUF_SIZE],
-            output_len: 0,
-            output_read: 0,
-            input_buf: Vec::new(),
-            input_pos: 0,
-            uncompressed_pos: 0,
-            eof: false,
-        })
+        Ok(Self(StreamReader::new(
+            &index.stream,
+            entry.uncompressed_offset + file_offset,
+            read_len,
+        )?))
     }
 
     /// Drive the state machine forward.
     pub fn step(&mut self) -> EngineRequest {
-        loop {
-            match self.step_once() {
-                Some(request) => return request,
-                None => continue,
-            }
-        }
-    }
-
-    /// One iteration of the read state machine. Returns `None` when there
-    /// is unconsumed input left to keep processing (the caller loops).
-    fn step_once(&mut self) -> Option<EngineRequest> {
-        Some(match &self.state {
-            ReadState::SeekToCheckpoint => {
-                // Restore decompressor from checkpoint
-                if let Err(e) = self.decompressor.restore(&self.checkpoint) {
-                    return Some(EngineRequest::Error(e));
-                }
-
-                // Determine actual start position and skip amount.
-                // All formats now support mid-stream resume via checkpoints.
-                let compressed_start = self.checkpoint.compressed_offset;
-                self.uncompressed_pos = self.checkpoint.uncompressed_offset;
-                let skip = self
-                    .target_offset
-                    .saturating_sub(self.checkpoint.uncompressed_offset);
-
-                self.state = if skip > 0 {
-                    ReadState::NeedInput {
-                        skip_remaining: skip,
-                    }
-                } else if self.target_size > 0 {
-                    ReadState::NeedInputEmitting {
-                        data_remaining: self.target_size,
-                    }
-                } else {
-                    ReadState::Done
-                };
-
-                if compressed_start == 0 {
-                    EngineRequest::NeedInput
-                } else {
-                    EngineRequest::SeekAndRead {
-                        offset: compressed_start,
-                        len: DECOMPRESS_BUF_SIZE,
-                    }
-                }
-            }
-
-            ReadState::NeedInput { skip_remaining } => {
-                let skip = *skip_remaining;
-                if self.eof {
-                    // Even at EOF, try decompressing — the decompressor may
-                    // have internal buffered data (e.g., gzip pending).
-                    self.state = ReadState::DecompressingToTarget {
-                        skip_remaining: skip,
-                    };
-                    return self.decompress_and_skip(skip);
-                }
-                EngineRequest::NeedInput
-            }
-            ReadState::NeedInputEmitting { data_remaining } => {
-                let rem = *data_remaining;
-                if self.eof {
-                    self.state = ReadState::EmittingData {
-                        data_remaining: rem,
-                    };
-                    return self.decompress_and_emit(rem);
-                }
-                EngineRequest::NeedInput
-            }
-
-            ReadState::DecompressingToTarget { skip_remaining } => {
-                let skip_remaining = *skip_remaining;
-                return self.decompress_and_skip(skip_remaining);
-            }
-
-            ReadState::EmittingData { data_remaining } => {
-                let data_remaining = *data_remaining;
-                return self.decompress_and_emit(data_remaining);
-            }
-
-            ReadState::Done => EngineRequest::Done,
-        })
+        self.0.step()
     }
 
     /// Provide compressed data to the engine.
@@ -762,25 +401,7 @@ impl ReadEngine {
     /// or [`EngineRequest::SeekAndRead`]. For `SeekAndRead`, seek to the
     /// requested offset first, then provide the bytes read from that position.
     pub fn provide_data(&mut self, data: &[u8]) {
-        self.input_buf.clear();
-        self.input_buf.extend_from_slice(data);
-        self.input_pos = 0;
-
-        match &self.state {
-            ReadState::NeedInput { skip_remaining } => {
-                let skip = *skip_remaining;
-                self.state = ReadState::DecompressingToTarget {
-                    skip_remaining: skip,
-                };
-            }
-            ReadState::NeedInputEmitting { data_remaining } => {
-                let rem = *data_remaining;
-                self.state = ReadState::EmittingData {
-                    data_remaining: rem,
-                };
-            }
-            _ => {}
-        }
+        self.0.provide_data(data)
     }
 
     /// Signal that the end of the compressed stream has been reached.
@@ -788,187 +409,24 @@ impl ReadEngine {
     /// Call this instead of [`provide_data()`](Self::provide_data) when
     /// the reader returns zero bytes.
     pub fn signal_eof(&mut self) {
-        self.eof = true;
+        self.0.signal_eof()
     }
 
     /// Read decompressed output from the engine.
     /// Returns the number of bytes written to `buf`.
     pub fn read_output(&mut self, buf: &mut [u8]) -> usize {
-        let available = self.output_len - self.output_read;
-        if available == 0 {
-            return 0;
-        }
-        let n = available.min(buf.len());
-        buf[..n].copy_from_slice(&self.output_buf[self.output_read..self.output_read + n]);
-        self.output_read += n;
-        if self.output_read >= self.output_len {
-            self.output_len = 0;
-            self.output_read = 0;
-        }
-        n
+        self.0.read_output(buf)
     }
 
-    fn decompress_and_skip(&mut self, mut skip_remaining: u64) -> Option<EngineRequest> {
-        let input = &self.input_buf[self.input_pos..];
-        let had_input = !input.is_empty();
-        if !had_input && !self.eof {
-            // Don't drive the decompressor with empty input unless the
-            // stream has actually ended; ask the caller for more instead.
-            self.state = ReadState::NeedInput { skip_remaining };
-            return Some(EngineRequest::NeedInput);
-        }
-        match self.decompressor.decompress(input, &mut self.skip_buf) {
-            Ok(result) => {
-                self.input_pos += result.bytes_consumed;
-                let produced = result.bytes_produced as u64;
-                self.uncompressed_pos += produced;
-
-                if produced > 0 && produced <= skip_remaining {
-                    skip_remaining -= produced;
-                    if skip_remaining == 0 {
-                        if self.target_size > 0 {
-                            self.state = ReadState::EmittingData {
-                                data_remaining: self.target_size,
-                            };
-                        } else {
-                            self.state = ReadState::Done;
-                            return Some(EngineRequest::Done);
-                        }
-                    } else {
-                        self.state = ReadState::DecompressingToTarget { skip_remaining };
-                    }
-                } else if produced > skip_remaining {
-                    // Overshot — some of the decompressed data is file data
-                    let file_start = skip_remaining as usize;
-                    let file_bytes = (produced - skip_remaining).min(self.target_size);
-                    let file_bytes = file_bytes as usize;
-
-                    self.output_len = file_bytes;
-                    self.output_read = 0;
-                    self.output_buf[..file_bytes]
-                        .copy_from_slice(&self.skip_buf[file_start..file_start + file_bytes]);
-
-                    let remaining = self.target_size - file_bytes as u64;
-                    if remaining == 0 {
-                        self.state = ReadState::Done;
-                    } else {
-                        self.state = ReadState::EmittingData {
-                            data_remaining: remaining,
-                        };
-                    }
-                    return Some(EngineRequest::OutputReady);
-                }
-                // produced == 0 falls through
-
-                if result.status == DecompressStatus::StreamEnd && had_input {
-                    self.state = ReadState::Done;
-                    return Some(EngineRequest::Done);
-                }
-
-                if self.input_pos >= self.input_buf.len() {
-                    if self.eof {
-                        // Only stop if decompressor made no progress at all.
-                        // It may have internally buffered output to drain.
-                        if result.bytes_consumed == 0 && result.bytes_produced == 0 {
-                            self.state = ReadState::Done;
-                            return Some(EngineRequest::Done);
-                        }
-                        // Keep trying - decompressor may have more buffered output
-                    } else {
-                        match &self.state {
-                            ReadState::DecompressingToTarget { skip_remaining } => {
-                                let s = *skip_remaining;
-                                self.state = ReadState::NeedInput { skip_remaining: s };
-                            }
-                            ReadState::EmittingData { data_remaining } => {
-                                let d = *data_remaining;
-                                self.state = ReadState::NeedInputEmitting { data_remaining: d };
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some(EngineRequest::NeedInput)
-                } else {
-                    // Unconsumed input remains: a stalled decompressor here
-                    // would loop forever, so treat it as malformed data.
-                    if result.bytes_consumed == 0 && result.bytes_produced == 0 {
-                        return Some(EngineRequest::Error(Error::DecompressionError(
-                            "decompressor made no progress with input remaining".into(),
-                        )));
-                    }
-                    None
-                }
-            }
-            Err(e) => Some(EngineRequest::Error(e)),
-        }
+    /// The underlying stream reader, for retargeting with
+    /// [`StreamReader::seek_forward`].
+    pub fn stream_reader(&mut self) -> &mut StreamReader {
+        &mut self.0
     }
 
-    fn decompress_and_emit(&mut self, data_remaining: u64) -> Option<EngineRequest> {
-        let input = &self.input_buf[self.input_pos..];
-
-        let had_input = !input.is_empty();
-        if !had_input && !self.eof {
-            // Don't drive the decompressor with empty input unless the
-            // stream has actually ended; ask the caller for more instead.
-            self.state = ReadState::NeedInputEmitting { data_remaining };
-            return Some(EngineRequest::NeedInput);
-        }
-        let max_output = (data_remaining as usize).min(self.output_buf.len());
-        match self
-            .decompressor
-            .decompress(input, &mut self.output_buf[..max_output])
-        {
-            Ok(result) => {
-                self.input_pos += result.bytes_consumed;
-                self.uncompressed_pos += result.bytes_produced as u64;
-
-                if result.bytes_produced > 0 {
-                    self.output_len = result.bytes_produced;
-                    self.output_read = 0;
-
-                    let remaining = data_remaining - result.bytes_produced as u64;
-                    if remaining == 0 {
-                        self.state = ReadState::Done;
-                    } else {
-                        self.state = ReadState::EmittingData {
-                            data_remaining: remaining,
-                        };
-                    }
-                    return Some(EngineRequest::OutputReady);
-                }
-
-                // No output produced
-                if result.status == DecompressStatus::StreamEnd && had_input {
-                    // Decompressor genuinely reached end of stream
-                    self.state = ReadState::Done;
-                    return Some(EngineRequest::Done);
-                }
-
-                // Need more input
-                if self.input_pos >= self.input_buf.len() {
-                    if self.eof {
-                        if result.bytes_consumed == 0 && result.bytes_produced == 0 {
-                            self.state = ReadState::Done;
-                            return Some(EngineRequest::Done);
-                        }
-                        // Keep trying - decompressor may have more buffered output
-                    } else {
-                        self.state = ReadState::NeedInputEmitting { data_remaining };
-                    }
-                    Some(EngineRequest::NeedInput)
-                } else {
-                    // Unconsumed input remains: a stalled decompressor here
-                    // would loop forever, so treat it as malformed data.
-                    if result.bytes_consumed == 0 && result.bytes_produced == 0 {
-                        return Some(EngineRequest::Error(Error::DecompressionError(
-                            "decompressor made no progress with input remaining".into(),
-                        )));
-                    }
-                    None
-                }
-            }
-            Err(e) => Some(EngineRequest::Error(e)),
-        }
+    /// Unwrap into the stream reader.
+    pub fn into_stream_reader(self) -> StreamReader {
+        self.0
     }
 }
 

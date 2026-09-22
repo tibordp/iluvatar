@@ -12,6 +12,7 @@ use crate::compress::checkpoint::{Checkpoint, CheckpointState, Lzma2FullCheckpoi
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
 use crate::error::{Error, Result};
 
+pub use decoder::{LzmaDecoder, LzmaProperties};
 use lzma2::{Lzma2DecodeStatus, Lzma2Decoder};
 
 /// LZMA2 decompressor implementing the `Decompressor` trait.
@@ -85,9 +86,13 @@ impl Decompressor for Lzma2Decompressor {
         }
     }
 
-    fn checkpoint(&self, compressed_offset: u64, uncompressed_offset: u64) -> Result<Checkpoint> {
+    fn checkpoint(
+        &self,
+        compressed_offset: u64,
+        uncompressed_offset: u64,
+    ) -> Result<Option<Checkpoint>> {
         let state = self.inner.get_state();
-        Ok(Checkpoint {
+        Ok(Some(Checkpoint {
             compressed_offset,
             bit_offset: 0,
             uncompressed_offset,
@@ -98,7 +103,7 @@ impl Decompressor for Lzma2Decompressor {
                 total_out: self.total_out,
                 finished: self.finished,
             }),
-        })
+        }))
     }
 
     fn restore(&mut self, checkpoint: &Checkpoint) -> Result<()> {
@@ -131,6 +136,107 @@ impl Lzma2Decompressor {
         self.total_in = 0;
         self.total_out = 0;
         self.finished = false;
+    }
+}
+
+/// Raw LZMA1 stream decompressor (the `.lzma` payload without its 13-byte
+/// header; 7z's LZMA coder). The properties byte and dictionary size come
+/// from the container. A stream with a known unpacked length may omit the
+/// end marker.
+pub struct LzmaDecompressor {
+    inner: LzmaDecoder,
+    props: LzmaProperties,
+    unpack_size: Option<u64>,
+    finished: bool,
+}
+
+impl LzmaDecompressor {
+    pub fn new(props: LzmaProperties, dict_size: u32, unpack_size: Option<u64>) -> Self {
+        let mut inner = LzmaDecoder::new(props, dict_size);
+        inner.set_unpack_size(unpack_size);
+        Self {
+            inner,
+            props,
+            unpack_size,
+            finished: false,
+        }
+    }
+
+    /// Create from the `.lzma`-style properties byte (`(pb * 5 + lp) * 9 + lc`).
+    pub fn from_props_byte(props: u8, dict_size: u32, unpack_size: Option<u64>) -> Result<Self> {
+        let props = LzmaProperties::from_byte(props).ok_or_else(|| {
+            Error::DecompressionError(format!("invalid LZMA properties byte: {}", props))
+        })?;
+        Ok(Self::new(props, dict_size, unpack_size))
+    }
+}
+
+impl Decompressor for LzmaDecompressor {
+    fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
+        if self.finished {
+            return Ok(DecompressResult {
+                bytes_consumed: 0,
+                bytes_produced: 0,
+                status: DecompressStatus::StreamEnd,
+            });
+        }
+        let result = self.inner.decode(input, output);
+        let status = match result.status {
+            decoder::LzmaDecodeStatus::FinishedWithMark
+            | decoder::LzmaDecodeStatus::FinishedWithoutMark => {
+                self.finished = true;
+                DecompressStatus::StreamEnd
+            }
+            decoder::LzmaDecodeStatus::Continue | decoder::LzmaDecodeStatus::NeedInput => {
+                if input.is_empty() && result.bytes_produced == 0 {
+                    return Err(Error::DecompressionError("truncated LZMA stream".into()));
+                }
+                DecompressStatus::Continue
+            }
+        };
+        Ok(DecompressResult {
+            bytes_consumed: result.bytes_consumed,
+            bytes_produced: result.bytes_produced,
+            status,
+        })
+    }
+
+    fn checkpoint(
+        &self,
+        compressed_offset: u64,
+        uncompressed_offset: u64,
+    ) -> Result<Option<Checkpoint>> {
+        Ok(Some(Checkpoint {
+            compressed_offset,
+            bit_offset: 0,
+            uncompressed_offset,
+            state: CheckpointState::Lzma(crate::compress::checkpoint::LzmaCheckpointState {
+                decoder_state: bincode::serialize(&self.inner)
+                    .map_err(|e| Error::CheckpointError(format!("serialize lzma state: {}", e)))?,
+                finished: self.finished,
+            }),
+        }))
+    }
+
+    fn restore(&mut self, checkpoint: &Checkpoint) -> Result<()> {
+        match &checkpoint.state {
+            CheckpointState::Lzma(state) => {
+                self.inner = bincode::deserialize(&state.decoder_state).map_err(|e| {
+                    Error::CheckpointError(format!("deserialize lzma state: {}", e))
+                })?;
+                self.finished = state.finished;
+                Ok(())
+            }
+            CheckpointState::None => {
+                self.inner = LzmaDecoder::new(self.props, self.inner.dict_size);
+                self.inner.set_unpack_size(self.unpack_size);
+                self.finished = false;
+                Ok(())
+            }
+            _ => Err(Error::CheckpointError(
+                "expected LZMA checkpoint state".into(),
+            )),
+        }
     }
 }
 
@@ -396,6 +502,7 @@ mod tests {
         // Take checkpoint
         let cp = dec
             .checkpoint(offset as u64, all_output.len() as u64)
+            .unwrap()
             .unwrap();
 
         // Continue decompression to verify we get correct output

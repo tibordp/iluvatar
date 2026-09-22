@@ -32,6 +32,71 @@ pub enum CheckpointState {
     Zstd(ZstdFullCheckpointState),
     /// LZMA2: full decompressor state for mid-stream checkpoint.
     Lzma2(Lzma2FullCheckpointState),
+    /// Raw LZMA1: full decoder state.
+    Lzma(LzmaCheckpointState),
+    /// A BCJ or Delta filter: position and the bytes it still holds.
+    Filter(FilterCheckpointState),
+    /// BCJ2: the range coder, contexts and side-stream positions.
+    Bcj2(Bcj2CheckpointState),
+    /// AES-CBC: the previous ciphertext block and any partial block.
+    Aes(AesCheckpointState),
+    /// A codec chain: one checkpoint per stage plus the bytes in flight
+    /// between stages.
+    Chain(ChainCheckpointState),
+}
+
+/// Raw LZMA1 checkpoint: the whole decoder, bincode-serialized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LzmaCheckpointState {
+    pub decoder_state: Vec<u8>,
+    pub finished: bool,
+}
+
+/// Filter checkpoint. `held` are input bytes the filter has taken but not
+/// yet emitted (a possible instruction straddling the chunk end); `pos` is
+/// the stream position of the first held byte.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilterCheckpointState {
+    pub pos: u64,
+    pub held: Vec<u8>,
+    /// Prefix of `held` already converted (output-ready).
+    pub filtered: usize,
+    /// Filter-specific state, bincode-serialized (x86's `prev_mask` and
+    /// `prev_pos`; delta's history ring).
+    pub extra: Vec<u8>,
+    pub finished: bool,
+}
+
+/// BCJ2 checkpoint: the whole coder state, bincode-serialized. The side
+/// streams themselves belong to the codec spec, not the checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bcj2CheckpointState {
+    pub state: Vec<u8>,
+}
+
+/// AES-CBC checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AesCheckpointState {
+    /// Previous ciphertext block (the IV for the next block).
+    pub prev: [u8; 16],
+    /// Partial ciphertext block received but not yet decryptable.
+    pub carry: Vec<u8>,
+    /// Decrypted bytes not yet handed out.
+    pub staged: Vec<u8>,
+    /// Plaintext bytes emitted so far (for the length limit).
+    pub produced: u64,
+    pub finished: bool,
+}
+
+/// Chain checkpoint: stage `i` resumes from `stages[i]` with `pending[i]`
+/// (empty for the last stage) already sitting in the buffer that feeds
+/// stage `i + 1`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainCheckpointState {
+    pub stages: Vec<Checkpoint>,
+    pub pending: Vec<Vec<u8>>,
+    /// Which stages have reported end of stream.
+    pub ended: Vec<bool>,
 }
 
 /// Gzip checkpoint: deflate block boundary state plus 32 KiB sliding window.
@@ -194,6 +259,15 @@ impl CheckpointState {
                     + 32
             }
             CheckpointState::Lzma2(s) => s.decoder_state.len() + 24,
+            CheckpointState::Lzma(s) => s.decoder_state.len() + 8,
+            CheckpointState::Filter(s) => s.held.len() + s.extra.len() + 16,
+            CheckpointState::Bcj2(s) => s.state.len() + 8,
+            CheckpointState::Aes(s) => s.carry.len() + s.staged.len() + 40,
+            CheckpointState::Chain(s) => {
+                s.stages.iter().map(|c| c.estimated_size()).sum::<usize>()
+                    + s.pending.iter().map(|p| p.len() + 8).sum::<usize>()
+                    + s.ended.len()
+            }
         }
     }
 }

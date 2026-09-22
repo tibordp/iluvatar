@@ -39,5 +39,7 @@
 //! ```
 
 mod reader;
+mod stream;
 
 pub use reader::{Archive, EntryReader};
+pub use stream::Stream;

@@ -101,17 +101,16 @@ impl RangeDecoder {
 
         let v = *prob as u32;
         let bound = (self.range >> K_NUM_BIT_MODEL_TOTAL_BITS) * v;
-        let symbol;
-        if self.code < bound {
+        let symbol = if self.code < bound {
             *prob = (v + ((K_BIT_MODEL_TOTAL - v) >> K_NUM_MOVE_BITS)) as u16;
             self.range = bound;
-            symbol = 0;
+            0
         } else {
             *prob = (v - (v >> K_NUM_MOVE_BITS)) as u16;
             self.code -= bound;
             self.range -= bound;
-            symbol = 1;
-        }
+            1
+        };
         Ok((symbol, consumed))
     }
 

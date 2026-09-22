@@ -2,11 +2,12 @@ use crate::archive::ArchiveFormat;
 use crate::compress::checkpoint::Checkpoint;
 use crate::compress::CompressionFormat;
 use crate::index::entry::IndexEntry;
+use crate::stream::StreamIndex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Current index format version.
-pub(crate) const INDEX_VERSION: u32 = 4;
+pub(crate) const INDEX_VERSION: u32 = 5;
 
 /// Metadata about the indexed archive.
 ///
@@ -74,13 +75,18 @@ fn default_archive_format() -> ArchiveFormat {
 pub struct ArchiveIndex {
     /// Archive metadata (compression format, size, completeness).
     pub metadata: IndexMetadata,
-    /// Sorted list of decompressor checkpoints by uncompressed offset.
-    pub checkpoints: Vec<Checkpoint>,
+    /// The compressed stream's checkpoint table.
+    pub stream: StreamIndex,
     /// File entries keyed by path.
     pub entries: HashMap<String, IndexEntry>,
 }
 
 impl ArchiveIndex {
+    /// Decompressor checkpoints, sorted by uncompressed offset.
+    pub fn checkpoints(&self) -> &[Checkpoint] {
+        &self.stream.checkpoints
+    }
+
     /// Look up a file by its path.
     ///
     /// Handles trailing-slash ambiguity: `get("dir")` will find an entry
@@ -122,7 +128,7 @@ impl ArchiveIndex {
     ///
     /// Returns the nearest checkpoint at or before the entry's data offset.
     pub fn checkpoint_for(&self, entry: &IndexEntry) -> &Checkpoint {
-        &self.checkpoints[entry.checkpoint_index]
+        &self.stream.checkpoints[entry.checkpoint_index]
     }
 
     /// Find the best checkpoint for an arbitrary uncompressed offset.
@@ -132,11 +138,7 @@ impl ArchiveIndex {
     /// efficient range reads within large files by picking a checkpoint
     /// close to the target byte rather than one before the file's start.
     pub fn best_checkpoint_for_offset(&self, uncompressed_offset: u64) -> (usize, &Checkpoint) {
-        let idx = self
-            .checkpoints
-            .partition_point(|cp| cp.uncompressed_offset <= uncompressed_offset)
-            .saturating_sub(1);
-        (idx, &self.checkpoints[idx])
+        self.stream.best_checkpoint_for_offset(uncompressed_offset)
     }
 
     /// Returns the number of file entries in the index.
@@ -154,7 +156,6 @@ impl ArchiveIndex {
 mod tests {
     use super::*;
     use crate::archive::EntryType;
-    use crate::compress::checkpoint::CheckpointState;
 
     fn make_test_index() -> ArchiveIndex {
         let mut entries = HashMap::new();
@@ -213,12 +214,7 @@ mod tests {
                 uncompressed_size: 5000,
                 complete: true,
             },
-            checkpoints: vec![Checkpoint {
-                compressed_offset: 0,
-                bit_offset: 0,
-                uncompressed_offset: 0,
-                state: CheckpointState::None,
-            }],
+            stream: StreamIndex::new(CompressionFormat::Gzip.into(), Some(1000)),
             entries,
         }
     }

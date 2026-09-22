@@ -345,6 +345,11 @@ impl Decompressor for Bzip2Decompressor {
             if final_status == DecompressStatus::StreamEnd {
                 break;
             }
+            // A finished segment ends on a block magic: return so the
+            // boundary can be checkpointed before output moves past it.
+            if seg_idx < boundary_positions.len() {
+                break;
+            }
         }
 
         Ok(DecompressResult {
@@ -354,26 +359,40 @@ impl Decompressor for Bzip2Decompressor {
         })
     }
 
-    fn checkpoint(&self, _compressed_offset: u64, _uncompressed_offset: u64) -> Result<Checkpoint> {
-        // Return the last block boundary (like gzip/xz pattern).
+    fn checkpoint(
+        &self,
+        compressed_offset: u64,
+        uncompressed_offset: u64,
+    ) -> Result<Option<Checkpoint>> {
+        // Blocks resume independently; `decompress` returns at each block
+        // magic, so a boundary is "now" when output has not moved past it.
+        // The magic's byte lands inside the consumed input, so the boundary
+        // is at or a byte before the caller's compressed count.
         if let Some(ref boundary) = self.last_block_boundary {
-            Ok(Checkpoint {
+            if boundary.uncompressed_offset != uncompressed_offset
+                || boundary.byte_offset > compressed_offset
+                || compressed_offset - boundary.byte_offset > 8
+            {
+                return Ok(None);
+            }
+            Ok(Some(Checkpoint {
                 compressed_offset: boundary.byte_offset,
                 bit_offset: boundary.bit_offset,
-                uncompressed_offset: boundary.uncompressed_offset,
+                uncompressed_offset,
                 state: CheckpointState::Bzip2(Bzip2CheckpointState {
                     block_number: boundary.block_index,
                     stream_header: vec![b'B', b'Z', b'h', self.stream_level],
                 }),
-            })
-        } else {
-            // No block boundary yet — fall back to stream start.
-            Ok(Checkpoint {
+            }))
+        } else if compressed_offset == 0 && uncompressed_offset == 0 {
+            Ok(Some(Checkpoint {
                 compressed_offset: 0,
                 bit_offset: 0,
                 uncompressed_offset: 0,
                 state: CheckpointState::None,
-            })
+            }))
+        } else {
+            Ok(None)
         }
     }
 
@@ -655,10 +674,10 @@ mod tests {
         let mut output = vec![0u8; 256];
         let _result = dec.decompress(&compressed, &mut output).unwrap();
 
-        let cp = dec.checkpoint(100, 200).unwrap();
-        // Single-block data — no mid-stream boundary, falls back to start
-        assert_eq!(cp.compressed_offset, 0);
-        assert_eq!(cp.uncompressed_offset, 0);
+        // Single-block data — no mid-stream boundary, so no checkpoint
+        // except at the very start.
+        assert!(dec.checkpoint(100, 200).unwrap().is_none());
+        assert!(dec.checkpoint(0, 0).unwrap().is_some());
     }
 
     #[test]
@@ -760,6 +779,7 @@ mod tests {
         let mut dec = Bzip2Decompressor::new();
         let mut all_output = Vec::new();
         let mut offset = 0;
+        let mut saved = None;
         loop {
             let end = (offset + 4096).min(compressed.len());
             let input = if offset < compressed.len() {
@@ -771,6 +791,16 @@ mod tests {
             let result = dec.decompress(input, &mut out).unwrap();
             all_output.extend_from_slice(&out[..result.bytes_produced]);
             offset += result.bytes_consumed;
+            if saved.is_none() {
+                if let Some(cp) = dec
+                    .checkpoint(offset as u64, all_output.len() as u64)
+                    .unwrap()
+                {
+                    if cp.compressed_offset > 0 {
+                        saved = Some(cp);
+                    }
+                }
+            }
             if result.status == DecompressStatus::StreamEnd
                 || (result.bytes_consumed == 0
                     && result.bytes_produced == 0
@@ -781,11 +811,10 @@ mod tests {
         }
         assert_eq!(all_output, original);
 
-        let cp = dec.checkpoint(0, 0).unwrap();
-        if cp.compressed_offset == 0 {
+        let Some(cp) = saved else {
             // Single block — no mid-stream checkpoint possible
             return;
-        }
+        };
 
         // Restore and decompress from checkpoint
         let mut dec2 = Bzip2Decompressor::new();
@@ -940,6 +969,7 @@ mod tests {
         let mut dec = Bzip2Decompressor::new();
         let mut all_output = Vec::new();
         let mut offset = 0;
+        let mut saved = None;
         loop {
             let end = (offset + 4096).min(compressed.len());
             let input = if offset < compressed.len() {
@@ -951,6 +981,16 @@ mod tests {
             let result = dec.decompress(input, &mut out).unwrap();
             all_output.extend_from_slice(&out[..result.bytes_produced]);
             offset += result.bytes_consumed;
+            if saved.is_none() {
+                if let Some(cp) = dec
+                    .checkpoint(offset as u64, all_output.len() as u64)
+                    .unwrap()
+                {
+                    if cp.compressed_offset > 0 {
+                        saved = Some(cp);
+                    }
+                }
+            }
             if result.status == DecompressStatus::StreamEnd
                 || (result.bytes_consumed == 0
                     && result.bytes_produced == 0
@@ -961,10 +1001,9 @@ mod tests {
         }
         assert_eq!(all_output, original);
 
-        let cp = dec.checkpoint(0, 0).unwrap();
-        if cp.compressed_offset == 0 {
+        let Some(cp) = saved else {
             return; // single block, nothing to test
-        }
+        };
 
         // The tracked offset must NOT equal the formula-based one
         // (RLE changes byte counts), unless they happen to coincide.

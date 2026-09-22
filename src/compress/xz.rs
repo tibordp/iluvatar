@@ -445,9 +445,13 @@ impl Decompressor for XzDecompressor {
         })
     }
 
-    fn checkpoint(&self, compressed_offset: u64, uncompressed_offset: u64) -> Result<Checkpoint> {
+    fn checkpoint(
+        &self,
+        compressed_offset: u64,
+        uncompressed_offset: u64,
+    ) -> Result<Option<Checkpoint>> {
         let lzma2_checkpoint = self.lzma2.as_ref().and_then(|dec| {
-            dec.checkpoint(0, 0).ok().and_then(|cp| {
+            dec.checkpoint(0, 0).ok().flatten().and_then(|cp| {
                 if let CheckpointState::Lzma2(state) = cp.state {
                     Some(state)
                 } else {
@@ -467,12 +471,12 @@ impl Decompressor for XzDecompressor {
             staged_output: self.staged_output[self.staged_pos..].to_vec(),
         };
 
-        Ok(Checkpoint {
+        Ok(Some(Checkpoint {
             compressed_offset,
             bit_offset: 0,
             uncompressed_offset,
             state: CheckpointState::Xz(state),
-        })
+        }))
     }
 
     fn restore(&mut self, checkpoint: &Checkpoint) -> Result<()> {
@@ -672,10 +676,9 @@ mod tests {
             offset += result.bytes_consumed;
 
             if all_output.len() >= 10000 && checkpoint_saved.is_none() {
-                checkpoint_saved = Some(
-                    dec.checkpoint(offset as u64, all_output.len() as u64)
-                        .unwrap(),
-                );
+                checkpoint_saved = dec
+                    .checkpoint(offset as u64, all_output.len() as u64)
+                    .unwrap();
             }
 
             if result.status == DecompressStatus::StreamEnd {
@@ -857,10 +860,9 @@ mod tests {
             offset += result.bytes_consumed;
 
             if all_output.len() >= 30_000 && checkpoint_saved.is_none() {
-                checkpoint_saved = Some(
-                    dec.checkpoint(offset as u64, all_output.len() as u64)
-                        .unwrap(),
-                );
+                checkpoint_saved = dec
+                    .checkpoint(offset as u64, all_output.len() as u64)
+                    .unwrap();
                 output_at_checkpoint = all_output.len();
             }
 

@@ -9,6 +9,7 @@ use crate::engine::state_machine::{IndexingEngine, ReadEngine};
 use crate::error::{Error, Result};
 use crate::index::entry::IndexEntry;
 use crate::index::store::ArchiveIndex;
+use crate::stream::StreamReader;
 use std::io::{Read, Seek, SeekFrom};
 
 /// Default read buffer size.
@@ -424,12 +425,10 @@ impl<R: Read + Seek> Archive<R> {
     pub fn open(&mut self, path: &str) -> Result<EntryReader<'_, R>> {
         self.reader.seek(SeekFrom::Start(0))?;
         let engine = ReadEngine::new(&self.index, path)?;
-        Ok(EntryReader {
-            reader: &mut self.reader,
-            engine,
-            buf: vec![0u8; BUF_SIZE],
-            done: false,
-        })
+        Ok(EntryReader::over(
+            &mut self.reader,
+            engine.into_stream_reader(),
+        ))
     }
 }
 
@@ -512,9 +511,20 @@ fn drive_indexing<R: Read, S: CheckpointStrategy, F: FnMut(&IndexProgress) -> bo
 /// ```
 pub struct EntryReader<'a, R> {
     reader: &'a mut R,
-    engine: ReadEngine,
+    engine: StreamReader,
     buf: Vec<u8>,
     done: bool,
+}
+
+impl<'a, R> EntryReader<'a, R> {
+    pub(crate) fn over(reader: &'a mut R, engine: StreamReader) -> Self {
+        Self {
+            reader,
+            engine,
+            buf: vec![0u8; BUF_SIZE],
+            done: false,
+        }
+    }
 }
 
 impl<R: Read + Seek> std::io::Read for EntryReader<'_, R> {

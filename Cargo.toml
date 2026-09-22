@@ -1,10 +1,10 @@
 [package]
 name = "iluvatar"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.73"
 authors = ["Tibor Djurica Potpara"]
-description = "Efficient random access to compressed tar and cpio archives via indexing and decompression checkpoints"
+description = "Random access into compressed streams and tar/cpio archives via indexing and decompression checkpoints"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tibordp/iluvatar"
 keywords = ["tar", "cpio", "archive", "compression", "random-access"]
@@ -15,6 +15,7 @@ exclude = ["tests/vectors/", "reference/"]
 [dependencies]
 miniz_oxide = { version = "0.9", features = ["block-boundary"], optional = true }
 bzip2 = { version = "0.5", optional = true }
+aes = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["io-util"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -26,16 +27,18 @@ tempfile = "3"
 flate2 = "1"
 bzip2 = "0.5"
 xz2 = "0.1"
+lzma-sys = "0.1"
 zstd = "0.13"
 tar = "0.4"
 tokio = { version = "1", features = ["rt", "macros", "io-util", "fs", "io-std"] }
 
 [features]
-default = ["gzip", "bz2", "xz", "zstandard"]
+default = ["gzip", "bz2", "xz", "zstandard", "aes"]
 gzip = ["dep:miniz_oxide"]
 bz2 = ["dep:bzip2"]
 xz = []
 zstandard = []
+aes = ["dep:aes"]
 tokio = ["dep:tokio"]
 cli = ["dep:clap"]
 

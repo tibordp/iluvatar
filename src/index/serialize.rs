@@ -73,16 +73,14 @@ impl ArchiveIndex {
 
         // Consistency checks so a corrupt/crafted index cannot cause panics
         // downstream (checkpoint lookups index into `checkpoints` directly).
-        if index.checkpoints.is_empty() {
-            return Err(Error::IndexError("index contains no checkpoints".into()));
-        }
+        index.stream.validate()?;
         for entry in index.entries.values() {
-            if entry.checkpoint_index >= index.checkpoints.len() {
+            if entry.checkpoint_index >= index.stream.checkpoints.len() {
                 return Err(Error::IndexError(format!(
                     "entry '{}' references checkpoint {} of {}",
                     entry.path,
                     entry.checkpoint_index,
-                    index.checkpoints.len()
+                    index.stream.checkpoints.len()
                 )));
             }
         }
@@ -99,6 +97,7 @@ mod tests {
     use crate::compress::CompressionFormat;
     use crate::index::entry::IndexEntry;
     use crate::index::store::IndexMetadata;
+    use crate::stream::StreamIndex;
     use std::collections::HashMap;
 
     fn make_test_index() -> ArchiveIndex {
@@ -128,14 +127,9 @@ mod tests {
                 uncompressed_size: 10000,
                 complete: true,
             },
-            checkpoints: vec![
-                Checkpoint {
-                    compressed_offset: 0,
-                    bit_offset: 0,
-                    uncompressed_offset: 0,
-                    state: CheckpointState::None,
-                },
-                Checkpoint {
+            stream: {
+                let mut stream = StreamIndex::new(CompressionFormat::Gzip.into(), Some(5000));
+                stream.checkpoints.push(Checkpoint {
                     compressed_offset: 2500,
                     bit_offset: 0,
                     uncompressed_offset: 5000,
@@ -144,8 +138,9 @@ mod tests {
                         block_state: None,
                         header_size: 10,
                     }),
-                },
-            ],
+                });
+                stream
+            },
             entries,
         }
     }
@@ -163,7 +158,7 @@ mod tests {
             restored.metadata.uncompressed_size,
             index.metadata.uncompressed_size
         );
-        assert_eq!(restored.checkpoints.len(), 2);
+        assert_eq!(restored.checkpoints().len(), 2);
         assert_eq!(restored.entries.len(), 1);
 
         let entry = restored.get("test.txt").unwrap();
@@ -202,7 +197,7 @@ mod tests {
     #[test]
     fn test_empty_checkpoints_rejected() {
         let mut index = make_test_index();
-        index.checkpoints.clear();
+        index.stream.checkpoints.clear();
         index.entries.clear(); // keep entry refs valid
         let bytes = index.to_bytes().unwrap();
         assert!(ArchiveIndex::from_bytes(&bytes).is_err());

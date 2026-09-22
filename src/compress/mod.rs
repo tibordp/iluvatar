@@ -1,37 +1,43 @@
-//! Decompressor implementations and compression format detection.
+//! Decoding stages and compression format detection.
 //!
-//! Each supported compression format has its own submodule implementing
-//! a `Decompressor` trait — a sans-I/O interface that consumes compressed
-//! bytes and produces decompressed output, with support for checkpointing
-//! and restoring internal state.
+//! Every codec implements [`Decompressor`](decompressor::Decompressor): a
+//! sans-I/O interface that consumes compressed bytes, produces decompressed
+//! output, and can checkpoint and restore its internal state. Stages compose
+//! into a [`ChainDecompressor`](chain::ChainDecompressor); a
+//! [`CodecSpec`](codec::CodecSpec) names a stream's stages and builds the
+//! decompressor for it.
 //!
-//! The xz and zstd decompressors are built-in rather than wrapping C
+//! The xz, LZMA and zstd decoders are built in rather than wrapping C
 //! libraries, because checkpoint/resume requires serializing the full
-//! decompressor state, which C library wrappers don't expose.
+//! decoder state, which C library wrappers don't expose.
 
+pub mod bcj2;
+pub mod chain;
 pub mod checkpoint;
-#[doc(hidden)]
+pub mod codec;
 pub mod decompressor;
 pub(crate) mod detect;
+pub mod filter;
+
+#[cfg(feature = "aes")]
+pub mod aes;
 
 #[cfg(feature = "gzip")]
-pub(crate) mod gzip;
+pub mod gzip;
 
 #[cfg(feature = "bz2")]
-pub(crate) mod bzip2;
+pub mod bzip2;
 
 #[cfg(feature = "xz")]
-pub(crate) mod lzma;
+pub mod lzma;
 
 #[cfg(feature = "xz")]
-#[doc(hidden)]
 pub mod xz;
 
 #[cfg(feature = "zstandard")]
-#[doc(hidden)]
 pub mod zstd_dec;
 
-pub(crate) mod none;
+pub mod none;
 
 use serde::{Deserialize, Serialize};
 

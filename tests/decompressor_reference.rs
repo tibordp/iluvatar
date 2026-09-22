@@ -294,9 +294,9 @@ fn test_zstd_checkpoint_range_reads() {
 
     // Verify we got multiple checkpoints
     assert!(
-        index.checkpoints.len() > 1,
+        index.checkpoints().len() > 1,
         "expected multiple checkpoints, got {}",
-        index.checkpoints.len()
+        index.checkpoints().len()
     );
 
     // Read full file
@@ -413,9 +413,9 @@ fn test_xz_checkpoint_range_reads() {
     let index = index_in_memory_chunked(&compressed, CompressionFormat::Xz, 8192, 32_768);
 
     assert!(
-        index.checkpoints.len() > 1,
+        index.checkpoints().len() > 1,
         "expected multiple checkpoints, got {}",
-        index.checkpoints.len()
+        index.checkpoints().len()
     );
 
     let full = read_in_memory(&compressed, &index, "big.bin");
@@ -452,9 +452,9 @@ fn test_xz_checkpoint_highly_compressible() {
 
     let index = index_in_memory_chunked(&compressed, CompressionFormat::Xz, 8192, 65_536);
     assert!(
-        index.checkpoints.len() > 1,
+        index.checkpoints().len() > 1,
         "expected multiple checkpoints, got {}",
-        index.checkpoints.len()
+        index.checkpoints().len()
     );
 
     let full = read_in_memory(&compressed, &index, "zeros.bin");

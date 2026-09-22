@@ -51,6 +51,8 @@ pub struct GzipDecompressor {
 
     // Last deflate block boundary for checkpointing
     last_boundary: Option<SavedBoundary>,
+    /// Raw deflate without gzip framing; `reset` must not expect a header.
+    raw: bool,
 }
 
 struct SavedBoundary {
@@ -84,7 +86,16 @@ impl GzipDecompressor {
             deflate_in: 0,
             total_out: 0,
             last_boundary: None,
+            raw: false,
         }
+    }
+
+    /// Raw deflate: no gzip framing (zip, 7z).
+    pub fn new_raw() -> Self {
+        let mut d = Self::new();
+        d.header_state = GzipHeaderState::Decompressing;
+        d.raw = true;
+        d
     }
 
     /// Try to parse the gzip header from header_buf.
@@ -370,25 +381,42 @@ impl Decompressor for GzipDecompressor {
         }
     }
 
-    fn checkpoint(&self, _compressed_offset: u64, _uncompressed_offset: u64) -> Result<Checkpoint> {
+    fn checkpoint(
+        &self,
+        compressed_offset: u64,
+        uncompressed_offset: u64,
+    ) -> Result<Option<Checkpoint>> {
+        // Deflate resumes only at block boundaries, and inflate stops on
+        // each one, so a boundary is "now" exactly when nothing has been
+        // produced since it.
+        if self.stage_pos < self.stage.len() {
+            return Ok(None);
+        }
         if let Some(ref boundary) = self.last_boundary {
-            Ok(Checkpoint {
-                compressed_offset: boundary.compressed_offset,
-                uncompressed_offset: boundary.uncompressed_offset,
+            if boundary.uncompressed_offset != uncompressed_offset
+                || boundary.compressed_offset != compressed_offset
+            {
+                return Ok(None);
+            }
+            Ok(Some(Checkpoint {
+                compressed_offset,
+                uncompressed_offset,
                 bit_offset: 0,
                 state: CheckpointState::Gzip(GzipCheckpointState {
                     window: boundary.window.clone(),
                     block_state: Some(boundary.block_state.clone()),
                     header_size: self.header_size,
                 }),
-            })
-        } else {
-            Ok(Checkpoint {
+            }))
+        } else if compressed_offset == 0 && uncompressed_offset == 0 {
+            Ok(Some(Checkpoint {
                 compressed_offset: 0,
                 bit_offset: 0,
                 uncompressed_offset: 0,
                 state: CheckpointState::None,
-            })
+            }))
+        } else {
+            Ok(None)
         }
     }
 
@@ -444,7 +472,11 @@ impl GzipDecompressor {
         self.finished = false;
         self.stage.clear();
         self.stage_pos = 0;
-        self.header_state = GzipHeaderState::ReadingFixedHeader;
+        self.header_state = if self.raw {
+            GzipHeaderState::Decompressing
+        } else {
+            GzipHeaderState::ReadingFixedHeader
+        };
         self.header_buf.clear();
         self.header_size = 0;
         self.deflate_in = 0;
@@ -573,7 +605,7 @@ mod tests {
         assert_eq!(&output1, &original[..]);
 
         let mut dec = GzipDecompressor::new();
-        let cp = dec.checkpoint(0, 0).unwrap();
+        let cp = dec.checkpoint(0, 0).unwrap().unwrap();
         dec.restore(&cp).unwrap();
 
         let output2 = full_decompress(&compressed, compressed.len());
@@ -668,6 +700,7 @@ mod tests {
         let mut dec = GzipDecompressor::new();
         let mut all_output = Vec::new();
         let mut off = 0;
+        let mut saved = None;
         loop {
             let end = (off + 4096).min(compressed.len());
             let input = if off < compressed.len() {
@@ -679,6 +712,13 @@ mod tests {
             let result = dec.decompress(input, &mut out).unwrap();
             all_output.extend_from_slice(&out[..result.bytes_produced]);
             off += result.bytes_consumed;
+            if saved.is_none() && all_output.len() > 100_000 {
+                if let Some(cp) = dec.checkpoint(off as u64, all_output.len() as u64).unwrap() {
+                    if cp.compressed_offset > 0 {
+                        saved = Some(cp);
+                    }
+                }
+            }
             if result.status == DecompressStatus::StreamEnd
                 || (result.bytes_consumed == 0
                     && result.bytes_produced == 0
@@ -689,7 +729,7 @@ mod tests {
         }
         assert_eq!(all_output, original);
 
-        let cp = dec.checkpoint(0, 0).unwrap();
+        let cp = saved.expect("a block boundary after 100 KiB of random data");
         if let CheckpointState::Gzip(ref state) = cp.state {
             if state.block_state.is_some() {
                 assert!(cp.compressed_offset > 0);

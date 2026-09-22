@@ -1,14 +1,14 @@
 use crate::archive::{ArchiveEntry, ArchiveFormat};
-use crate::compress::checkpoint::Checkpoint;
 use crate::compress::CompressionFormat;
 use crate::index::entry::IndexEntry;
 use crate::index::store::{ArchiveIndex, IndexMetadata, INDEX_VERSION};
+use crate::stream::StreamIndex;
 use std::collections::HashMap;
 
-/// Accumulates entries and checkpoints during the indexing pass.
+/// Accumulates entries during the indexing pass; the checkpoints come from
+/// the stream indexer when the index is assembled.
 pub struct IndexBuilder {
     entries: HashMap<String, IndexEntry>,
-    checkpoints: Vec<Checkpoint>,
     compression: CompressionFormat,
     archive_format: ArchiveFormat,
     archive_size: u64,
@@ -24,7 +24,6 @@ impl IndexBuilder {
     ) -> Self {
         Self {
             entries: HashMap::new(),
-            checkpoints: Vec::new(),
             compression,
             archive_format,
             archive_size,
@@ -32,18 +31,13 @@ impl IndexBuilder {
         }
     }
 
+    /// Record the detected container format.
+    pub fn set_archive_format(&mut self, format: ArchiveFormat) {
+        self.archive_format = format;
+    }
+
     /// Add an archive entry to the index.
-    ///
-    /// The entry is associated with the latest checkpoint whose uncompressed
-    /// offset does not exceed the entry's data offset — a later checkpoint
-    /// (e.g. one taken at the end of the decompressed chunk in which this
-    /// entry was discovered) cannot be used to read the entry.
     pub fn add_entry(&mut self, entry: ArchiveEntry) {
-        let checkpoint_index = self
-            .checkpoints
-            .iter()
-            .rposition(|cp| cp.uncompressed_offset <= entry.data_offset)
-            .unwrap_or(0);
         self.last_entry_path = Some(entry.path.clone());
         let index_entry = IndexEntry {
             path: entry.path.clone(),
@@ -55,29 +49,14 @@ impl IndexBuilder {
             mtime: entry.mtime,
             link_target: entry.link_target,
             uncompressed_offset: entry.data_offset,
-            checkpoint_index,
+            checkpoint_index: 0,
         };
         self.entries.insert(entry.path, index_entry);
-    }
-
-    /// Add a decompressor checkpoint.
-    pub fn add_checkpoint(&mut self, checkpoint: Checkpoint) {
-        self.checkpoints.push(checkpoint);
-    }
-
-    /// Number of checkpoints added so far.
-    pub fn checkpoint_count(&self) -> usize {
-        self.checkpoints.len()
     }
 
     /// Number of entries added so far.
     pub fn entry_count(&self) -> usize {
         self.entries.len()
-    }
-
-    /// Total compressed archive size.
-    pub fn archive_size(&self) -> u64 {
-        self.archive_size
     }
 
     /// Path of the most recently added entry, if any.
@@ -88,51 +67,58 @@ impl IndexBuilder {
     /// Clone the current state into a usable partial `ArchiveIndex`.
     ///
     /// The engine continues to be usable for further indexing.
-    pub fn snapshot(&self, uncompressed_size: u64) -> ArchiveIndex {
-        ArchiveIndex {
-            metadata: IndexMetadata {
-                version: INDEX_VERSION,
-                compression: self.compression,
-                archive_format: self.archive_format,
-                archive_size: self.archive_size,
-                uncompressed_size,
-                complete: false,
-            },
-            checkpoints: self.checkpoints.clone(),
-            entries: self.entries.clone(),
-        }
+    pub fn snapshot(&self, stream: StreamIndex) -> ArchiveIndex {
+        assemble(
+            self.entries.clone(),
+            self.compression,
+            self.archive_format,
+            self.archive_size,
+            stream,
+            false,
+        )
     }
 
-    /// Consume the builder into a partial `ArchiveIndex`.
-    pub fn finish_partial(self, uncompressed_size: u64) -> ArchiveIndex {
-        ArchiveIndex {
-            metadata: IndexMetadata {
-                version: INDEX_VERSION,
-                compression: self.compression,
-                archive_format: self.archive_format,
-                archive_size: self.archive_size,
-                uncompressed_size,
-                complete: false,
-            },
-            checkpoints: self.checkpoints,
-            entries: self.entries,
-        }
+    /// Consume the builder into an `ArchiveIndex`; `complete` records
+    /// whether the whole archive was seen.
+    pub fn finish(self, stream: StreamIndex, complete: bool) -> ArchiveIndex {
+        assemble(
+            self.entries,
+            self.compression,
+            self.archive_format,
+            self.archive_size,
+            stream,
+            complete,
+        )
     }
+}
 
-    /// Consume the builder and produce a complete `ArchiveIndex`.
-    pub fn finish(self, uncompressed_size: u64) -> ArchiveIndex {
-        ArchiveIndex {
-            metadata: IndexMetadata {
-                version: INDEX_VERSION,
-                compression: self.compression,
-                archive_format: self.archive_format,
-                archive_size: self.archive_size,
-                uncompressed_size,
-                complete: true,
-            },
-            checkpoints: self.checkpoints,
-            entries: self.entries,
-        }
+/// Associate every entry with the latest checkpoint at or before its data
+/// — a later checkpoint (one taken at the end of the chunk the entry was
+/// discovered in) cannot be used to read it.
+fn assemble(
+    mut entries: HashMap<String, IndexEntry>,
+    compression: CompressionFormat,
+    archive_format: ArchiveFormat,
+    archive_size: u64,
+    stream: StreamIndex,
+    complete: bool,
+) -> ArchiveIndex {
+    for entry in entries.values_mut() {
+        entry.checkpoint_index = stream
+            .best_checkpoint_for_offset(entry.uncompressed_offset)
+            .0;
+    }
+    ArchiveIndex {
+        metadata: IndexMetadata {
+            version: INDEX_VERSION,
+            compression,
+            archive_format,
+            archive_size,
+            uncompressed_size: stream.indexed_to,
+            complete,
+        },
+        stream,
+        entries,
     }
 }
 
@@ -140,7 +126,7 @@ impl IndexBuilder {
 mod tests {
     use super::*;
     use crate::archive::EntryType;
-    use crate::compress::checkpoint::CheckpointState;
+    use crate::compress::checkpoint::{Checkpoint, CheckpointState};
 
     fn make_entry(path: &str, size: u64, data_offset: u64) -> ArchiveEntry {
         ArchiveEntry {
@@ -156,25 +142,29 @@ mod tests {
         }
     }
 
+    fn stream(checkpoints: &[(u64, u64)], indexed_to: u64) -> StreamIndex {
+        let mut s = StreamIndex::new(CompressionFormat::Gzip.into(), Some(1000));
+        for &(c, u) in &checkpoints[1..] {
+            s.checkpoints.push(Checkpoint {
+                compressed_offset: c,
+                bit_offset: 0,
+                uncompressed_offset: u,
+                state: CheckpointState::None,
+            });
+        }
+        s.indexed_to = indexed_to;
+        s
+    }
+
     #[test]
     fn test_build_index() {
         let mut builder = IndexBuilder::new(CompressionFormat::Gzip, ArchiveFormat::Tar, 1000);
-
-        builder.add_checkpoint(Checkpoint {
-            compressed_offset: 0,
-            bit_offset: 0,
-            uncompressed_offset: 0,
-            state: CheckpointState::None,
-        });
-
         builder.add_entry(make_entry("test.txt", 100, 512));
-
-        assert_eq!(builder.checkpoint_count(), 1);
         assert_eq!(builder.entry_count(), 1);
 
-        let index = builder.finish(2048);
+        let index = builder.finish(stream(&[(0, 0)], 2048), true);
         assert_eq!(index.entries.len(), 1);
-        assert_eq!(index.checkpoints.len(), 1);
+        assert_eq!(index.checkpoints().len(), 1);
         assert_eq!(index.metadata.uncompressed_size, 2048);
         assert_eq!(index.metadata.compression, CompressionFormat::Gzip);
         assert!(index.metadata.complete);
@@ -183,17 +173,9 @@ mod tests {
     #[test]
     fn test_snapshot() {
         let mut builder = IndexBuilder::new(CompressionFormat::Gzip, ArchiveFormat::Tar, 5000);
-
-        builder.add_checkpoint(Checkpoint {
-            compressed_offset: 0,
-            bit_offset: 0,
-            uncompressed_offset: 0,
-            state: CheckpointState::None,
-        });
-
         builder.add_entry(make_entry("a.txt", 100, 512));
 
-        let snap = builder.snapshot(1024);
+        let snap = builder.snapshot(stream(&[(0, 0)], 1024));
         assert_eq!(snap.entries.len(), 1);
         assert!(!snap.metadata.complete);
         assert!(snap.get("a.txt").is_some());
@@ -202,7 +184,7 @@ mod tests {
         builder.add_entry(make_entry("b.txt", 200, 2048));
         assert_eq!(builder.entry_count(), 2);
 
-        let final_index = builder.finish(4096);
+        let final_index = builder.finish(stream(&[(0, 0)], 4096), true);
         assert_eq!(final_index.entries.len(), 2);
         assert!(final_index.metadata.complete);
     }
@@ -222,15 +204,9 @@ mod tests {
     #[test]
     fn test_finish_partial() {
         let mut builder = IndexBuilder::new(CompressionFormat::Gzip, ArchiveFormat::Tar, 1000);
-        builder.add_checkpoint(Checkpoint {
-            compressed_offset: 0,
-            bit_offset: 0,
-            uncompressed_offset: 0,
-            state: CheckpointState::None,
-        });
         builder.add_entry(make_entry("file.txt", 100, 512));
 
-        let index = builder.finish_partial(1024);
+        let index = builder.finish(stream(&[(0, 0)], 1024), false);
         assert!(!index.metadata.complete);
         assert_eq!(index.entries.len(), 1);
     }
@@ -238,32 +214,16 @@ mod tests {
     #[test]
     fn test_entry_associated_with_checkpoint_at_or_before_data() {
         let mut builder = IndexBuilder::new(CompressionFormat::Gzip, ArchiveFormat::Tar, 1000);
-        builder.add_checkpoint(Checkpoint {
-            compressed_offset: 0,
-            bit_offset: 0,
-            uncompressed_offset: 0,
-            state: CheckpointState::None,
-        });
-        builder.add_checkpoint(Checkpoint {
-            compressed_offset: 500,
-            bit_offset: 0,
-            uncompressed_offset: 1000,
-            state: CheckpointState::None,
-        });
-
         // Entry data starts BEFORE the latest checkpoint: must use the earlier one.
         builder.add_entry(make_entry("early.txt", 100, 800));
         // Entry data starts after the latest checkpoint: uses it.
         builder.add_entry(make_entry("late.txt", 100, 1500));
 
-        let index = builder.finish(4096);
+        let index = builder.finish(stream(&[(0, 0), (500, 1000)], 4096), true);
         let early = index.get("early.txt").unwrap();
         let late = index.get("late.txt").unwrap();
         assert_eq!(early.checkpoint_index, 0);
         assert_eq!(late.checkpoint_index, 1);
-        assert!(
-            index.checkpoints[early.checkpoint_index].uncompressed_offset
-                <= early.uncompressed_offset
-        );
+        assert!(index.checkpoint_for(early).uncompressed_offset <= early.uncompressed_offset);
     }
 }

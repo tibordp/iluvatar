@@ -224,6 +224,18 @@ fn test_files_refs<'a>(files: &'a [(&'a str, Vec<u8>)]) -> Vec<(&'a str, &'a [u8
     files.iter().map(|(p, d)| (*p, d.as_slice())).collect()
 }
 
+/// Pseudo-random bytes: deflate emits a block boundary every few tens of
+/// KiB of these, where a repetitive pattern fits in one block.
+fn incompressible(seed: u64, len: usize) -> Vec<u8> {
+    let mut rng = seed;
+    (0..len)
+        .map(|_| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng >> 33) as u8
+        })
+        .collect()
+}
+
 // ─── Uncompressed Tar Tests ───
 
 #[test]
@@ -338,9 +350,9 @@ fn test_bzip2_multiblock_index_and_read() {
 
     // Verify that at least one mid-stream checkpoint exists.
     assert!(
-        index.checkpoints.len() > 1,
+        index.checkpoints().len() > 1,
         "expected multiple checkpoints, got {}",
-        index.checkpoints.len()
+        index.checkpoints().len()
     );
 
     // Read every file and compare.
@@ -528,7 +540,8 @@ fn test_index_save_and_load() {
 #[cfg(feature = "gzip")]
 #[test]
 fn test_checkpoints_created() {
-    let files = test_files();
+    let mut files = test_files();
+    files.push(("noise.bin", incompressible(7, 300_000)));
     let refs = test_files_refs(&files);
     let compressed = create_tar_gz(&refs);
 
@@ -563,13 +576,13 @@ fn test_checkpoints_created() {
 
     // Should have multiple checkpoints due to small interval
     assert!(
-        index.checkpoints.len() > 1,
+        index.checkpoints().len() > 1,
         "expected multiple checkpoints, got {}",
-        index.checkpoints.len()
+        index.checkpoints().len()
     );
 
     // Checkpoints should be sorted by uncompressed offset
-    for pair in index.checkpoints.windows(2) {
+    for pair in index.checkpoints().windows(2) {
         assert!(pair[0].uncompressed_offset <= pair[1].uncompressed_offset);
     }
 
@@ -583,7 +596,8 @@ fn test_checkpoints_created() {
 #[cfg(feature = "gzip")]
 #[test]
 fn test_checkpoint_with_sync_archive() {
-    let files = test_files();
+    let mut files = test_files();
+    files.push(("noise.bin", incompressible(8, 300_000)));
     let refs = test_files_refs(&files);
     let compressed = create_tar_gz(&refs);
     let tmp = write_temp(&compressed);
@@ -595,7 +609,7 @@ fn test_checkpoint_with_sync_archive() {
     )
     .unwrap();
 
-    assert!(archive.index().checkpoints.len() > 1);
+    assert!(archive.index().checkpoints().len() > 1);
 
     for (path, expected) in &files {
         let content = archive.read_file(path).unwrap();
@@ -783,15 +797,15 @@ fn test_gzip_checkpoint_midstream_seek() {
 
     // Should have multiple checkpoints (initial + block boundary checkpoints)
     assert!(
-        index.checkpoints.len() > 2,
+        index.checkpoints().len() > 2,
         "expected multiple checkpoints, got {}",
-        index.checkpoints.len()
+        index.checkpoints().len()
     );
 
     // At least one checkpoint should have compressed_offset > 0
     // (proving mid-stream resume, not restart from beginning)
     let midstream_checkpoints: Vec<_> = index
-        .checkpoints
+        .checkpoints()
         .iter()
         .filter(|cp| cp.compressed_offset > 0)
         .collect();
@@ -809,7 +823,7 @@ fn test_gzip_checkpoint_midstream_seek() {
     // Verify a file near the end uses a checkpoint with offset > 0
     let last_file = "file_019.dat";
     let entry = index.get(last_file).unwrap();
-    let cp = &index.checkpoints[entry.checkpoint_index];
+    let cp = &index.checkpoints()[entry.checkpoint_index];
     assert!(
         cp.compressed_offset > 0,
         "last file's checkpoint should have compressed_offset > 0, \
@@ -854,7 +868,7 @@ fn test_index_bytes_roundtrip() {
     let restored = ArchiveIndex::from_bytes(&bytes).unwrap();
 
     assert_eq!(restored.entries.len(), index.entries.len());
-    assert_eq!(restored.checkpoints.len(), index.checkpoints.len());
+    assert_eq!(restored.checkpoints().len(), index.checkpoints().len());
     assert_eq!(restored.metadata.compression, index.metadata.compression);
 
     for (path, _) in &files {
@@ -1157,7 +1171,7 @@ fn test_range_read_zero_length() {
 #[test]
 fn test_range_read_across_checkpoints() {
     // Create a large file that will span multiple checkpoints
-    let content: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
+    let content = incompressible(9, 300_000);
     let files = &[("large.bin", content.as_slice())];
     let compressed = create_tar_gz(files);
 
@@ -1191,9 +1205,9 @@ fn test_range_read_across_checkpoints() {
     };
 
     assert!(
-        index.checkpoints.len() > 2,
+        index.checkpoints().len() > 2,
         "expected multiple checkpoints for range test, got {}",
-        index.checkpoints.len()
+        index.checkpoints().len()
     );
 
     // Read from the second half — should use a checkpoint past the beginning
@@ -1783,10 +1797,10 @@ fn test_entry_checkpoints_usable_for_reading() {
         }
     }
     let index = engine.finish();
-    assert!(index.checkpoints.len() > 2, "want several checkpoints");
+    assert!(index.checkpoints().len() > 2, "want several checkpoints");
 
     for entry in index.entries.values() {
-        let cp = &index.checkpoints[entry.checkpoint_index];
+        let cp = &index.checkpoints()[entry.checkpoint_index];
         assert!(
             cp.uncompressed_offset <= entry.uncompressed_offset,
             "entry '{}' at {} assigned checkpoint {} starting at {}",

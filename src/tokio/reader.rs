@@ -9,6 +9,7 @@ use crate::engine::state_machine::{IndexingEngine, ReadEngine};
 use crate::error::{Error, Result};
 use crate::index::entry::IndexEntry;
 use crate::index::store::ArchiveIndex;
+use crate::stream::StreamReader;
 use ::tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, ReadBuf};
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -308,12 +309,10 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Archive<R> {
     pub async fn open(&mut self, path: &str) -> Result<EntryReader<'_, R>> {
         self.reader.seek(SeekFrom::Start(0)).await?;
         let engine = ReadEngine::new(&self.index, path)?;
-        Ok(EntryReader {
-            reader: &mut self.reader,
-            engine,
-            io_buf: vec![0u8; BUF_SIZE],
-            state: PollState::DriveEngine,
-        })
+        Ok(EntryReader::over(
+            &mut self.reader,
+            engine.into_stream_reader(),
+        ))
     }
 }
 
@@ -418,9 +417,20 @@ enum PollState {
 /// ```
 pub struct EntryReader<'a, R> {
     reader: &'a mut R,
-    engine: ReadEngine,
+    engine: StreamReader,
     io_buf: Vec<u8>,
     state: PollState,
+}
+
+impl<'a, R> EntryReader<'a, R> {
+    pub(crate) fn over(reader: &'a mut R, engine: StreamReader) -> Self {
+        Self {
+            reader,
+            engine,
+            io_buf: vec![0u8; BUF_SIZE],
+            state: PollState::DriveEngine,
+        }
+    }
 }
 
 impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRead for EntryReader<'_, R> {

@@ -1,11 +1,13 @@
 //! # iluvatar
 //!
-//! Read individual files from compressed tar and cpio archives without
-//! decompressing the whole thing.
+//! Random access into compressed streams: read individual files from
+//! compressed tar and cpio archives, or any byte range of a bare compressed
+//! file, without decompressing the whole thing.
 //!
-//! The library makes an indexing pass over the archive, recording each file's
-//! position and periodically snapshotting the decompressor state. Subsequent
-//! reads restore the nearest snapshot and decompress forward from there.
+//! The library makes an indexing pass over the stream, periodically
+//! snapshotting the decompressor state (and, for an archive, recording each
+//! file's position). Subsequent reads restore the nearest snapshot and
+//! decompress forward from there.
 //!
 //! ## Quick start
 //!
@@ -96,10 +98,12 @@
 //!
 //! ## Modules
 //!
-//! - [`sync`] — Synchronous `Archive` API (most users want this)
-//! - [`tokio`] — Async equivalent using tokio
-//! - [`engine`] — Sans-I/O [`IndexingEngine`] and [`ReadEngine`]
-//! - [`compress`] — Decompressor implementations and format detection
+//! - [`sync`] — Synchronous `Archive` and `Stream` APIs (most users want these)
+//! - [`tokio`] — Async equivalents using tokio
+//! - [`stream`] — Sans-I/O [`StreamIndexer`] and [`StreamReader`] over one
+//!   compressed stream, container-agnostic
+//! - [`engine`] — Sans-I/O [`IndexingEngine`] and [`ReadEngine`] for tar/cpio
+//! - [`compress`] — Codecs, filters, chains and format detection
 //! - [`archive`] — Archive format types and parsers (tar, cpio)
 //! - [`index`] — Index types and serialization
 
@@ -109,6 +113,7 @@ pub(crate) mod cpio;
 pub mod engine;
 pub mod error;
 pub mod index;
+pub mod stream;
 pub mod sync;
 pub(crate) mod tar;
 
@@ -117,6 +122,9 @@ pub mod tokio;
 
 // Re-exports for convenience
 pub use archive::{ArchiveFormat, EntryType};
+pub use compress::checkpoint::{Checkpoint, CheckpointState};
+pub use compress::codec::{Bcj2Streams, BcjArch, Codec, CodecSpec};
+pub use compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
 pub use compress::CompressionFormat;
 pub use engine::checkpoint_strategy::{
     default_interval_for_format, Budget, BudgetRatio, CheckpointContext, CheckpointStrategy,
@@ -128,3 +136,4 @@ pub use engine::state_machine::{IndexingEngine, ReadEngine};
 pub use error::{Error, Result};
 pub use index::entry::IndexEntry;
 pub use index::store::ArchiveIndex;
+pub use stream::{StreamIndex, StreamIndexer, StreamProgress, StreamReader};

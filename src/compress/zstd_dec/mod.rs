@@ -424,14 +424,18 @@ impl Decompressor for ZstdDecompressor {
         })
     }
 
-    fn checkpoint(&self, compressed_offset: u64, uncompressed_offset: u64) -> Result<Checkpoint> {
+    fn checkpoint(
+        &self,
+        compressed_offset: u64,
+        uncompressed_offset: u64,
+    ) -> Result<Option<Checkpoint>> {
         let state = self.get_checkpoint_state();
-        Ok(Checkpoint {
+        Ok(Some(Checkpoint {
             compressed_offset,
             bit_offset: 0,
             uncompressed_offset,
             state: CheckpointState::Zstd(state),
-        })
+        }))
     }
 
     fn restore(&mut self, checkpoint: &Checkpoint) -> Result<()> {
@@ -610,10 +614,9 @@ mod tests {
 
             // Take checkpoint after producing some output
             if all_output.len() >= 3000 && checkpoint_saved.is_none() {
-                checkpoint_saved = Some(
-                    dec.checkpoint(offset as u64, all_output.len() as u64)
-                        .unwrap(),
-                );
+                checkpoint_saved = dec
+                    .checkpoint(offset as u64, all_output.len() as u64)
+                    .unwrap();
             }
 
             if result.status == DecompressStatus::StreamEnd {
@@ -947,10 +950,9 @@ mod tests {
             offset += result.bytes_consumed;
 
             if all_output.len() >= 50_000 && checkpoint_saved.is_none() {
-                checkpoint_saved = Some(
-                    dec.checkpoint(offset as u64, all_output.len() as u64)
-                        .unwrap(),
-                );
+                checkpoint_saved = dec
+                    .checkpoint(offset as u64, all_output.len() as u64)
+                    .unwrap();
                 output_at_checkpoint = all_output.len();
             }
 

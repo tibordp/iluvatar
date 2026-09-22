@@ -1,7 +1,8 @@
 # iluvatar
 
-Read individual files from compressed tar and cpio archives without
-decompressing the whole thing.
+Random access into compressed streams: read individual files from
+compressed tar and cpio archives, or any byte range of a bare `.gz`,
+`.xz`, `.zst` or `.bz2` file, without decompressing the whole thing.
 
 iluvatar works by making an indexing pass over the compressed archive,
 recording each file's path, size, and byte offset in the decompressed stream.
@@ -67,6 +68,51 @@ let index = engine.finish();
 // Use index with ReadEngine to read individual files
 # Ok::<(), iluvatar::Error>(())
 ```
+
+### Bare compressed files
+
+A compressed file with no container inside is a stream whose content is
+the data itself. `Stream` indexes it and serves unpacked byte ranges:
+
+```rust
+use iluvatar::sync::Stream;
+use std::fs::File;
+
+let mut stream = Stream::new(File::open("access.log.gz")?)?;
+let total = stream.len().unwrap();
+let tail = stream.read_range(total.saturating_sub(64 * 1024), 64 * 1024)?;
+# Ok::<(), iluvatar::Error>(())
+```
+
+### Stream engine
+
+Underneath, a `StreamIndexer` lays checkpoints over one compressed stream
+and a `StreamReader` decodes any unpacked range from the nearest one. The
+tar and cpio engines are compositions of the two, and a container that
+already knows where its members live (7z folders, for instance) uses them
+directly. Indexing can stop early and resume later without re-decoding:
+
+```rust
+use iluvatar::{Codec, CodecSpec, EngineRequest, FixedInterval, StreamIndexer, StreamReader};
+
+# fn feed(_: &mut StreamIndexer<FixedInterval>) {}
+let mut indexer = StreamIndexer::new(CodecSpec::single(Codec::Xz), FixedInterval::new(1 << 20), None)?;
+indexer.stop_at(100 << 20); // index the first 100 MiB now, the rest on demand
+feed(&mut indexer);         // drive it like any other engine
+let index = indexer.finish();
+
+let mut reader = StreamReader::new(&index, 50 << 20, 4096)?;
+// ... drive it, then keep it alive:
+// reader.seek_forward(offset, len) continues from where the decoder stands.
+# Ok::<(), iluvatar::Error>(())
+```
+
+A `CodecSpec` names a stream's decoding stages in packed-to-unpacked
+order, so an encrypted, filtered 7z folder is
+`[AesCbc, Lzma2, Bcj(X86)]`. Chains checkpoint as a whole. 7-Zip's
+four-stream `Bcj2` is a stage too: the caller decodes its three small side
+streams whole and hands them over, and only the main stream flows through
+the chain.
 
 ### Async (tokio)
 
@@ -150,19 +196,27 @@ let index = Archive::build_index_with_progress(
 | tar    | ustar, GNU, PAX, V7 (including long name extensions) |
 | cpio   | newc (SVR4), odc (POSIX.1) |
 
-**Compression formats:**
+**Codecs** (any of them may be a stage in a chain):
 
-| Format | Checkpoint method | Implementation |
-|--------|-------------------|----------------|
-| gzip   | DEFLATE block boundary | `miniz_oxide` with `block-boundary` feature |
-| bzip2  | Full state snapshot | `bzip2` crate (C binding) |
-| xz     | Full state snapshot | Built-in LZMA2 decoder |
-| zstd   | Full state snapshot | Built-in decoder |
-| none   | Trivial byte offset | Direct seeking |
+| Codec | Checkpoint method | Implementation |
+|-------|-------------------|----------------|
+| gzip, raw deflate | DEFLATE block boundary | `miniz_oxide` with `block-boundary` feature |
+| bzip2 | Block boundary | `bzip2` crate (C binding) |
+| xz, raw LZMA2, raw LZMA1 | Full state snapshot | Built-in decoders |
+| zstd | Full state snapshot | Built-in decoder |
+| BCJ x86, PowerPC, IA-64, ARM, ARM Thumb, SPARC, ARM64, RISC-V; Delta | Full state (a few bytes) | Built-in, ported from XZ Utils |
+| AES-256-CBC | Previous ciphertext block | `aes` crate (pure Rust) |
+| none | Trivial byte offset | Direct seeking |
 
-The xz and zstd decompressors are built-in rather than wrapping C libraries,
-because checkpoint/resume requires access to the full decompressor state,
-which C library wrappers don't expose.
+Format detection covers gzip, bzip2, xz, zstd and uncompressed; the raw
+codecs, filters and encryption are for containers that name their codecs
+(pass a `CodecSpec`).
+
+The xz, LZMA and zstd decompressors are built-in rather than wrapping C
+libraries, because checkpoint/resume requires access to the full
+decompressor state, which C library wrappers don't expose. Checkpoints are
+exact: a codec that can only resume at block boundaries declines to
+checkpoint between them rather than pointing at an earlier boundary.
 
 ## Limitations
 
@@ -197,6 +251,7 @@ iluvatar = { version = "0.1", default-features = false, features = ["gzip"] }
 | `bz2` | bzip2 support (requires `bzip2` crate, C binding) |
 | `xz` | xz/LZMA2 support |
 | `zstandard` | zstd support |
+| `aes` | AES-256-CBC stage (requires `aes` crate) |
 | `tokio` | Async API via tokio |
 | `cli` | CLI binary (demo/utility, not the main focus) |
 

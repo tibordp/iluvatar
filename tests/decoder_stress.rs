@@ -102,7 +102,7 @@ fn decompress_random_chunks(
         if let Some(threshold) = checkpoint_after {
             if checkpoint.is_none() && pending.is_empty() && out.len() as u64 >= threshold {
                 let consumed = (offset - pending.len()) as u64;
-                checkpoint = Some(dec.checkpoint(consumed, out.len() as u64).unwrap());
+                checkpoint = dec.checkpoint(consumed, out.len() as u64).unwrap();
             }
         }
 
@@ -224,7 +224,7 @@ fn test_xz_checkpoint_size_is_proportional_to_decoded_data() {
         }
     }
 
-    let cp = dec.checkpoint(offset as u64, produced).unwrap();
+    let cp = dec.checkpoint(offset as u64, produced).unwrap().unwrap();
     let size = cp.estimated_size();
     // The window can hold at most `produced` bytes plus decoder tables
     // (~16 KiB of probabilities) and small buffers. With the full 64 MiB

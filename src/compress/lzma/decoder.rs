@@ -135,7 +135,7 @@ impl LzmaProperties {
 /// Cyclic sliding window buffer for LZMA decoding.
 ///
 /// Serialization uses a compact representation that stores only the live
-/// portion of the dictionary (see [`SlidingWindowRepr`]): the buffer itself
+/// portion of the dictionary (see `SlidingWindowRepr`): the buffer itself
 /// is allocated at the full dictionary size up front, and serializing the
 /// unwritten zero tail would bloat every checkpoint to `dict_size` bytes
 /// (64 MiB at xz -9) regardless of how little has been decoded.

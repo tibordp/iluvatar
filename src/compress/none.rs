@@ -45,13 +45,17 @@ impl Decompressor for NoneDecompressor {
         })
     }
 
-    fn checkpoint(&self, compressed_offset: u64, uncompressed_offset: u64) -> Result<Checkpoint> {
-        Ok(Checkpoint {
+    fn checkpoint(
+        &self,
+        compressed_offset: u64,
+        uncompressed_offset: u64,
+    ) -> Result<Option<Checkpoint>> {
+        Ok(Some(Checkpoint {
             compressed_offset,
             bit_offset: 0,
             uncompressed_offset,
             state: CheckpointState::None,
-        })
+        }))
     }
 
     fn restore(&mut self, checkpoint: &Checkpoint) -> Result<()> {
@@ -90,7 +94,7 @@ mod tests {
     #[test]
     fn test_checkpoint_restore() {
         let mut dec = NoneDecompressor::new();
-        let cp = dec.checkpoint(100, 100).unwrap();
+        let cp = dec.checkpoint(100, 100).unwrap().unwrap();
         assert_eq!(cp.compressed_offset, 100);
         assert_eq!(cp.uncompressed_offset, 100);
         dec.restore(&cp).unwrap();
