@@ -70,6 +70,14 @@
   through a slice with fixed-size chunks into slack instead of `Vec`
   appends. Huffman literals use a 4096-entry lookup and decode 5 symbols per
   stream per refill. Checkpoint serialization format is unchanged.
+- **Checkpoints and indexes serialize at memcpy speed.** Byte buffers in
+  checkpoint state (dictionary windows, staged output) were serialized one
+  element at a time; they're now written as a single length-prefixed copy,
+  which bincode encodes identically, so the index format is unchanged.
+  Taking an xz checkpoint is ~12x faster and restoring one ~19x (a ~9 MB
+  window: 7.8 ms → 0.6 ms, 12 ms → 0.6 ms), which halves indexing time at
+  dense checkpoint intervals and makes xz range reads ~3x faster.
+  `ArchiveIndex::to_bytes`/`from_bytes` are 10–40x faster for xz and zstd.
 - **xz/LZMA decoder: short match copies avoid memmove calls** (~2–4% at
   presets 0–9).
 

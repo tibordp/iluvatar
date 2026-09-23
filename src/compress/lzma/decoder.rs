@@ -157,7 +157,9 @@ pub struct SlidingWindow {
 struct SlidingWindowRepr {
     size: u64,
     total_pos: u64,
+    #[serde(with = "serde_bytes")]
     data: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pending_out: Vec<u8>,
 }
 

@@ -20,7 +20,11 @@ impl ArchiveIndex {
     /// # }
     /// ```
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        // Sizing is cheap (byte fields report their length without being
+        // walked) and saves regrowing a buffer that can reach 100+ MB.
+        let size =
+            bincode::serialized_size(self).map_err(|e| Error::Serialization(e.to_string()))?;
+        let mut buf = Vec::with_capacity(INDEX_MAGIC.len() + size as usize);
         buf.extend_from_slice(INDEX_MAGIC);
         bincode::serialize_into(&mut buf, self).map_err(|e| Error::Serialization(e.to_string()))?;
         Ok(buf)

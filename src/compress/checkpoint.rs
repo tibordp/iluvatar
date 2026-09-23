@@ -1,3 +1,8 @@
+//! Byte-vector fields are (de)serialized with `serde_bytes`: a single
+//! length-prefixed copy instead of serde's element-by-element sequence.
+//! With bincode both produce the same bytes (see the test below), so this
+//! is purely a speedup; checkpoint windows run to megabytes.
+
 use serde::{Deserialize, Serialize};
 
 /// A serializable snapshot of decompressor state at a known position.
@@ -48,6 +53,7 @@ pub enum CheckpointState {
 /// Raw LZMA1 checkpoint: the whole decoder, bincode-serialized.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LzmaCheckpointState {
+    #[serde(with = "serde_bytes")]
     pub decoder_state: Vec<u8>,
     pub finished: bool,
 }
@@ -58,11 +64,13 @@ pub struct LzmaCheckpointState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterCheckpointState {
     pub pos: u64,
+    #[serde(with = "serde_bytes")]
     pub held: Vec<u8>,
     /// Prefix of `held` already converted (output-ready).
     pub filtered: usize,
     /// Filter-specific state, bincode-serialized (x86's `prev_mask` and
     /// `prev_pos`; delta's history ring).
+    #[serde(with = "serde_bytes")]
     pub extra: Vec<u8>,
     pub finished: bool,
 }
@@ -71,6 +79,7 @@ pub struct FilterCheckpointState {
 /// streams themselves belong to the codec spec, not the checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bcj2CheckpointState {
+    #[serde(with = "serde_bytes")]
     pub state: Vec<u8>,
 }
 
@@ -80,8 +89,10 @@ pub struct AesCheckpointState {
     /// Previous ciphertext block (the IV for the next block).
     pub prev: [u8; 16],
     /// Partial ciphertext block received but not yet decryptable.
+    #[serde(with = "serde_bytes")]
     pub carry: Vec<u8>,
     /// Decrypted bytes not yet handed out.
+    #[serde(with = "serde_bytes")]
     pub staged: Vec<u8>,
     /// Plaintext bytes emitted so far (for the length limit).
     pub produced: u64,
@@ -107,6 +118,7 @@ pub struct ChainCheckpointState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GzipCheckpointState {
     /// The sliding window (up to 32 KiB of preceding decompressed data).
+    #[serde(with = "serde_bytes")]
     pub window: Vec<u8>,
     /// Deflate block boundary state for mid-stream resume.
     pub block_state: Option<GzipBlockBoundary>,
@@ -137,6 +149,7 @@ pub struct Bzip2CheckpointState {
     /// Block number (0-indexed).
     pub block_number: u64,
     /// The 4-byte bzip2 stream header (`BZh` + level byte).
+    #[serde(with = "serde_bytes")]
     pub stream_header: Vec<u8>,
 }
 
@@ -150,6 +163,7 @@ pub struct XzCheckpointState {
     /// Block index in the XZ stream.
     pub block_index: u32,
     /// The 12-byte XZ stream header (needed to initialize a fresh decoder).
+    #[serde(with = "serde_bytes")]
     pub stream_header: Vec<u8>,
 }
 
@@ -167,8 +181,10 @@ pub struct ZstdCheckpointState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XzFullCheckpointState {
     /// Serialized XZ parser phase (bincode).
+    #[serde(with = "serde_bytes")]
     pub phase: Vec<u8>,
     /// The 12-byte XZ stream header.
+    #[serde(with = "serde_bytes")]
     pub stream_header: Vec<u8>,
     /// Check type size.
     pub check_size: usize,
@@ -177,12 +193,15 @@ pub struct XzFullCheckpointState {
     /// Block header size for current block.
     pub block_header_size: usize,
     /// Serialized LZMA2 checkpoint state (if mid-block).
+    #[serde(with = "serde_bytes")]
     pub lzma2_state: Option<Vec<u8>>,
     /// Internal input buffer.
     #[serde(default)]
+    #[serde(with = "serde_bytes")]
     pub buffer: Vec<u8>,
     /// Decoded output not yet delivered to the caller at checkpoint time.
     #[serde(default)]
+    #[serde(with = "serde_bytes")]
     pub staged_output: Vec<u8>,
 }
 
@@ -194,20 +213,26 @@ pub struct XzFullCheckpointState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZstdFullCheckpointState {
     /// Serialized `BlockDecoderState` (bincode): FSE tables, Huffman table, repeat offsets.
+    #[serde(with = "serde_bytes")]
     pub block_state: Vec<u8>,
     /// Window buffer: recent decompressed output for back-references.
+    #[serde(with = "serde_bytes")]
     pub window: Vec<u8>,
     /// Maximum window size for the current frame.
     pub window_size: usize,
     /// Serialized decoder phase (bincode).
+    #[serde(with = "serde_bytes")]
     pub phase: Vec<u8>,
     /// Serialized frame header (bincode), if currently within a frame.
+    #[serde(with = "serde_bytes")]
     pub frame_header: Option<Vec<u8>>,
     /// Internal input buffer (unprocessed bytes that were consumed from caller but not yet decoded).
     #[serde(default)]
+    #[serde(with = "serde_bytes")]
     pub buffer: Vec<u8>,
     /// Staged output: decoded bytes not yet delivered to the caller.
     #[serde(default)]
+    #[serde(with = "serde_bytes")]
     pub staged_output: Vec<u8>,
     /// Position within staged_output.
     #[serde(default)]
@@ -222,6 +247,7 @@ pub struct ZstdFullCheckpointState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lzma2FullCheckpointState {
     /// Serialized `Lzma2DecoderState` (bincode).
+    #[serde(with = "serde_bytes")]
     pub decoder_state: Vec<u8>,
     /// Total compressed bytes consumed at checkpoint.
     pub total_in: u64,
@@ -277,5 +303,28 @@ impl Checkpoint {
     pub fn estimated_size(&self) -> usize {
         // Two u64 offsets + u8 bit_offset + state
         17 + self.state.estimated_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn serde_bytes_is_wire_compatible_with_vec_u8() {
+        for len in [0usize, 1, 255, 70_000] {
+            let v: Vec<u8> = (0..len).map(|i| (i * 31) as u8).collect();
+            let as_seq = bincode::serialize(&v).unwrap();
+            let as_bytes = bincode::serialize(serde_bytes::Bytes::new(&v)).unwrap();
+            assert_eq!(as_seq, as_bytes, "len {len}");
+
+            let back: serde_bytes::ByteBuf = bincode::deserialize(&as_seq).unwrap();
+            assert_eq!(back.into_vec(), v);
+            let back: Vec<u8> = bincode::deserialize(&as_bytes).unwrap();
+            assert_eq!(back, v);
+
+            let opt = Some(v.clone());
+            let as_seq = bincode::serialize(&opt).unwrap();
+            let as_bytes = bincode::serialize(&Some(serde_bytes::Bytes::new(&v))).unwrap();
+            assert_eq!(as_seq, as_bytes, "Option, len {len}");
+        }
     }
 }
