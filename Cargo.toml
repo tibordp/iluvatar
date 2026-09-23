@@ -31,6 +31,7 @@ lzma-sys = "0.1"
 zstd = "0.13"
 tar = "0.4"
 tokio = { version = "1", features = ["rt", "macros", "io-util", "fs", "io-std"] }
+criterion = "0.8"
 
 [features]
 default = ["gzip", "bz2", "xz", "zstandard", "aes"]
@@ -54,3 +55,8 @@ required-features = ["cli"]
 name = "throughput"
 harness = false
 required-features = ["zstandard", "xz"]
+
+[[bench]]
+name = "e2e"
+harness = false
+required-features = ["gzip", "bz2", "xz", "zstandard"]
