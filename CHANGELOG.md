@@ -64,6 +64,8 @@
   through a slice with fixed-size chunks into slack instead of `Vec`
   appends. Huffman literals use a 4096-entry lookup and decode 5 symbols per
   stream per refill. Checkpoint serialization format is unchanged.
+- **xz/LZMA decoder: short match copies avoid memmove calls** (~2–4% at
+  presets 0–9).
 
 ## 0.3.0 — 2026-07-15
 

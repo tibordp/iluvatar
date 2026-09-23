@@ -289,6 +289,56 @@ impl SlidingWindow {
         let mut remaining = len;
         let mut out_off = 0usize;
 
+        // Common case: neither source nor destination wraps. Copy in fixed
+        // 16/8-byte chunks (inline loads/stores instead of two memmove calls
+        // per match), writing each chunk to both the window and `out`. The
+        // last chunk overlaps the previous one so the copy stays exact: the
+        // window must not be written past `pos + len`, since when full those
+        // bytes are still live dictionary. A chunk never overlaps its own
+        // source because the chunk size is at most `dist`.
+        if dist <= self.pos && self.pos + len <= self.size && (len >= 8 && dist >= 8 || len < 16) {
+            let src = self.pos - dist;
+            let dst = self.pos;
+            if len < 8 || dist < 8 {
+                // Short match (LZMA's minimum is 2) or a short period:
+                // plain byte loop, which also gives overlap replication.
+                for (k, o) in out[..len].iter_mut().enumerate() {
+                    let b = self.buf[src + k];
+                    self.buf[dst + k] = b;
+                    *o = b;
+                }
+            } else if dist >= 16 && len >= 16 {
+                let mut k = 0;
+                loop {
+                    let chunk: [u8; 16] = self.buf[src + k..src + k + 16].try_into().unwrap();
+                    self.buf[dst + k..dst + k + 16].copy_from_slice(&chunk);
+                    out[k..k + 16].copy_from_slice(&chunk);
+                    if k + 16 == len {
+                        break;
+                    }
+                    k = (k + 16).min(len - 16);
+                }
+            } else {
+                let mut k = 0;
+                loop {
+                    let chunk: [u8; 8] = self.buf[src + k..src + k + 8].try_into().unwrap();
+                    self.buf[dst + k..dst + k + 8].copy_from_slice(&chunk);
+                    out[k..k + 8].copy_from_slice(&chunk);
+                    if k + 8 == len {
+                        break;
+                    }
+                    k = (k + 8).min(len - 8);
+                }
+            }
+            self.pos += len;
+            self.total_pos += len as u64;
+            if self.pos == self.size {
+                self.pos = 0;
+                self.is_full = true;
+            }
+            return;
+        }
+
         if dist == 1 {
             // Run of a single byte.
             let b = self.get_byte(1);
@@ -1998,6 +2048,47 @@ mod tests {
         // After 8192 bytes, window should be full and wrapped
         assert!(w.is_full);
         assert_eq!(w.get_byte(1), 0xFF); // last byte written: 8191 & 0xFF = 0xFF
+    }
+
+    #[test]
+    fn test_copy_match_to_matches_bytewise() {
+        // Compare the chunked copy against byte-by-byte replication across
+        // distances, lengths and cursor positions, including wraps of the
+        // source and destination around the circular buffer.
+        let fill = |w: &mut SlidingWindow, n: usize| {
+            for i in 0..n {
+                w.put_byte_direct((i as u32).wrapping_mul(2654435761).rotate_right(13) as u8);
+            }
+        };
+        for prefill in [40usize, 4000, 4096 + 100, 3 * 4096 - 20] {
+            for dist in [1u32, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 100, 4095] {
+                for len in [2usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 100, 273] {
+                    let mut a = SlidingWindow::new(K_DIC_MIN);
+                    fill(&mut a, prefill);
+                    if !a.check_distance(dist - 1) {
+                        continue;
+                    }
+                    let mut b = a.clone();
+
+                    let mut out = vec![0u8; len];
+                    a.copy_match_to(dist, len, &mut out);
+
+                    let mut expected = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        let byte = b.get_byte(dist);
+                        b.put_byte_direct(byte);
+                        expected.push(byte);
+                    }
+                    let ctx = format!("prefill {prefill} dist {dist} len {len}");
+                    assert_eq!(out, expected, "{ctx}");
+                    assert_eq!(a.get_window_data(), b.get_window_data(), "{ctx}");
+                    assert_eq!(
+                        (a.pos, a.total_pos, a.is_full),
+                        (b.pos, b.total_pos, b.is_full)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
