@@ -2,6 +2,9 @@
 //!
 //! Run with: cargo bench --bench throughput
 //!
+//! Environment knobs: `BENCH_ITERS` (runs per measurement, best is kept;
+//! default 10) and `BENCH_FILTER` (only run cases whose name contains it).
+//!
 //! Builds a mixed corpus (text-like, binary, repetitive), compresses it with
 //! the reference encoders at several levels, then measures how fast the
 //! iluvatar decompressors decode it through the `Decompressor` trait.
@@ -12,6 +15,17 @@ use std::time::Instant;
 use iluvatar::compress::decompressor::{DecompressStatus, Decompressor};
 use iluvatar::compress::xz::XzDecompressor;
 use iluvatar::compress::zstd_dec::ZstdDecompressor;
+
+fn iters() -> usize {
+    std::env::var("BENCH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10)
+}
+
+fn selected(name: &str) -> bool {
+    std::env::var("BENCH_FILTER").map_or(true, |f| name.contains(&f))
+}
 
 /// Simple deterministic PRNG.
 fn prng_data(seed: u64, size: usize) -> Vec<u8> {
@@ -137,9 +151,9 @@ fn run_decompress(mut dec: Box<dyn Decompressor>, compressed: &[u8], expected: &
 }
 
 fn bench(name: &str, compressed: &[u8], expected: &[u8], make: impl Fn() -> Box<dyn Decompressor>) {
-    // Warmup + best-of-3
+    // Warmup + best-of-N
     let mut best = f64::INFINITY;
-    for _ in 0..3 {
+    for _ in 0..iters() {
         let t = run_decompress(make(), compressed, expected);
         best = best.min(t);
     }
@@ -156,7 +170,7 @@ fn bench(name: &str, compressed: &[u8], expected: &[u8], make: impl Fn() -> Box<
 /// Reference decode speed using the C libraries, for context.
 fn bench_reference_zstd(compressed: &[u8], expected: &[u8]) -> f64 {
     let mut best = f64::INFINITY;
-    for _ in 0..3 {
+    for _ in 0..iters() {
         let start = Instant::now();
         let out = zstd::decode_all(std::io::Cursor::new(compressed)).unwrap();
         best = best.min(start.elapsed().as_secs_f64());
@@ -167,7 +181,7 @@ fn bench_reference_zstd(compressed: &[u8], expected: &[u8]) -> f64 {
 
 fn bench_reference_xz(compressed: &[u8], expected: &[u8]) -> f64 {
     let mut best = f64::INFINITY;
-    for _ in 0..3 {
+    for _ in 0..iters() {
         let mut out = Vec::new();
         let start = Instant::now();
         let mut r = xz2::read::XzDecoder::new(std::io::Cursor::new(compressed));
@@ -182,27 +196,42 @@ fn main() {
     let corpus = build_corpus();
     println!("corpus: {} bytes", corpus.len());
 
-    // Profiling mode: loop one decoder forever so a sampling profiler can attach.
+    // Profiling mode: loop one decoder so a sampling profiler can attach.
+    // PROFILE_LEVEL picks the zstd level / xz preset; PROFILE_COUNT bounds
+    // the number of decodes (default: forever), which together with
+    // `/usr/bin/time -l` gives a cycle count that is robust to noise.
     if let Ok(which) = std::env::var("PROFILE_LOOP") {
+        let level: Option<u32> = std::env::var("PROFILE_LEVEL")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let count: usize = std::env::var("PROFILE_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
         match which.as_str() {
             "zstd" => {
-                let compressed = zstd::encode_all(std::io::Cursor::new(&corpus), 3).unwrap();
-                loop {
+                let level = level.unwrap_or(3) as i32;
+                let compressed = zstd::encode_all(std::io::Cursor::new(&corpus), level).unwrap();
+                for _ in 0..count {
                     run_decompress(Box::new(ZstdDecompressor::new()), &compressed, &corpus);
                 }
             }
             _ => {
-                let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+                let mut encoder = xz2::write::XzEncoder::new(Vec::new(), level.unwrap_or(6));
                 encoder.write_all(&corpus).unwrap();
                 let compressed = encoder.finish().unwrap();
-                loop {
+                for _ in 0..count {
                     run_decompress(Box::new(XzDecompressor::new()), &compressed, &corpus);
                 }
             }
         }
+        return;
     }
 
     for level in [1, 3, 9, 19] {
+        if !selected(&format!("zstd level {level}")) {
+            continue;
+        }
         let compressed = zstd::encode_all(std::io::Cursor::new(&corpus), level).unwrap();
         let ref_mbps = bench_reference_zstd(&compressed, &corpus);
         println!("  [reference C zstd: {:.0} MB/s]", ref_mbps);
@@ -212,6 +241,9 @@ fn main() {
     }
 
     for preset in [0, 6, 9] {
+        if !selected(&format!("xz preset {preset}")) {
+            continue;
+        }
         let mut encoder = xz2::write::XzEncoder::new(Vec::new(), preset);
         encoder.write_all(&corpus).unwrap();
         let compressed = encoder.finish().unwrap();

@@ -247,3 +247,75 @@ fn test_xz_checkpoint_size_is_proportional_to_decoded_data() {
         "restored tail mismatch"
     );
 }
+
+/// Decode `compressed` with random chunking until the stream ends, an error
+/// is returned, or progress stops. Only a panic counts as a failure.
+fn decode_ignoring_errors(dec: &mut dyn Decompressor, compressed: &[u8], rng: &mut Rng) {
+    let mut offset = 0usize;
+    let mut produced = 0usize;
+    let mut buf = vec![0u8; 65536];
+    // Corrupt streams may legitimately expand a lot; cap the work.
+    while produced < 64 << 20 {
+        let n = rng.range(1, 8192).min(compressed.len() - offset);
+        let out_len = rng.range(1, buf.len());
+        let result = match dec.decompress(&compressed[offset..offset + n], &mut buf[..out_len]) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        offset += result.bytes_consumed;
+        produced += result.bytes_produced;
+        if result.status == DecompressStatus::StreamEnd {
+            return;
+        }
+        if result.bytes_consumed == 0 && result.bytes_produced == 0 && offset >= compressed.len() {
+            return;
+        }
+    }
+}
+
+/// Flip random bytes of valid streams and check the decoder never panics
+/// (errors are expected). Exercises the fast paths' handling of hostile
+/// bit widths, offsets and lengths.
+fn corruption_sweep(compressed: &[u8], make: impl Fn() -> Box<dyn Decompressor>, seed: u64) {
+    let mut rng = Rng(seed);
+    for _ in 0..300 {
+        let mut damaged = compressed.to_vec();
+        for _ in 0..rng.range(1, 5) {
+            // Leave the first bytes (magic/header) mostly intact so the
+            // damage reaches block decoding.
+            let at = rng.range(compressed.len().min(16), compressed.len());
+            damaged[at] ^= 1 << rng.range(0, 8);
+        }
+        decode_ignoring_errors(&mut *make(), &damaged, &mut rng);
+    }
+}
+
+#[test]
+#[cfg(feature = "zstandard")]
+fn test_zstd_corrupt_input_does_not_panic() {
+    let data = build_data(7, 300_000);
+    for level in [1, 9, 19] {
+        let compressed = zstd::encode_all(std::io::Cursor::new(&data), level).unwrap();
+        corruption_sweep(
+            &compressed,
+            || Box::new(ZstdDecompressor::new()),
+            level as u64,
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "xz")]
+fn test_xz_corrupt_input_does_not_panic() {
+    let data = build_data(8, 300_000);
+    for preset in [0, 6] {
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), preset);
+        encoder.write_all(&data).unwrap();
+        let compressed = encoder.finish().unwrap();
+        corruption_sweep(
+            &compressed,
+            || Box::new(XzDecompressor::new()),
+            preset as u64,
+        );
+    }
+}
