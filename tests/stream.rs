@@ -637,6 +637,21 @@ fn seek_forward_before_the_first_step_retargets() {
     // offset picked the checkpoint.
     let mut reader = StreamReader::new(&index, 250_000, 0).unwrap();
     assert!(reader.seek_forward(100, 10).is_err());
+
+    // `position` agrees with what `seek_forward` accepts, so a pool that
+    // parks an unstarted reader (a streaming read dropped before its first
+    // poll) can pick it by the documented rule and retarget it.
+    let mut reader = StreamReader::new(&index, 250_000, 500).unwrap();
+    assert_eq!(reader.position(), 250_000);
+    reader.seek_forward(reader.position(), 10).unwrap();
+    assert_eq!(reader.position(), 250_000);
+    reader.seek_forward(260_000, 1_000).unwrap();
+    assert_eq!(reader.position(), 260_000);
+    assert_eq!(
+        drive_reader(&mut reader, &compressed, 4096),
+        &plain[260_000..261_000]
+    );
+    assert_eq!(reader.position(), 261_000);
 }
 
 /// A reader retargeted after the decoder hit the end of the stream still

@@ -46,7 +46,9 @@
   checkpoint past the start of the stream decoded from a decoder that had
   never restored the checkpoint, silently returning nothing. A reader that
   hasn't started is now simply retargeted (this also lifts the error for
-  `seek_forward` before the first `step`).
+  `seek_forward` before the first `step`), and its `position()` reports
+  the range's start instead of 0, so a pool of parked readers no longer
+  picks one for a read it then refuses.
 
 ### Changed
 

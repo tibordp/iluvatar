@@ -180,7 +180,14 @@ impl StreamReader {
     }
 
     /// Unpacked position of the next byte `read_output` would return.
+    ///
+    /// Before the first [`step`](Self::step) (nothing restored or decoded
+    /// yet) this is the range's start: the earliest offset
+    /// [`seek_forward`](Self::seek_forward) accepts.
     pub fn position(&self) -> u64 {
+        if !self.started {
+            return self.target_offset;
+        }
         self.unpacked_pos - (self.output_len - self.output_read) as u64
     }
 
