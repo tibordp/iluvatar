@@ -1811,3 +1811,124 @@ fn test_entry_checkpoints_usable_for_reading() {
         );
     }
 }
+
+// ─── Extraction with one live reader ───
+
+/// The extraction loop from the `StreamReader` docs, verbatim: every
+/// regular file in archive order through one reader moved with
+/// `seek_forward`.
+fn extract_all<R: std::io::Read + std::io::Seek>(
+    file: &mut R,
+    index: &ArchiveIndex,
+    mut visit: impl FnMut(&str, Vec<u8>),
+) -> iluvatar::Result<()> {
+    use iluvatar::{EntryType, StreamReader};
+    use std::io::SeekFrom;
+
+    let mut entries: Vec<_> = index
+        .list(None)
+        .into_iter()
+        .filter(|e| e.entry_type == EntryType::Regular)
+        .collect();
+    entries.sort_by_key(|e| e.uncompressed_offset);
+
+    let mut live: Option<StreamReader> = None;
+    let mut input = vec![0u8; 64 * 1024];
+    let mut output = vec![0u8; 64 * 1024];
+    for entry in entries {
+        match live.as_mut() {
+            Some(reader) => reader.seek_forward(entry.uncompressed_offset, entry.size)?,
+            None => {
+                live = Some(StreamReader::new(
+                    &index.stream,
+                    entry.uncompressed_offset,
+                    entry.size,
+                )?)
+            }
+        }
+        let reader = live.as_mut().unwrap();
+        let mut data = Vec::with_capacity(entry.size as usize);
+        loop {
+            match reader.step() {
+                EngineRequest::NeedInput | EngineRequest::SeekAndRead { .. } => {
+                    file.seek(SeekFrom::Start(reader.compressed_position()))?;
+                    let n = file.read(&mut input)?;
+                    if n == 0 {
+                        reader.signal_eof();
+                    } else {
+                        reader.provide_data(&input[..n]);
+                    }
+                }
+                EngineRequest::OutputReady => loop {
+                    let n = reader.read_output(&mut output);
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&output[..n]);
+                },
+                EngineRequest::Done => break,
+                EngineRequest::Error(e) => return Err(e),
+            }
+        }
+        visit(&entry.path, data);
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(all(
+    feature = "gzip",
+    feature = "bz2",
+    feature = "xz",
+    feature = "zstandard"
+))]
+fn test_extract_all_with_one_live_reader() {
+    // Empty files first (the reader starts on an empty range) and in the
+    // middle; enough data for many 64 KiB checkpoints.
+    let mut files: Vec<(String, Vec<u8>)> = vec![("a/empty0".into(), Vec::new())];
+    for i in 0..30u64 {
+        let data = if i % 3 == 0 {
+            incompressible(i, 40_000 + i as usize * 997)
+        } else {
+            (0..30_000 + i as usize * 1511)
+                .map(|j| b"lorem ipsum dolor\n"[(j + i as usize) % 18])
+                .collect()
+        };
+        files.push((format!("f{i:02}"), data));
+        if i % 10 == 5 {
+            files.push((format!("empty{i}"), Vec::new()));
+        }
+    }
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
+
+    for (name, archive) in [
+        ("gzip", create_tar_gz(&refs)),
+        ("bzip2", create_tar_bz2_small_blocks(&refs)),
+        ("xz", create_tar_xz(&refs)),
+        ("zstd", create_tar_zst(&refs)),
+    ] {
+        let mut cursor = std::io::Cursor::new(archive.as_slice());
+        let index = Archive::with_strategy(&mut cursor, iluvatar::FixedInterval::new(64 * 1024))
+            .unwrap()
+            .into_parts()
+            .1;
+        // Leave the handle somewhere unhelpful: the loop must not care.
+        std::io::Seek::seek(&mut cursor, std::io::SeekFrom::End(0)).unwrap();
+
+        let mut seen = 0;
+        extract_all(&mut cursor, &index, |path, data| {
+            let expected = &files.iter().find(|(p, _)| p == path).unwrap().1;
+            assert!(data == *expected, "{name}: {path} differs");
+            seen += 1;
+        })
+        .unwrap();
+        assert_eq!(seen, files.len(), "{name}");
+        assert!(
+            index.checkpoints().len() > 3,
+            "{name}: too few checkpoints to be interesting"
+        );
+    }
+}

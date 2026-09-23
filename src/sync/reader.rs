@@ -290,6 +290,12 @@ impl<R: Read + Seek> Archive<R> {
     /// For large files, consider [`read_file_range()`](Self::read_file_range)
     /// or [`open()`](Self::open) to avoid loading everything at once.
     ///
+    /// Each call is independent: it restores the nearest checkpoint and
+    /// decodes forward from there. To read many files, or the whole
+    /// archive, visit them in archive order with one live
+    /// [`StreamReader`](crate::StreamReader) instead; see
+    /// [its docs](crate::StreamReader#reading-many-files).
+    ///
     /// ```no_run
     /// # fn example(archive: &mut iluvatar::sync::Archive<std::fs::File>) -> iluvatar::Result<()> {
     /// let data = archive.read_file("README.md")?;
@@ -344,6 +350,12 @@ impl<R: Read + Seek> Archive<R> {
     /// Reads `len` bytes starting at byte `offset` within the file.
     /// Seeks to the best checkpoint for that position, so reading
     /// from the middle of a large file is efficient.
+    ///
+    /// Each call is independent: it restores the nearest checkpoint and
+    /// decodes forward from there. To read many files, or the whole
+    /// archive, visit them in archive order with one live
+    /// [`StreamReader`](crate::StreamReader) instead; see
+    /// [its docs](crate::StreamReader#reading-many-files).
     ///
     /// ```no_run
     /// # fn example(archive: &mut iluvatar::sync::Archive<std::fs::File>) -> iluvatar::Result<()> {
@@ -405,6 +417,12 @@ impl<R: Read + Seek> Archive<R> {
     ///
     /// The returned reader mutably borrows this archive, so only one
     /// file can be open at a time.
+    ///
+    /// Each call is independent: it restores the nearest checkpoint and
+    /// decodes forward from there. To read many files, or the whole
+    /// archive, visit them in archive order with one live
+    /// [`StreamReader`](crate::StreamReader) instead; see
+    /// [its docs](crate::StreamReader#reading-many-files).
     ///
     /// ```no_run
     /// # fn example(archive: &mut iluvatar::sync::Archive<std::fs::File>) -> Result<(), Box<dyn std::error::Error>> {

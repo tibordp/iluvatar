@@ -35,6 +35,82 @@ enum State {
 /// [`seek_forward`](Self::seek_forward) retargets it at a later range
 /// without restoring anything, so sequential reads cost only the new
 /// bytes.
+///
+/// # Reading many files
+///
+/// `Archive::read_file` and friends create a fresh reader per call: each
+/// read restores a checkpoint and decodes forward from it on its own. To
+/// extract a whole archive, or many files, visit them in archive order with
+/// one live reader instead: a single decoding pass.
+///
+/// ```no_run
+/// use std::io::{Read, Seek, SeekFrom};
+/// use iluvatar::{ArchiveIndex, EngineRequest, EntryType, StreamReader};
+///
+/// /// Visit every regular file, in archive order, with one live reader.
+/// fn extract_all<R: Read + Seek>(
+///     file: &mut R,
+///     index: &ArchiveIndex,
+///     mut visit: impl FnMut(&str, Vec<u8>),
+/// ) -> iluvatar::Result<()> {
+///     let mut entries: Vec<_> = index
+///         .list(None)
+///         .into_iter()
+///         .filter(|e| e.entry_type == EntryType::Regular)
+///         .collect();
+///     // Tar members sit back to back in the unpacked stream.
+///     entries.sort_by_key(|e| e.uncompressed_offset);
+///
+///     let mut live: Option<StreamReader> = None;
+///     let mut input = vec![0u8; 64 * 1024];
+///     let mut output = vec![0u8; 64 * 1024];
+///     for entry in entries {
+///         match live.as_mut() {
+///             Some(reader) => reader.seek_forward(entry.uncompressed_offset, entry.size)?,
+///             None => {
+///                 live = Some(StreamReader::new(&index.stream, entry.uncompressed_offset, entry.size)?)
+///             }
+///         }
+///         let reader = live.as_mut().unwrap();
+///         let mut data = Vec::with_capacity(entry.size as usize);
+///         loop {
+///             match reader.step() {
+///                 // Read from where the reader stands, not from wherever
+///                 // the handle was left.
+///                 EngineRequest::NeedInput | EngineRequest::SeekAndRead { .. } => {
+///                     file.seek(SeekFrom::Start(reader.compressed_position()))?;
+///                     let n = file.read(&mut input)?;
+///                     if n == 0 {
+///                         reader.signal_eof();
+///                     } else {
+///                         reader.provide_data(&input[..n]);
+///                     }
+///                 }
+///                 EngineRequest::OutputReady => loop {
+///                     let n = reader.read_output(&mut output);
+///                     if n == 0 {
+///                         break;
+///                     }
+///                     data.extend_from_slice(&output[..n]);
+///                 },
+///                 EngineRequest::Done => break,
+///                 EngineRequest::Error(e) => return Err(e),
+///             }
+///         }
+///         visit(&entry.path, data);
+///     }
+///     Ok(())
+/// }
+/// ```
+///
+/// When requests arrive over time in no particular order (a file browser,
+/// a FUSE mount), the same idea generalizes to a small pool of parked
+/// readers: reuse one whose [`position`](Self::position) is at or before
+/// the target offset and at or after the checkpoint a fresh reader would
+/// restore ([`StreamIndex::best_checkpoint_for_offset`]); that can never
+/// decode more than starting fresh.
+///
+/// [`StreamIndex::best_checkpoint_for_offset`]: crate::StreamIndex::best_checkpoint_for_offset
 pub struct StreamReader {
     decompressor: Box<dyn Decompressor>,
     checkpoint: Checkpoint,

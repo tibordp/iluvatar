@@ -114,6 +114,33 @@ four-stream `Bcj2` is a stage too: the caller decodes its three small side
 streams whole and hands them over, and only the main stream flows through
 the chain.
 
+### Reading many files
+
+Every `read_file`, `read_file_range`, `open` and `Stream::read_range` call is
+independent: it restores the checkpoint nearest its target and decodes
+forward from there. One read costs at most a checkpoint interval of
+decoding, whatever the archive's size. But reading N files costs N restores
+and N partial decodes, even when the files are next to each other.
+
+- **A few files, random access:** use `read_file` / `read_file_range`, and
+  pick the checkpoint interval (below) for how much decoding one read may
+  cost.
+- **The whole archive, or many files:** visit them in archive order
+  (`IndexEntry::uncompressed_offset`; tar members sit back to back) with one
+  `StreamReader` kept alive and moved along with `seek_forward`. That is
+  one decoding pass. The [`StreamReader` docs](https://docs.rs/iluvatar/latest/iluvatar/struct.StreamReader.html#reading-many-files)
+  have a complete extraction loop.
+- **Requests arriving over time in any order** (a file browser, a FUSE
+  mount): keep a small pool of parked readers and reuse one whose
+  `position()` is at or before the target and at or after the checkpoint
+  a fresh reader would restore; it never decodes more than starting over.
+
+On a 19 MiB test archive with a checkpoint every MiB, reading 60 files in
+archive order through one live reader is 30–35x faster than calling
+`read_file` for each (all four codecs), and extracting the whole archive
+that way runs at about the speed of indexing it
+(`cargo bench --bench e2e -- extract_sequential`).
+
 ### Async (tokio)
 
 ```rust,ignore
@@ -128,7 +155,12 @@ let data = archive.read_file("some/path").await?;
 
 By default, checkpoint intervals are tuned per compression format (1 MiB for
 bzip2, 16 MiB for gzip, 64 MiB for zstd/xz) to balance seek speed against
-index size. You can override this with a custom strategy:
+index size. Checkpoint size depends on the format: a bzip2 checkpoint is a
+few bytes and a gzip one about 32 KiB, but an xz or zstd checkpoint carries
+the decoder's whole window, up to the dictionary or window size (8 MiB at
+xz -6, 64 MiB at xz -9), so a dense interval grows those indexes quickly.
+`Budget` and `BudgetRatio` cap the total instead. You can override the
+default with a custom strategy:
 
 ```rust
 use iluvatar::sync::Archive;

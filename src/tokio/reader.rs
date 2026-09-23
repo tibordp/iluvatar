@@ -197,6 +197,12 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Archive<R> {
     ///
     /// For large files, consider [`read_file_range()`](Self::read_file_range)
     /// or [`open()`](Self::open) to avoid loading everything at once.
+    ///
+    /// Each call is independent: it restores the nearest checkpoint and
+    /// decodes forward from there. To read many files, or the whole
+    /// archive, visit them in archive order with one live
+    /// [`StreamReader`](crate::StreamReader) instead; see
+    /// [its docs](crate::StreamReader#reading-many-files).
     pub async fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
         self.reader.seek(SeekFrom::Start(0)).await?;
         let mut engine = ReadEngine::new(&self.index, path)?;
@@ -244,6 +250,12 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Archive<R> {
     /// Reads `len` bytes starting at byte `offset` within the file.
     /// Seeks to the best checkpoint for that position, so reading
     /// from the middle of a large file is efficient.
+    ///
+    /// Each call is independent: it restores the nearest checkpoint and
+    /// decodes forward from there. To read many files, or the whole
+    /// archive, visit them in archive order with one live
+    /// [`StreamReader`](crate::StreamReader) instead; see
+    /// [its docs](crate::StreamReader#reading-many-files).
     pub async fn read_file_range(&mut self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         self.reader.seek(SeekFrom::Start(0)).await?;
         let mut engine = ReadEngine::new_range(&self.index, path, offset, len)?;
@@ -293,6 +305,12 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Archive<R> {
     ///
     /// The returned reader mutably borrows this archive, so only one
     /// file can be open at a time.
+    ///
+    /// Each call is independent: it restores the nearest checkpoint and
+    /// decodes forward from there. To read many files, or the whole
+    /// archive, visit them in archive order with one live
+    /// [`StreamReader`](crate::StreamReader) instead; see
+    /// [its docs](crate::StreamReader#reading-many-files).
     ///
     /// ```no_run
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {

@@ -124,6 +124,11 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Stream<R> {
     }
 
     /// Read `len` unpacked bytes starting at `offset`; shorter at the end.
+    ///
+    /// Each call is independent: it restores the nearest checkpoint and
+    /// decodes forward from there. For many consecutive ranges, keep one
+    /// [`StreamReader`](crate::StreamReader) alive and move it with
+    /// [`seek_forward`](crate::StreamReader::seek_forward).
     pub async fn read_range(&mut self, offset: u64, len: u64) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         self.open(offset, len)?.read_to_end(&mut out).await?;
@@ -131,6 +136,11 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Stream<R> {
     }
 
     /// Stream an unpacked range through [`AsyncRead`].
+    ///
+    /// Each call is independent: it restores the nearest checkpoint and
+    /// decodes forward from there. For many consecutive ranges, keep one
+    /// [`StreamReader`](crate::StreamReader) alive and move it with
+    /// [`seek_forward`](crate::StreamReader::seek_forward).
     pub fn open(&mut self, offset: u64, len: u64) -> Result<EntryReader<'_, R>> {
         let reader = StreamReader::new(&self.index, offset, len)?;
         Ok(EntryReader::over(&mut self.reader, reader))

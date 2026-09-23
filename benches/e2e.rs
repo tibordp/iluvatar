@@ -23,7 +23,7 @@
 //! size, checkpoint count, index size) are printed on first use.
 
 use std::hint::black_box;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -32,7 +32,10 @@ use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion, Thro
 
 use iluvatar::compress::decompressor::{DecompressStatus, Decompressor};
 use iluvatar::sync::{Archive, Stream};
-use iluvatar::{ArchiveIndex, Checkpoint, CodecSpec, CompressionFormat, EntryType, FixedInterval};
+use iluvatar::{
+    ArchiveIndex, Checkpoint, CodecSpec, CompressionFormat, EngineRequest, EntryType,
+    FixedInterval, IndexEntry, StreamReader,
+};
 
 /// Checkpoint interval of the dense (`1mib`) strategy.
 const DENSE_INTERVAL: u64 = 1 << 20;
@@ -376,10 +379,10 @@ fn bench_read_range(c: &mut Criterion) {
     group.finish();
 }
 
-/// Extracting files one after another in archive order through
-/// `read_file`: each read restores a checkpoint and decodes forward on its
-/// own, which is what a caller pays today for sequential extraction.
-/// Limited to the first `EXTRACT_FILES` files to keep bzip2/xz runs short.
+/// Extracting files one after another in archive order. `read_file`
+/// restores a checkpoint and decodes forward for every file; a live
+/// `StreamReader` makes it one pass. The `read_file` loop is limited to
+/// the first `EXTRACT_FILES` files to keep bzip2/xz runs short.
 fn bench_extract_sequential(c: &mut Criterion) {
     const EXTRACT_FILES: usize = 60;
     let mut group = c.benchmark_group("read/extract_sequential");
@@ -396,15 +399,90 @@ fn bench_extract_sequential(c: &mut Criterion) {
             .map(|e| (e.path.clone(), e.size))
             .collect();
         group.throughput(Throughput::Bytes(files.iter().map(|(_, size)| size).sum()));
-        group.bench_function(format!("{}-1mib", format.name()), |b| {
+        group.bench_function(format!("read_file/{}-1mib", format.name()), |b| {
             b.iter(|| {
                 for (path, _) in &files {
                     black_box(archive.read_file(path).unwrap());
                 }
             })
         });
+
+        // The same files through one live reader (the pattern documented
+        // on `StreamReader`), then the whole archive that way.
+        let index = &f.index_dense;
+        let entries: Vec<&IndexEntry> = regular_entries(index)
+            .into_iter()
+            .take(EXTRACT_FILES)
+            .collect();
+        let mut cursor = Cursor::new(f.archive.as_slice());
+        group.bench_function(format!("live_reader/{}-1mib", format.name()), |b| {
+            b.iter(|| extract_live(&mut cursor, index, &entries))
+        });
+        let all = regular_entries(index);
+        group.throughput(Throughput::Bytes(all.iter().map(|e| e.size).sum()));
+        group.bench_function(format!("live_reader_all/{}-1mib", format.name()), |b| {
+            b.iter(|| extract_live(&mut cursor, index, &all))
+        });
     }
     group.finish();
+}
+
+/// Regular files in archive order.
+fn regular_entries(index: &ArchiveIndex) -> Vec<&IndexEntry> {
+    let mut entries: Vec<&IndexEntry> = index
+        .list(None)
+        .into_iter()
+        .filter(|e| e.entry_type == EntryType::Regular)
+        .collect();
+    entries.sort_by_key(|e| e.uncompressed_offset);
+    entries
+}
+
+/// Read `entries` (in archive order) with one `StreamReader` moved along
+/// with `seek_forward`, as in the `StreamReader` docs.
+fn extract_live(file: &mut Cursor<&[u8]>, index: &ArchiveIndex, entries: &[&IndexEntry]) {
+    let mut live: Option<StreamReader> = None;
+    let mut input = vec![0u8; 64 * 1024];
+    let mut output = vec![0u8; 64 * 1024];
+    for entry in entries {
+        match live.as_mut() {
+            Some(reader) => reader
+                .seek_forward(entry.uncompressed_offset, entry.size)
+                .unwrap(),
+            None => {
+                live = Some(
+                    StreamReader::new(&index.stream, entry.uncompressed_offset, entry.size)
+                        .unwrap(),
+                )
+            }
+        }
+        let reader = live.as_mut().unwrap();
+        let mut data = Vec::with_capacity(entry.size as usize);
+        loop {
+            match reader.step() {
+                EngineRequest::NeedInput | EngineRequest::SeekAndRead { .. } => {
+                    file.seek(SeekFrom::Start(reader.compressed_position()))
+                        .unwrap();
+                    let n = file.read(&mut input).unwrap();
+                    if n == 0 {
+                        reader.signal_eof();
+                    } else {
+                        reader.provide_data(&input[..n]);
+                    }
+                }
+                EngineRequest::OutputReady => loop {
+                    let n = reader.read_output(&mut output);
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&output[..n]);
+                },
+                EngineRequest::Done => break,
+                EngineRequest::Error(e) => panic!("{e}"),
+            }
+        }
+        black_box(data);
+    }
 }
 
 // ─── Bare streams ────────────────────────────────────────────────────────
