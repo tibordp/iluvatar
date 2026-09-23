@@ -55,6 +55,15 @@
   load and must be rebuilt.
 - Filters are ported from XZ Utils' simple filters and delta decoder (0BSD);
   no new C dependency. The `aes` crate is the only dependency added.
+- **zstd decoder: ~1.1–1.2x faster decompression.** Sequences are decoded in
+  batches of 64, then executed, so each loop keeps its state in registers.
+  FSE decoding uses packed 8-byte entries in fixed-size tables (no bounds
+  checks), a single unconditional bit refill per sequence (the second only
+  when needed), and independent bit extractions. Match sources of each
+  batch are touched ahead of execution as a software prefetch. Copies write
+  through a slice with fixed-size chunks into slack instead of `Vec`
+  appends. Huffman literals use a 4096-entry lookup and decode 5 symbols per
+  stream per refill. Checkpoint serialization format is unchanged.
 
 ## 0.3.0 — 2026-07-15
 

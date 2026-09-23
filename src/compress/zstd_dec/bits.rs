@@ -73,13 +73,21 @@ fn load_u64_le(data: &[u8], byte_idx: usize) -> u64 {
         // Safe unaligned little-endian load.
         u64::from_le_bytes(data[byte_idx..byte_idx + 8].try_into().unwrap())
     } else {
-        let mut buf = [0u8; 8];
-        if byte_idx < data.len() {
-            let n = data.len() - byte_idx;
-            buf[..n].copy_from_slice(&data[byte_idx..]);
-        }
-        u64::from_le_bytes(buf)
+        load_u64_le_tail(data, byte_idx)
     }
+}
+
+/// Out-of-line slow path of `load_u64_le`, kept separate so hot callers
+/// don't pay for the memcpy call's register pressure.
+#[cold]
+#[inline(never)]
+fn load_u64_le_tail(data: &[u8], byte_idx: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    if byte_idx < data.len() {
+        let n = data.len() - byte_idx;
+        buf[..n].copy_from_slice(&data[byte_idx..]);
+    }
+    u64::from_le_bytes(buf)
 }
 
 /// Extract `n` bits starting at absolute bit index `lo` from `data`
@@ -193,52 +201,112 @@ impl<'a> BackwardBitReader<'a> {
     }
 }
 
-/// Backward bit reader that keeps up to 56 upcoming bits in a u64 register,
-/// refilling from memory only when the cache runs dry. Used for the sequence
-/// bitstream where reads are strict (reading past the end is an error).
+/// Backward bit reader for the sequence bitstream, built for a hot loop:
+/// the caller refills explicitly (one unaligned load) and then performs a
+/// batch of unchecked reads totalling at most 56 bits.
+///
+/// Reads past the start of the stream yield zero bits instead of failing;
+/// `is_overflowed` reports it, and callers must check it once decoding is
+/// done (mirroring the reference decoder's end-of-stream check).
 #[derive(Debug, Clone)]
 pub(crate) struct SeqBitReader<'a> {
     data: &'a [u8],
-    /// Bits not yet consumed (including the cached ones).
-    rem: usize,
-    /// MSB-aligned cache of the next `cbits` bits.
+    /// Bits not yet consumed (including the cached ones); negative once
+    /// reads have run past the start of the stream.
+    rem: isize,
+    /// MSB-aligned cache of the next bits (zero-padded past the stream).
     cache: u64,
-    cbits: usize,
+    /// Bits that may still be read from `cache` before the next refill.
+    cbits: u32,
 }
 
 impl<'a> SeqBitReader<'a> {
+    /// Bits guaranteed readable after a `refill`.
+    pub const REFILL_BITS: u32 = 56;
+
     pub fn new(data: &'a [u8]) -> Result<Self, &'static str> {
         let reader = BackwardBitReader::new(data)?;
-        Ok(Self {
+        let mut r = Self {
             data,
-            rem: reader.bits_remaining(),
+            rem: reader.bits_remaining() as isize,
             cache: 0,
             cbits: 0,
-        })
+        };
+        r.refill();
+        Ok(r)
     }
 
-    /// Read `n` bits MSB-first (n <= 56). Errors if fewer than `n` remain.
+    /// Top up the cache so the next `REFILL_BITS` bits can be read.
     #[inline(always)]
-    pub fn read(&mut self, n: usize) -> Result<usize, ()> {
-        if n == 0 {
-            return Ok(0);
+    pub fn refill(&mut self) {
+        if self.rem >= 56 {
+            // Cache absolute bits [rem - 56, rem). The load stays in bounds:
+            // (rem - 56) / 8 + 8 <= (rem + 8) / 8 <= data.len().
+            let lo = (self.rem - 56) as usize;
+            let v = load_u64_le(self.data, lo >> 3);
+            self.cache = (v >> (lo & 7)) << 8;
+        } else {
+            self.cache = Self::tail_cache(self.data, self.rem);
         }
-        if self.cbits < n {
-            if self.rem < n {
-                return Err(());
-            }
-            // Refill: cache the next min(rem, 56) unconsumed bits. The
-            // already-cached bits are re-read (idempotent).
-            let avail = self.rem.min(56);
-            let bits = extract_bits(self.data, self.rem - avail, avail);
-            self.cache = (bits as u64) << (64 - avail);
-            self.cbits = avail;
+        self.cbits = Self::REFILL_BITS;
+    }
+
+    /// Cache contents when fewer than 56 bits remain: the remaining bits
+    /// MSB-aligned, zeros after. Takes plain values (not `&mut self`) so the
+    /// reader can stay in registers across the call.
+    #[cold]
+    #[inline(never)]
+    fn tail_cache(data: &[u8], rem: isize) -> u64 {
+        if rem <= 0 {
+            0
+        } else {
+            let r = rem as usize;
+            (extract_bits(data, 0, r) as u64) << (64 - r)
         }
-        let v = (self.cache >> (64 - n)) as usize;
+    }
+
+    /// Read `n` bits MSB-first (n <= 56). The caller guarantees that at most
+    /// `REFILL_BITS` bits are read between refills.
+    #[inline(always)]
+    pub fn read(&mut self, n: u32) -> usize {
+        debug_assert!(n <= self.cbits);
+        // Split shift so that n == 0 yields 0 without a branch.
+        let v = ((self.cache >> 1) >> (63 - n)) as usize;
         self.cache <<= n;
-        self.cbits -= n;
-        self.rem -= n;
-        Ok(v)
+        self.cbits = self.cbits.wrapping_sub(n);
+        self.rem -= n as isize;
+        v
+    }
+
+    /// Peek `n` bits located `skip` bits into the cache (`skip + n` must not
+    /// exceed the bits available). Peeks at different offsets are
+    /// independent, unlike a chain of `read`s, which serializes on the
+    /// cache shift.
+    #[inline(always)]
+    pub fn peek_at(&self, skip: u32, n: u32) -> usize {
+        debug_assert!(skip + n <= self.cbits);
+        (((self.cache << skip) >> 1) >> (63 - n)) as usize
+    }
+
+    /// Drop `n` bits after they were read with `peek_at`.
+    #[inline(always)]
+    pub fn consume(&mut self, n: u32) {
+        debug_assert!(n <= self.cbits);
+        self.cache <<= n;
+        self.cbits = self.cbits.wrapping_sub(n);
+        self.rem -= n as isize;
+    }
+
+    /// Bits that may still be read before the next refill.
+    #[inline(always)]
+    pub fn available(&self) -> u32 {
+        self.cbits
+    }
+
+    /// Whether more bits were read than the stream contains.
+    #[inline(always)]
+    pub fn is_overflowed(&self) -> bool {
+        self.rem < 0
     }
 }
 

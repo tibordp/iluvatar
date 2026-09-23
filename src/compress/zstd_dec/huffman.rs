@@ -22,12 +22,91 @@ pub(crate) struct HufEntry {
 }
 
 /// Huffman decoding table.
+///
+/// Serialized (in checkpoints) as `entries` + `table_log` only; the `lookup`
+/// view is rebuilt on deserialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "HuffmanTableRepr", into = "HuffmanTableRepr")]
 pub(crate) struct HuffmanTable {
     /// The decoding table (size = 1 << table_log).
     pub entries: Vec<HufEntry>,
     /// Table log (max bits per symbol).
     pub table_log: u32,
+    /// `entries` expanded to a `HUF_TABLE_LOG_MAX`-bit index (each entry
+    /// replicated `1 << (HUF_TABLE_LOG_MAX - table_log)` times), packed as
+    /// `nb_bits | symbol << 8`. Decoding indexes it with the top 12 bits of
+    /// the bit cache (a constant shift, no bounds check); keeping `nb_bits`
+    /// in the low bits lets the entry feed the cache shift directly.
+    pub lookup: Box<[u16; HUF_LOOKUP_SIZE]>,
+    /// Cached `is_valid()`, checked before every decode.
+    valid: bool,
+}
+
+const HUF_LOOKUP_SIZE: usize = 1 << HUF_TABLE_LOG_MAX;
+
+/// Serialized form of `HuffmanTable` (the checkpoint format).
+#[derive(Serialize, Deserialize)]
+struct HuffmanTableRepr {
+    entries: Vec<HufEntry>,
+    table_log: u32,
+}
+
+impl From<HuffmanTableRepr> for HuffmanTable {
+    fn from(repr: HuffmanTableRepr) -> Self {
+        HuffmanTable::new(repr.entries, repr.table_log)
+    }
+}
+
+impl From<HuffmanTable> for HuffmanTableRepr {
+    fn from(table: HuffmanTable) -> Self {
+        HuffmanTableRepr {
+            entries: table.entries,
+            table_log: table.table_log,
+        }
+    }
+}
+
+impl HuffmanTable {
+    pub fn new(entries: Vec<HufEntry>, table_log: u32) -> Self {
+        let mut table = HuffmanTable {
+            entries,
+            table_log,
+            lookup: Box::new([0u16; HUF_LOOKUP_SIZE]),
+            valid: false,
+        };
+        // Tables that fail validation (possible only via a corrupt
+        // checkpoint) are rejected by the decoders before `lookup` is used.
+        table.valid = table.is_valid();
+        if table.valid {
+            let (entries, lookup) = (&table.entries, &mut table.lookup);
+            let shift = HUF_TABLE_LOG_MAX - table_log;
+            for (i, slot) in lookup.iter_mut().enumerate() {
+                let e = entries[i >> shift];
+                *slot = e.nb_bits as u16 | (e.symbol as u16) << 8;
+            }
+        }
+        table
+    }
+
+    /// Whether the table is internally consistent (always true for tables
+    /// built by `read_huffman_table`; a corrupt checkpoint may not be). The
+    /// fast decoders rely on every code length being in `1..=table_log`.
+    fn is_valid(&self) -> bool {
+        let tl = self.table_log;
+        (1..=HUF_TABLE_LOG_MAX).contains(&tl)
+            && self.entries.len() >= 1 << tl
+            && self.entries[..1 << tl]
+                .iter()
+                .all(|e| (1..=tl).contains(&(e.nb_bits as u32)))
+    }
+}
+
+/// Look up the symbol at the top of an MSB-aligned bit cache. Returns
+/// `(symbol, nb_bits)`.
+#[inline(always)]
+fn huf_lookup(lookup: &[u16; HUF_LOOKUP_SIZE], cache: u64) -> (u8, u32) {
+    let e = lookup[(cache >> (64 - HUF_TABLE_LOG_MAX)) as usize];
+    ((e >> 8) as u8, (e & 0x3F) as u32)
 }
 
 /// Read a Huffman table description from compressed data.
@@ -118,7 +197,7 @@ pub(crate) fn read_huffman_table(data: &[u8]) -> Result<(HuffmanTable, usize), S
             };
             table_size
         ];
-        return Ok((HuffmanTable { entries, table_log }, bytes_consumed));
+        return Ok((HuffmanTable::new(entries, table_log), bytes_consumed));
     }
 
     // Compute rank starting positions (ascending weight order).
@@ -157,7 +236,7 @@ pub(crate) fn read_huffman_table(data: &[u8]) -> Result<(HuffmanTable, usize), S
         rank_start[w as usize] += num_entries as u32;
     }
 
-    Ok((HuffmanTable { entries, table_log }, bytes_consumed))
+    Ok((HuffmanTable::new(entries, table_log), bytes_consumed))
 }
 
 /// Decompress Huffman weights from FSE-compressed data.
@@ -263,14 +342,13 @@ pub(crate) fn decompress_huffman_1stream(
     }
 
     let mut rem = init_stream_bits(src)?;
-    let entries = &table.entries[..];
-    if entries.len() < (1usize << table.table_log) {
-        return Err("huffman table too small for table log".into());
+    if !table.valid {
+        return Err("invalid huffman table".into());
     }
 
     let mut decoded = 0usize;
     decode_stream_tail(
-        entries,
+        &table.lookup,
         table.table_log as usize,
         src,
         &mut rem,
@@ -305,7 +383,7 @@ fn init_stream_bits(src: &[u8]) -> Result<usize, String> {
 /// Keeps up to 56 bits in a local MSB-aligned u64 container and decodes
 /// several symbols per refill instead of touching memory per symbol.
 fn decode_stream_tail(
-    entries: &[HufEntry],
+    lookup: &[u16; HUF_LOOKUP_SIZE],
     tl: usize,
     src: &[u8],
     rem: &mut usize,
@@ -314,40 +392,32 @@ fn decode_stream_tail(
     end: usize,
 ) {
     'outer: while *decoded < end && *rem > 0 {
-        if *rem >= tl {
-            // Refill: cache bits [rem - avail, rem), MSB-aligned in a u64.
-            let avail = (*rem).min(56);
-            let bits = super::bits::extract_bits(src, *rem - avail, avail);
-            let mut cache = (bits as u64) << (64 - avail);
-            let mut cbits = avail;
-
-            while cbits >= tl {
-                let idx = (cache >> (64 - tl)) as usize;
-                let entry = entries[idx];
-                let nb = entry.nb_bits as usize;
-                if nb > *rem {
-                    break 'outer;
-                }
-                out[*decoded] = entry.symbol;
-                *decoded += 1;
-                cache <<= nb;
-                cbits -= nb;
-                *rem -= nb;
-                if *decoded >= end {
-                    break 'outer;
-                }
+        // Cache bits [rem - avail, rem), MSB-aligned. When fewer than
+        // `tl` bits remain, the missing low bits read as zero.
+        let avail = (*rem).min(56);
+        let bits = super::bits::extract_bits(src, *rem - avail, avail);
+        let mut cache = (bits as u64) << (64 - avail);
+        let mut cbits = avail;
+        loop {
+            // Bits past `tl` in the 12-bit peek don't affect the lookup.
+            let (symbol, nb) = huf_lookup(lookup, cache);
+            let nb = nb as usize;
+            if nb > *rem {
+                break 'outer;
             }
-        } else {
-            // Tail: fewer than table_log bits remain; peek with zero padding.
-            let bits = super::bits::extract_bits(src, 0, *rem);
-            let peek_val = bits << (tl - *rem);
-            let entry = entries[peek_val];
-            if entry.nb_bits as usize > *rem {
+            out[*decoded] = symbol;
+            *decoded += 1;
+            cache <<= nb;
+            cbits -= nb;
+            *rem -= nb;
+            if *decoded >= end {
+                break 'outer;
+            }
+            // Refill once the cache may hold fewer than `tl` real bits
+            // (unless the stream itself is down to those bits).
+            if cbits < tl && cbits < *rem {
                 break;
             }
-            out[*decoded] = entry.symbol;
-            *decoded += 1;
-            *rem -= entry.nb_bits as usize;
         }
     }
 }
@@ -393,11 +463,11 @@ pub(crate) fn decompress_huffman_4streams(
     let regen2 = seg_size.min(regen_size.saturating_sub(seg_size));
     let regen3 = seg_size.min(regen_size.saturating_sub(2 * seg_size));
 
-    let entries = &table.entries[..];
-    let tl = table.table_log as usize;
-    if entries.len() < (1usize << tl) {
-        return Err("huffman table too small for table log".into());
+    if !table.valid {
+        return Err("invalid huffman table".into());
     }
+    let lookup = &*table.lookup;
+    let tl = table.table_log as usize;
     if regen_size == 0 {
         return Ok(());
     }
@@ -421,42 +491,20 @@ pub(crate) fn decompress_huffman_4streams(
     ];
     let mut poss = starts;
 
-    // Fast path: decode 4 symbols per stream per round, interleaved across
-    // the 4 independent streams for instruction-level parallelism. Safe
-    // without per-symbol end checks while every stream has >= 56 bits left
-    // (4 symbols consume at most 4 * table_log <= 48 bits) and >= 4 output
-    // slots.
-    if tl > 0 {
-        let mut caches = [0u64; 4];
-        loop {
-            let mut ok = true;
-            for i in 0..4 {
-                ok &= rems[i] >= 56 && poss[i] + 4 <= ends[i];
-            }
-            if !ok {
-                break;
-            }
-            for i in 0..4 {
-                let bits = super::bits::extract_bits(srcs[i], rems[i] - 56, 56);
-                caches[i] = (bits as u64) << 8;
-            }
-            for _ in 0..4 {
-                for i in 0..4 {
-                    let idx = (caches[i] >> (64 - tl)) as usize;
-                    let entry = entries[idx];
-                    out[poss[i]] = entry.symbol;
-                    poss[i] += 1;
-                    caches[i] <<= entry.nb_bits;
-                    rems[i] -= entry.nb_bits as usize;
-                }
-            }
-        }
+    // Fast path: several symbols per stream per round, interleaved across
+    // the 4 independent streams for instruction-level parallelism. A round
+    // reads at most `k * tl` bits per stream, so with 5 symbols the 56-bit
+    // cache suffices for tables up to 11 bits (the encoder's default max).
+    if tl <= 11 {
+        decode_4streams_fast::<5>(lookup, tl, &srcs, &mut rems, &mut poss, &ends, out);
+    } else {
+        decode_4streams_fast::<4>(lookup, tl, &srcs, &mut rems, &mut poss, &ends, out);
     }
 
     // Finish each stream with the general (bounds-checked) decoder.
     for i in 0..4 {
         decode_stream_tail(
-            entries,
+            lookup,
             tl,
             srcs[i],
             &mut rems[i],
@@ -475,6 +523,62 @@ pub(crate) fn decompress_huffman_4streams(
     }
 
     Ok(())
+}
+
+/// Bulk-decode the four interleaved streams `K` symbols at a time while
+/// every stream is far from both its input start and its output end.
+/// Leaves the remainder for `decode_stream_tail`.
+#[inline(always)]
+fn decode_4streams_fast<const K: usize>(
+    lookup: &[u16; HUF_LOOKUP_SIZE],
+    tl: usize,
+    srcs: &[&[u8]; 4],
+    rems: &mut [usize; 4],
+    poss: &mut [usize; 4],
+    ends: &[usize; 4],
+    out: &mut [u8],
+) {
+    debug_assert!(K <= 8 && K * tl <= 56);
+    let max_bits = K * tl;
+    loop {
+        // Number of rounds that can run without checks: each stream needs
+        // >= 56 unread bits at the start of a round (a round consumes at
+        // most `max_bits`) and room for `K` more symbols.
+        let mut rounds = usize::MAX;
+        for i in 0..4 {
+            let by_bits = if rems[i] >= 56 {
+                (rems[i] - 56) / max_bits + 1
+            } else {
+                0
+            };
+            rounds = rounds.min(by_bits).min((ends[i] - poss[i]) / K);
+        }
+        if rounds == 0 {
+            return;
+        }
+        for _ in 0..rounds {
+            let mut caches = [0u64; 4];
+            for i in 0..4 {
+                let bits = super::bits::extract_bits(srcs[i], rems[i] - 56, 56);
+                caches[i] = (bits as u64) << 8;
+            }
+            let mut words = [0u64; 4];
+            let mut used = [0u32; 4];
+            for k in 0..K {
+                for i in 0..4 {
+                    let (symbol, nb) = huf_lookup(lookup, caches[i]);
+                    words[i] |= (symbol as u64) << (8 * k);
+                    caches[i] <<= nb;
+                    used[i] += nb;
+                }
+            }
+            for i in 0..4 {
+                out[poss[i]..poss[i] + K].copy_from_slice(&words[i].to_le_bytes()[..K]);
+                poss[i] += K;
+                rems[i] -= used[i] as usize;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

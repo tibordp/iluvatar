@@ -176,7 +176,6 @@ fn decompress_compressed_block(
     // Take the buffer out of `state` so the literals can be borrowed while
     // `state` is used mutably below.
     let mut literals = std::mem::take(&mut state.literals_buf);
-    literals.clear();
     let lit_consumed = decode_literals_section(block_data, state, &mut literals)?;
 
     // 2. Parse the sequences section header, updating the FSE tables in `state`.
@@ -232,8 +231,14 @@ fn decode_literals_section(
     let lit_block_type = first_byte & 3;
 
     match lit_block_type {
-        0 => decode_raw_literals(data, literals),
-        1 => decode_rle_literals(data, literals),
+        0 => {
+            literals.clear();
+            decode_raw_literals(data, literals)
+        }
+        1 => {
+            literals.clear();
+            decode_rle_literals(data, literals)
+        }
         2 => decode_compressed_literals(data, state, false, literals),
         3 => decode_compressed_literals(data, state, true, literals), // Treeless (repeat Huffman)
         _ => unreachable!(),
@@ -384,7 +389,9 @@ fn decode_compressed_literals(
 
     let huf_stream = &compressed_data[huf_consumed..];
 
-    // Decompress using Huffman coding
+    // Decompress using Huffman coding. The decoders overwrite (or reject)
+    // every byte, so stale contents from the previous block can stay; only
+    // growth gets zero-filled.
     literals.resize(regen_size, 0);
     if single_stream {
         decompress_huffman_1stream(huf_table, huf_stream, literals)?;

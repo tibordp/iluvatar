@@ -39,14 +39,116 @@ pub(crate) struct FseEntry {
     pub base_value: u32,
 }
 
+/// Number of slots in a compact sequence decoding table: every sequence
+/// table (log <= `MAX_FSE_LOG`) fits, so states can be masked instead of
+/// bounds-checked.
+pub(crate) const SEQ_TABLE_SLOTS: usize = 1 << MAX_FSE_LOG;
+
+/// Compact decoding entry for the sequence hot loop, packed into a `u64` so
+/// one register holds a whole entry:
+///
+/// | bits  | field                |
+/// |-------|----------------------|
+/// | 0-31  | `base_value`         |
+/// | 32-47 | `next_state`         |
+/// | 48-55 | `nb_bits`            |
+/// | 56-63 | `nb_additional_bits` |
+///
+/// For offset codes, `nb_additional_bits` equals the code itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SeqEntry(pub u64);
+
+impl SeqEntry {
+    #[inline(always)]
+    pub fn new(e: &FseEntry) -> Self {
+        SeqEntry(
+            e.base_value as u64
+                | (e.next_state as u64) << 32
+                | (e.nb_bits as u64) << 48
+                | (e.nb_additional_bits as u64) << 56,
+        )
+    }
+    #[inline(always)]
+    pub fn base_value(self) -> u32 {
+        self.0 as u32
+    }
+    #[inline(always)]
+    pub fn next_state(self) -> usize {
+        (self.0 >> 32) as u16 as usize
+    }
+    #[inline(always)]
+    pub fn nb_bits(self) -> u32 {
+        (self.0 >> 48) as u8 as u32
+    }
+    #[inline(always)]
+    pub fn nb_additional_bits(self) -> u32 {
+        (self.0 >> 56) as u32
+    }
+}
+
 /// A complete FSE decoding table.
+///
+/// Serialized (in checkpoints) as `table_log` + `entries` only; the compact
+/// `seq_entries` view is rebuilt on deserialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "FseTableRepr", into = "FseTableRepr")]
 pub(crate) struct FseTable {
     pub table_log: u32,
     pub entries: Vec<FseEntry>,
+    /// `entries` in the compact `SeqEntry` form (same indexing), padded to
+    /// `SEQ_TABLE_SLOTS`.
+    pub seq_entries: Box<[SeqEntry; SEQ_TABLE_SLOTS]>,
+    /// Largest `nb_additional_bits` of any entry, or `None` if the table is
+    /// malformed for sequence decoding (only possible via a corrupt
+    /// checkpoint): a table log above `MAX_FSE_LOG`, a size that doesn't
+    /// match it, or a state transition wider than the table log.
+    pub seq_max_additional_bits: Option<u8>,
+}
+
+/// Serialized form of `FseTable` (the checkpoint format).
+#[derive(Serialize, Deserialize)]
+struct FseTableRepr {
+    table_log: u32,
+    entries: Vec<FseEntry>,
+}
+
+impl From<FseTableRepr> for FseTable {
+    fn from(repr: FseTableRepr) -> Self {
+        FseTable::new(repr.table_log, repr.entries)
+    }
+}
+
+impl From<FseTable> for FseTableRepr {
+    fn from(table: FseTable) -> Self {
+        FseTableRepr {
+            table_log: table.table_log,
+            entries: table.entries,
+        }
+    }
 }
 
 impl FseTable {
+    pub fn new(table_log: u32, entries: Vec<FseEntry>) -> Self {
+        let mut seq_entries = Box::new([SeqEntry::default(); SEQ_TABLE_SLOTS]);
+        for (slot, e) in seq_entries.iter_mut().zip(&entries) {
+            *slot = SeqEntry::new(e);
+        }
+        let well_formed = table_log <= MAX_FSE_LOG
+            && entries.len() == 1 << table_log
+            && entries.iter().all(|e| e.nb_bits as u32 <= table_log);
+        let seq_max_additional_bits = if well_formed {
+            entries.iter().map(|e| e.nb_additional_bits).max()
+        } else {
+            None
+        };
+        FseTable {
+            table_log,
+            entries,
+            seq_entries,
+            seq_max_additional_bits,
+        }
+    }
+
     /// Decode: given current state, return the entry and produce the symbol.
     pub fn decode(&self, state: usize) -> &FseEntry {
         &self.entries[state]
@@ -264,7 +366,7 @@ pub(crate) fn build_fse_table(
         }
     }
 
-    Ok(FseTable { table_log, entries })
+    Ok(FseTable::new(table_log, entries))
 }
 
 /// Build a single-entry (RLE) FSE table for a given symbol.
@@ -279,16 +381,16 @@ pub(crate) fn build_rle_fse_table(
     let nb_additional_bits = nb_add_bits
         .and_then(|nb| nb.get(symbol as usize).copied())
         .unwrap_or(0);
-    FseTable {
-        table_log: 0,
-        entries: vec![FseEntry {
+    FseTable::new(
+        0,
+        vec![FseEntry {
             symbol,
             nb_bits: 0,
             next_state: 0,
             nb_additional_bits,
             base_value,
         }],
-    }
+    )
 }
 
 // ============================================================================
