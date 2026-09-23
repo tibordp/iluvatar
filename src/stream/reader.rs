@@ -183,13 +183,12 @@ impl StreamReader {
                         remaining: self.target_len,
                     }
                 };
-                if compressed_start == 0 {
-                    EngineRequest::NeedInput
-                } else {
-                    EngineRequest::SeekAndRead {
-                        offset: compressed_start,
-                        len: BUF_SIZE,
-                    }
+                // Always an explicit seek, even to 0: the caller's handle
+                // may stand anywhere (after indexing, or after a previous
+                // read through the same handle).
+                EngineRequest::SeekAndRead {
+                    offset: compressed_start,
+                    len: BUF_SIZE,
                 }
             }
             State::NeedInputSkipping { remaining } => {

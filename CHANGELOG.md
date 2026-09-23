@@ -36,6 +36,12 @@
   reached the trailer even when part of that call's output was still staged
   inside it, so a `StreamReader` retargeted with `seek_forward` at that
   point served nothing for the rest of the file.
+- `sync::Stream` and `tokio::Stream` range reads served by the checkpoint
+  at the start of the stream read from wherever the file handle stood:
+  after indexing that was the end of the file, so the read came back empty,
+  and after an earlier read it fed the decoder bytes from the wrong place
+  (a decode error, or wrong data). `StreamReader` now always asks for an
+  explicit `SeekAndRead`, including to offset 0.
 
 ### Changed
 

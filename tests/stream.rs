@@ -674,3 +674,45 @@ fn indexer_can_hand_out_its_output() {
     assert!(index.complete);
     assert_eq!(index.unpacked_len, Some(plain.len() as u64));
 }
+
+/// Repeated range reads through one `sync::Stream` handle, starting right
+/// after indexing (handle at EOF) and jumping back to ranges served by the
+/// checkpoint at packed offset 0. The reader must seek there explicitly
+/// rather than assume the handle stands at the start.
+#[test]
+fn sync_stream_repeated_reads_through_one_handle() {
+    use iluvatar::sync::Stream;
+    use std::io::Cursor;
+
+    let plain = mixed(3, 700_000);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("gzip", gzip(&plain)),
+        ("bzip2", bzip2(&plain)),
+        ("xz", xz(&plain)),
+        ("zstd", zstd(&plain)),
+    ];
+    let ranges = [
+        (0u64, 4096u64),
+        (400_000, 50_000),
+        (10, 100),
+        (650_000, 100_000),
+        (0, 700_000),
+        (123_456, 7),
+    ];
+    for (name, compressed) in cases {
+        let mut stream = Stream::with_strategy(
+            Cursor::new(compressed.as_slice()),
+            FixedInterval::new(64 * 1024),
+        )
+        .unwrap();
+        for (offset, len) in ranges {
+            let got = stream.read_range(offset, len).unwrap();
+            let end = (offset + len).min(plain.len() as u64) as usize;
+            assert!(
+                got == plain[offset as usize..end],
+                "{name}: range {offset}+{len} returned {} wrong bytes",
+                got.len()
+            );
+        }
+    }
+}
