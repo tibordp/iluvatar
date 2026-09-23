@@ -58,6 +58,8 @@ pub struct StreamReader {
     eof: bool,
     /// The decoder reported the end of the stream.
     stream_ended: bool,
+    /// The checkpoint has been restored (the first `step` happened).
+    started: bool,
 }
 
 impl StreamReader {
@@ -92,6 +94,7 @@ impl StreamReader {
             unpacked_pos: 0,
             eof: false,
             stream_ended: false,
+            started: false,
         })
     }
 
@@ -116,11 +119,27 @@ impl StreamReader {
     /// start before [`position`](Self::position). Output already decoded
     /// past the new offset is served from the buffer; the rest is decoded
     /// forward from where the decoder stands, with no checkpoint restore.
+    ///
+    /// A reader that hasn't been stepped yet (or was created for an empty
+    /// range) is simply retargeted; `offset` must not be before the offset
+    /// it was created for, since that picked its checkpoint.
     pub fn seek_forward(&mut self, offset: u64, len: u64) -> Result<()> {
-        if matches!(self.state, State::SeekToCheckpoint) {
-            return Err(Error::InvalidState(
-                "seek_forward before the reader has started".into(),
-            ));
+        if !self.started {
+            if offset < self.target_offset {
+                return Err(Error::InvalidState(format!(
+                    "seek_forward to {} before the reader's start {}",
+                    offset, self.target_offset
+                )));
+            }
+            self.target_offset = offset;
+            self.target_len = len;
+            self.range_left = len;
+            self.state = if len == 0 {
+                State::Done
+            } else {
+                State::SeekToCheckpoint
+            };
+            return Ok(());
         }
         let position = self.position();
         if offset < position {
@@ -172,6 +191,7 @@ impl StreamReader {
                 if let Err(e) = self.decompressor.restore(&self.checkpoint) {
                     return Some(EngineRequest::Error(e));
                 }
+                self.started = true;
                 let compressed_start = self.checkpoint.compressed_offset;
                 self.compressed_pos = compressed_start;
                 self.unpacked_pos = self.checkpoint.uncompressed_offset;

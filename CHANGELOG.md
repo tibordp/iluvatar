@@ -42,6 +42,11 @@
   and after an earlier read it fed the decoder bytes from the wrong place
   (a decode error, or wrong data). `StreamReader` now always asks for an
   explicit `SeekAndRead`, including to offset 0.
+- `StreamReader::seek_forward` on a reader created for an empty range at a
+  checkpoint past the start of the stream decoded from a decoder that had
+  never restored the checkpoint, silently returning nothing. A reader that
+  hasn't started is now simply retargeted (this also lifts the error for
+  `seek_forward` before the first `step`).
 
 ### Changed
 

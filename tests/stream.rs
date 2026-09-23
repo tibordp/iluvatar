@@ -608,6 +608,37 @@ fn seek_forward_serves_sequential_and_jumping_reads() {
     assert!(drive_reader(&mut reader, &compressed, 4096).is_empty());
 }
 
+/// `seek_forward` on a reader that hasn't restored its checkpoint yet
+/// (never stepped, or created for an empty range, as when extraction
+/// starts at an empty file) retargets it. It used to decode from an
+/// unrestored decoder and silently return nothing.
+#[test]
+fn seek_forward_before_the_first_step_retargets() {
+    let plain = mixed(10, 400_000);
+    let compressed = xz(&plain);
+    let index = index_stream(
+        &compressed,
+        CodecSpec::single(Codec::Xz),
+        64 * 1024,
+        4096,
+        None,
+    );
+    for len in [0u64, 500] {
+        // Past the first checkpoint, so a fresh decoder is in the wrong place.
+        let mut reader = StreamReader::new(&index, 250_000, len).unwrap();
+        reader.seek_forward(250_100, 1_000).unwrap();
+        assert_eq!(
+            drive_reader(&mut reader, &compressed, 4096),
+            &plain[250_100..251_100],
+            "created with len {len}"
+        );
+    }
+    // Before the offset the reader was created for is refused: that
+    // offset picked the checkpoint.
+    let mut reader = StreamReader::new(&index, 250_000, 0).unwrap();
+    assert!(reader.seek_forward(100, 10).is_err());
+}
+
 /// A reader retargeted after the decoder hit the end of the stream still
 /// serves what that last decode left undelivered.
 #[test]
