@@ -608,6 +608,29 @@ fn seek_forward_serves_sequential_and_jumping_reads() {
     assert!(drive_reader(&mut reader, &compressed, 4096).is_empty());
 }
 
+/// A reader retargeted after the decoder hit the end of the stream still
+/// serves what that last decode left undelivered.
+#[test]
+fn seek_forward_after_the_decoder_reached_stream_end() {
+    let plain = mixed(4, 215_040);
+    for (compressed, codec) in [
+        (gzip(&plain), Codec::Deflate { raw: false }),
+        (xz(&plain), Codec::Xz),
+        (bzip2(&plain), Codec::Bzip2),
+        (zstd(&plain), Codec::Zstd),
+    ] {
+        let index = index_stream(&compressed, CodecSpec::single(codec), 1 << 20, 4096, None);
+        let mut reader = StreamReader::new(&index, 0, 100_000).unwrap();
+        let mut got = drive_reader(&mut reader, &compressed, 1 << 20);
+        for (off, len) in [(100_000u64, 100_000u64), (200_000, 15_040)] {
+            reader.seek_forward(off, len).unwrap();
+            got.extend_from_slice(&drive_reader(&mut reader, &compressed, 1 << 20));
+        }
+        assert_eq!(got.len(), plain.len());
+        assert!(got == plain);
+    }
+}
+
 #[test]
 fn indexer_can_hand_out_its_output() {
     let plain = mixed(10, 100_000);

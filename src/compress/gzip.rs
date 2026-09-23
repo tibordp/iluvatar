@@ -279,7 +279,13 @@ impl GzipDecompressor {
             TINFLStatus::Done => {
                 self.finished = true;
                 self.header_state = GzipHeaderState::Finished;
-                DecompressStatus::StreamEnd
+                // The end is reported by the flush that empties the stage,
+                // never while it still holds output.
+                if self.stage.is_empty() {
+                    DecompressStatus::StreamEnd
+                } else {
+                    DecompressStatus::Continue
+                }
             }
             TINFLStatus::NeedsMoreInput
             | TINFLStatus::HasMoreOutput

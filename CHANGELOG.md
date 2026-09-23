@@ -30,6 +30,13 @@
   public API; `lzma` gained a raw LZMA1 stage and `gzip` a raw-deflate
   constructor.
 
+### Fixed
+
+- The gzip decoder reported the end of the stream on the decode call that
+  reached the trailer even when part of that call's output was still staged
+  inside it, so a `StreamReader` retargeted with `seek_forward` at that
+  point served nothing for the rest of the file.
+
 ### Changed
 
 - **Checkpoints are exact.** `Decompressor::checkpoint` now returns
