@@ -404,6 +404,35 @@ impl ArchiveParser for TarParser {
     fn stream_pos(&self) -> u64 {
         self.stream_pos
     }
+
+    fn end_of_stream(&self) -> Result<()> {
+        let problem = match &self.state {
+            // Missing end-of-archive zero blocks are common and harmless.
+            ParserState::ReadingHeader if self.header_pos == 0 => {
+                let pending_metadata = self.pax_path.is_some()
+                    || self.pax_linkpath.is_some()
+                    || self.pax_size.is_some()
+                    || self.gnu_long_name.is_some()
+                    || self.gnu_long_link.is_some();
+                if !pending_metadata {
+                    return Ok(());
+                }
+                "stream ended after an extended header, before its entry".to_string()
+            }
+            ParserState::OneZeroBlock | ParserState::End => return Ok(()),
+            ParserState::ReadingHeader => "stream ended inside a header".to_string(),
+            ParserState::SkippingData { remaining } => {
+                format!(
+                    "stream ended {} bytes before the end of a member",
+                    remaining
+                )
+            }
+            ParserState::ReadingPaxData { .. } | ParserState::ReadingGnuLong { .. } => {
+                "stream ended inside an extended header".to_string()
+            }
+        };
+        Err(Error::TruncatedArchive(problem))
+    }
 }
 
 #[cfg(test)]

@@ -66,6 +66,11 @@ pub enum Error {
     #[error("truncated input")]
     TruncatedInput,
 
+    /// The archive ended somewhere a well-formed archive cannot end, such
+    /// as inside a header or a member's data.
+    #[error("truncated archive: {0}")]
+    TruncatedArchive(String),
+
     /// An I/O error occurred (wraps [`std::io::Error`]).
     #[error("I/O error: {0}")]
     Io(String),

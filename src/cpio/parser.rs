@@ -518,6 +518,28 @@ impl ArchiveParser for CpioParser {
     fn stream_pos(&self) -> u64 {
         self.stream_pos
     }
+
+    fn end_of_stream(&self) -> Result<()> {
+        let problem = match &self.state {
+            CpioState::End => return Ok(()),
+            CpioState::ReadingHeader if self.header_buf.is_empty() => {
+                format!("stream ended before the {} entry", TRAILER_NAME)
+            }
+            CpioState::ReadingHeader | CpioState::ReadingFilename { .. } => {
+                "stream ended inside a header".to_string()
+            }
+            CpioState::SkippingData { remaining } => {
+                format!(
+                    "stream ended {} bytes before the end of a member",
+                    remaining
+                )
+            }
+            CpioState::SkippingNamePad { .. }
+            | CpioState::ReadingLinkTarget { .. }
+            | CpioState::SkippingDataPad { .. } => "stream ended inside an entry".to_string(),
+        };
+        Err(Error::TruncatedArchive(problem))
+    }
 }
 
 #[cfg(test)]

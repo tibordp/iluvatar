@@ -18,6 +18,23 @@
   formats (and their error variants) can be added without a breaking
   release. Exhaustive matches on either need a wildcard arm.
 
+### Fixed
+
+- Truncated archives were indexed without complaint: an uncompressed (or
+  cleanly recompressed) archive cut off inside a header or a member's data
+  produced an index whose last entry ran past the end of the stream, and
+  reading that entry silently returned a short file. Indexing now fails
+  with the new `Error::TruncatedArchive` when the stream ends somewhere an
+  archive cannot end. Tar may still end without its zero blocks, and ar
+  without the pad byte after an odd-sized last member; cpio requires its
+  `TRAILER!!!` entry.
+- Reads now fail with `Error::TruncatedInput` instead of returning short
+  data when the stream ends before the requested range: always for archive
+  entries (`ReadEngine`), and for `StreamReader` ranges whenever the index
+  knows the stream's length. `ReadEngine` also rejects an entry that runs
+  past the end of the stream, which an index built by an earlier version
+  from a truncated archive can contain.
+
 ## 0.4.0 — 2026-09-23
 
 ### Added

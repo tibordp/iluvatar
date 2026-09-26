@@ -32,7 +32,11 @@ enum ArState {
         buf: Vec<u8>,
     },
     /// Skipping member data and its padding.
-    SkippingData { remaining: u64 },
+    SkippingData {
+        remaining: u64,
+        /// How many of the `remaining` bytes are the trailing pad byte.
+        pad: u64,
+    },
 }
 
 /// How a member header is to be handled.
@@ -119,7 +123,7 @@ impl ArParser {
         let pad = hdr.size & 1;
         let event = match self.classify(&hdr)? {
             Member::Skip => {
-                self.skip(hdr.size + pad);
+                self.skip(hdr.size, pad);
                 ArchiveEvent::NeedData
             }
             Member::NameTable => {
@@ -146,7 +150,7 @@ impl ArParser {
             }
             Member::Named(path) => {
                 let entry = self.entry(path, &hdr, hdr.size);
-                self.skip(hdr.size + pad);
+                self.skip(hdr.size, pad);
                 ArchiveEvent::Entry(entry)
             }
         };
@@ -230,11 +234,13 @@ impl ArParser {
         }
     }
 
-    fn skip(&mut self, remaining: u64) {
+    /// Skip `data` member bytes followed by `pad` padding bytes.
+    fn skip(&mut self, data: u64, pad: u64) {
+        let remaining = data + pad;
         self.state = if remaining == 0 {
             ArState::ReadingHeader
         } else {
-            ArState::SkippingData { remaining }
+            ArState::SkippingData { remaining, pad }
         };
     }
 
@@ -256,7 +262,7 @@ impl ArParser {
             _ => unreachable!(),
         };
         self.name_table = Some(buf);
-        self.skip(pad);
+        self.skip(0, pad);
         Ok((take, ArchiveEvent::NeedData))
     }
 
@@ -281,10 +287,10 @@ impl ArParser {
         let name_end = buf.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         let name = &buf[..name_end];
         let data_size = hdr.size - buf.len() as u64;
-        let rest = data_size + (hdr.size & 1);
+        let pad = hdr.size & 1;
 
         if name.starts_with(b"__.SYMDEF") {
-            self.skip(rest);
+            self.skip(data_size, pad);
             return Ok((take, ArchiveEvent::NeedData));
         }
         if name.is_empty() {
@@ -292,17 +298,18 @@ impl ArParser {
         }
         let path = String::from_utf8_lossy(name).into_owned();
         let entry = self.entry(path, &hdr, data_size);
-        self.skip(rest);
+        self.skip(data_size, pad);
         Ok((take, ArchiveEvent::Entry(entry)))
     }
 
     fn feed_skip_data(&mut self, data: &[u8]) -> Result<(usize, ArchiveEvent)> {
-        let remaining = match &mut self.state {
-            ArState::SkippingData { remaining } => remaining,
+        let (remaining, pad) = match &mut self.state {
+            ArState::SkippingData { remaining, pad } => (remaining, pad),
             _ => unreachable!(),
         };
         let skip = (data.len() as u64).min(*remaining) as usize;
         *remaining -= skip as u64;
+        *pad = (*pad).min(*remaining);
         self.stream_pos += skip as u64;
         if *remaining == 0 {
             self.state = ArState::ReadingHeader;
@@ -333,6 +340,26 @@ impl ArchiveParser for ArParser {
 
     fn stream_pos(&self) -> u64 {
         self.stream_pos
+    }
+
+    fn end_of_stream(&self) -> Result<()> {
+        // ar has no trailer: the archive may end at any member boundary.
+        let problem = match &self.state {
+            ArState::ReadingHeader if self.header_buf.is_empty() => return Ok(()),
+            // Some writers omit the pad byte after an odd-sized last member.
+            ArState::SkippingData { remaining, pad } if remaining <= pad => return Ok(()),
+            ArState::ReadingMagic => "stream ended inside the global header".to_string(),
+            ArState::ReadingHeader => "stream ended inside a member header".to_string(),
+            ArState::ReadingNameTable { .. } => {
+                "stream ended inside the long-name table".to_string()
+            }
+            ArState::ReadingBsdName { .. } => "stream ended inside a member name".to_string(),
+            ArState::SkippingData { remaining, pad } => format!(
+                "stream ended {} bytes before the end of a member",
+                remaining - pad
+            ),
+        };
+        Err(Error::TruncatedArchive(problem))
     }
 }
 

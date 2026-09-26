@@ -29,4 +29,12 @@ pub trait ArchiveParser: Send {
 
     /// Current position in the uncompressed stream.
     fn stream_pos(&self) -> u64;
+
+    /// Called when the stream ends before the parser reported
+    /// `EndOfArchive`. Returns [`Error::TruncatedArchive`] if the stream
+    /// stopped somewhere a well-formed archive cannot end (inside a
+    /// header, inside a member's data, before a required trailer).
+    ///
+    /// [`Error::TruncatedArchive`]: crate::Error::TruncatedArchive
+    fn end_of_stream(&self) -> Result<()>;
 }

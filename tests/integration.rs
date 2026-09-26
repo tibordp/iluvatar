@@ -2105,3 +2105,193 @@ fn test_extract_all_with_one_live_reader() {
         );
     }
 }
+
+// ─── Truncated archives ───
+
+/// Like `index_in_memory`, but returns indexing errors.
+fn try_index_in_memory(data: &[u8], format: CompressionFormat) -> iluvatar::Result<ArchiveIndex> {
+    let mut engine = IndexingEngine::new(format, None, data.len() as u64)?;
+    let mut offset = 0;
+    loop {
+        match engine.step() {
+            EngineRequest::NeedInput => {
+                if offset >= data.len() {
+                    engine.signal_eof();
+                } else {
+                    let end = (offset + 8192).min(data.len());
+                    engine.provide_data(&data[offset..end]);
+                    offset = end;
+                }
+            }
+            EngineRequest::Done => return Ok(engine.finish()),
+            EngineRequest::Error(e) => return Err(e),
+            _ => {}
+        }
+    }
+}
+
+/// Like `read_in_memory`, but returns read errors.
+fn try_read_in_memory(data: &[u8], index: &ArchiveIndex, path: &str) -> iluvatar::Result<Vec<u8>> {
+    let mut engine = ReadEngine::new(index, path)?;
+    let mut result = Vec::new();
+    let mut offset = 0;
+    let mut buf = vec![0u8; 65536];
+    loop {
+        match engine.step() {
+            EngineRequest::NeedInput => {
+                if offset >= data.len() {
+                    engine.signal_eof();
+                } else {
+                    let end = (offset + 8192).min(data.len());
+                    engine.provide_data(&data[offset..end]);
+                    offset = end;
+                }
+            }
+            EngineRequest::SeekAndRead { offset: off, len } => {
+                let start = (off as usize).min(data.len());
+                let end = (start + len).min(data.len());
+                if start == end {
+                    engine.signal_eof();
+                } else {
+                    engine.provide_data(&data[start..end]);
+                }
+                offset = end;
+            }
+            EngineRequest::OutputReady => loop {
+                let n = engine.read_output(&mut buf);
+                if n == 0 {
+                    break;
+                }
+                result.extend_from_slice(&buf[..n]);
+            },
+            EngineRequest::Done => return Ok(result),
+            EngineRequest::Error(e) => return Err(e),
+        }
+    }
+}
+
+/// Index every proper prefix of `archive`. Each must either fail as a
+/// truncated archive or index only entries whose data lies inside the
+/// prefix. Returns how many prefixes failed.
+fn check_every_prefix(archive: &[u8]) -> usize {
+    let mut failures = 0;
+    for len in 0..archive.len() {
+        match try_index_in_memory(&archive[..len], CompressionFormat::None) {
+            Ok(index) => {
+                for entry in index.entries.values() {
+                    assert!(
+                        entry.uncompressed_offset + entry.size <= len as u64,
+                        "prefix {}: {} extends past the end",
+                        len,
+                        entry.path
+                    );
+                }
+            }
+            Err(iluvatar::Error::TruncatedArchive(_)) => failures += 1,
+            Err(e) => panic!("prefix {}: unexpected error {}", len, e),
+        }
+    }
+    failures
+}
+
+fn truncation_files() -> Vec<(String, Vec<u8>)> {
+    vec![
+        ("small.txt".into(), b"hello".to_vec()),
+        (format!("{}/long_name.bin", "d".repeat(120)), vec![7; 1500]),
+        ("odd.bin".into(), vec![9; 333]),
+    ]
+}
+
+#[test]
+fn test_truncated_tar_prefixes() {
+    let files = truncation_files();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
+    let tar_data = create_tar_bytes(&refs);
+    assert!(check_every_prefix(&tar_data) > 0);
+}
+
+#[test]
+fn test_truncated_cpio_prefixes() {
+    let files = truncation_files();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
+    let cpio_data = create_cpio_bytes(&refs);
+    // Every prefix without the trailer fails. The empty prefix is an empty
+    // archive, and the three prefixes that stop in the alignment padding
+    // after the trailer's name (110 + 11 bytes, padded to 124) have
+    // already seen it.
+    assert_eq!(check_every_prefix(&cpio_data), cpio_data.len() - 4);
+}
+
+#[test]
+fn test_truncated_ar_prefixes() {
+    let files = truncation_files();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
+    let ar_data = create_ar_bytes(&refs);
+    assert!(check_every_prefix(&ar_data) > 0);
+
+    // The pad byte after an odd-sized last member may be missing.
+    assert_eq!(ar_data.last(), Some(&b'\n'));
+    let index =
+        try_index_in_memory(&ar_data[..ar_data.len() - 1], CompressionFormat::None).unwrap();
+    assert_eq!(index.entries.len(), 3);
+}
+
+#[cfg(feature = "gzip")]
+#[test]
+fn test_truncated_compressed_archive_fails_indexing() {
+    let tar_data = create_tar_bytes(&[("a.txt", &b"alpha"[..]), ("b.bin", &[1u8; 4000][..])]);
+    // Compress only a prefix that ends inside b.bin, as a complete gzip
+    // stream: the codec is happy, the archive is not.
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar_data[..2000]).unwrap();
+    let compressed = encoder.finish().unwrap();
+    assert!(matches!(
+        try_index_in_memory(&compressed, CompressionFormat::Gzip),
+        Err(iluvatar::Error::TruncatedArchive(_))
+    ));
+}
+
+#[test]
+fn test_read_from_file_truncated_after_indexing() {
+    let tar_data = create_tar_bytes(&[("a.txt", &b"alpha"[..]), ("b.bin", &[1u8; 4000][..])]);
+    let index = index_in_memory(&tar_data, CompressionFormat::None);
+    let entry = index.get("b.bin").unwrap();
+    let cut = (entry.uncompressed_offset + 1000) as usize;
+
+    assert!(matches!(
+        try_read_in_memory(&tar_data[..cut], &index, "b.bin"),
+        Err(iluvatar::Error::TruncatedInput)
+    ));
+    // Entries before the cut are still readable.
+    assert_eq!(
+        try_read_in_memory(&tar_data[..cut], &index, "a.txt").unwrap(),
+        b"alpha"
+    );
+}
+
+#[test]
+fn test_read_entry_past_end_of_stream_rejected() {
+    // An index claiming an entry runs past the end of the stream (e.g. one
+    // built before truncated archives were rejected).
+    let ar_data = create_ar_bytes(&[("a.o", &b"alpha"[..]), ("b.o", &[1u8; 100][..])]);
+    let mut index = index_in_memory(&ar_data, CompressionFormat::None);
+    index.stream.unpacked_len = Some(ar_data.len() as u64 - 10);
+
+    assert!(matches!(
+        ReadEngine::new(&index, "b.o"),
+        Err(iluvatar::Error::TruncatedInput)
+    ));
+    assert_eq!(
+        try_read_in_memory(&ar_data, &index, "a.o").unwrap(),
+        b"alpha"
+    );
+}

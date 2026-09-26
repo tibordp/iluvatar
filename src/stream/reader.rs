@@ -136,19 +136,35 @@ pub struct StreamReader {
     stream_ended: bool,
     /// The checkpoint has been restored (the first `step` happened).
     started: bool,
+    /// Unpacked length of the stream, when the index knows it.
+    unpacked_len: Option<u64>,
+    /// The range is known to exist: ending short of it is an error rather
+    /// than the end of the data.
+    require_full: bool,
+}
+
+/// Cut `offset..offset + len` to a stream of `unpacked_len` bytes.
+fn clamp_len(unpacked_len: Option<u64>, offset: u64, len: u64) -> u64 {
+    match unpacked_len {
+        Some(total) => len.min(total.saturating_sub(offset)),
+        None => len,
+    }
 }
 
 impl StreamReader {
     /// Read `len` unpacked bytes starting at `offset`. A range past the
     /// data the stream holds is cut short; one starting at or past the end
     /// completes with no output.
+    ///
+    /// When the index knows the stream's unpacked length, the (cut) range
+    /// is known to exist, and a stream that ends before delivering all of
+    /// it (a file truncated since it was indexed) is reported as
+    /// [`Error::TruncatedInput`]. Without a known length, the end of the
+    /// stream simply ends the range.
     pub fn new(index: &StreamIndex, offset: u64, len: u64) -> Result<Self> {
         let decompressor = index.codec.create()?;
         let (_, checkpoint) = index.best_checkpoint_for_offset(offset);
-        let mut len = len;
-        if let Some(total) = index.unpacked_len {
-            len = len.min(total.saturating_sub(offset));
-        }
+        let len = clamp_len(index.unpacked_len, offset, len);
         Ok(Self {
             decompressor,
             checkpoint: checkpoint.clone(),
@@ -171,7 +187,15 @@ impl StreamReader {
             eof: false,
             stream_ended: false,
             started: false,
+            unpacked_len: index.unpacked_len,
+            require_full: index.unpacked_len.is_some(),
         })
+    }
+
+    /// Treat any range as known to exist, even without a known stream
+    /// length: archive entries have sizes the stream must hold.
+    pub(crate) fn require_full_range(&mut self) {
+        self.require_full = true;
     }
 
     /// Decoded bytes the caller may take right now.
@@ -214,6 +238,7 @@ impl StreamReader {
                     offset, self.target_offset
                 )));
             }
+            let len = clamp_len(self.unpacked_len, offset, len);
             self.target_offset = offset;
             self.target_len = len;
             self.range_left = len;
@@ -241,6 +266,7 @@ impl StreamReader {
             self.output_read = 0;
         }
         let beyond = offset - position - drop;
+        let len = clamp_len(self.unpacked_len, offset, len);
         self.target_offset = offset;
         self.target_len = len;
         self.range_left = len;
@@ -259,6 +285,11 @@ impl StreamReader {
     pub fn step(&mut self) -> EngineRequest {
         loop {
             match self.step_once() {
+                // Everything decoded has been served by the time `Done` is
+                // reported, so `range_left` is what the stream never held.
+                Some(EngineRequest::Done) if self.range_left > 0 && self.require_full => {
+                    return EngineRequest::Error(Error::TruncatedInput);
+                }
                 Some(request) => return request,
                 None => continue,
             }

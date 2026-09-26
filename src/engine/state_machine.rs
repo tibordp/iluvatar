@@ -160,6 +160,11 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
                     }
                 }
                 EngineRequest::Done => {
+                    // Left unset on error, so a retried step fails again
+                    // instead of reporting success.
+                    if let Err(e) = self.end_of_stream() {
+                        return EngineRequest::Error(e);
+                    }
                     self.done = true;
                     return EngineRequest::Done;
                 }
@@ -204,6 +209,27 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
             self.chunk = chunk;
             result?;
         }
+    }
+
+    /// The stream ended without the parser reporting the end of the
+    /// archive: check that it ended somewhere an archive may end.
+    fn end_of_stream(&mut self) -> Result<()> {
+        if self.archive_parser.is_none() {
+            if self.detect_buf.is_empty() {
+                // An empty stream is an empty archive.
+                return Ok(());
+            }
+            // Too short for detection to pick cpio or ar, so it can only be
+            // tar; let the tar parser judge it.
+            self.archive_parser = Some(create_archive_parser(ArchiveFormat::Tar));
+            self.index_builder.set_archive_format(ArchiveFormat::Tar);
+            let detect = std::mem::take(&mut self.detect_buf);
+            self.feed_to_parser(&detect)?;
+            if self.done {
+                return Ok(());
+            }
+        }
+        self.archive_parser.as_ref().unwrap().end_of_stream()
     }
 
     /// Feed decompressed data to the archive parser.
@@ -358,14 +384,7 @@ impl ReadEngine {
     ///
     /// Looks up the file in the index and prepares to read it.
     pub fn new(index: &ArchiveIndex, path: &str) -> Result<Self> {
-        let entry = index
-            .get(path)
-            .ok_or_else(|| crate::error::Error::FileNotFound(path.into()))?;
-        Ok(Self(StreamReader::new(
-            &index.stream,
-            entry.uncompressed_offset,
-            entry.size,
-        )?))
+        Self::new_range(index, path, 0, u64::MAX)
     }
 
     /// Create a read engine for a byte range within a file.
@@ -382,13 +401,23 @@ impl ReadEngine {
         let entry = index
             .get(path)
             .ok_or_else(|| crate::error::Error::FileNotFound(path.into()))?;
+        // An entry reaching past the end of the stream means the archive
+        // was truncated (an index built before truncated archives were
+        // rejected, or a crafted one); the reader would cut the read short.
+        if let Some(total) = index.stream.unpacked_len {
+            if entry.uncompressed_offset.saturating_add(entry.size) > total {
+                return Err(crate::error::Error::TruncatedInput);
+            }
+        }
         let file_offset = file_offset.min(entry.size);
         let read_len = len.min(entry.size - file_offset);
-        Ok(Self(StreamReader::new(
+        let mut reader = StreamReader::new(
             &index.stream,
             entry.uncompressed_offset + file_offset,
             read_len,
-        )?))
+        )?;
+        reader.require_full_range();
+        Ok(Self(reader))
     }
 
     /// Drive the state machine forward.
