@@ -11,8 +11,23 @@
   library layouts are supported; symbol tables are skipped. GNU thin
   archives, whose members live outside the archive, are rejected with
   `Error::InvalidArHeader`.
+- `ArchiveIndex::get_all` returns every member with a given path, and
+  `ReadEngine::for_entry` / `for_entry_range` read a specific entry, so
+  each of several same-named members can be reached.
 
 ### Changed
+
+- **`ArchiveIndex` keeps entries in archive order and keeps duplicates.**
+  The `entries` field (a `HashMap` keyed by path) is now private;
+  `entries()` returns every entry in archive order, and `list` returns
+  archive order too, where it was arbitrary. Members sharing a path (a
+  static library with two `foo.o`, a tar appended to with `tar -r`)
+  were collapsed to the last one; all are kept now, and `get`, `len` and
+  `ReadEngine::new` count and resolve them as described in the
+  `ArchiveIndex` docs (`get` still resolves to the last). The index
+  format version is bumped: rebuild saved indexes.
+- `iluvatar ls` lists in archive order, like `tar t`, instead of sorting
+  by path.
 
 - `ArchiveFormat` and `Error` are now `#[non_exhaustive]`, so future
   formats (and their error variants) can be added without a breaking

@@ -245,7 +245,7 @@ fn test_uncompressed_index_and_read() {
     let tar_data = create_tar_bytes(&refs);
 
     let index = index_in_memory(&tar_data, CompressionFormat::None);
-    assert_eq!(index.entries.len(), files.len());
+    assert_eq!(index.len(), files.len());
 
     for (path, expected) in &files {
         let entry = index.get(path).unwrap();
@@ -271,7 +271,7 @@ fn test_gzip_index_and_read() {
     let compressed = create_tar_gz(&refs);
 
     let index = index_in_memory(&compressed, CompressionFormat::Gzip);
-    assert_eq!(index.entries.len(), files.len());
+    assert_eq!(index.len(), files.len());
 
     for (path, expected) in &files {
         let entry = index.get(path).unwrap();
@@ -297,7 +297,7 @@ fn test_bzip2_index_and_read() {
     let compressed = create_tar_bz2(&refs);
 
     let index = index_in_memory(&compressed, CompressionFormat::Bzip2);
-    assert_eq!(index.entries.len(), files.len());
+    assert_eq!(index.len(), files.len());
 
     for (path, expected) in &files {
         let entry = index.get(path).unwrap();
@@ -346,7 +346,7 @@ fn test_bzip2_multiblock_index_and_read() {
     let compressed = create_tar_bz2_small_blocks(&files);
 
     let index = index_in_memory(&compressed, CompressionFormat::Bzip2);
-    assert_eq!(index.entries.len(), 3);
+    assert_eq!(index.len(), 3);
 
     // Verify that at least one mid-stream checkpoint exists.
     assert!(
@@ -373,7 +373,7 @@ fn test_xz_index_and_read() {
     let compressed = create_tar_xz(&refs);
 
     let index = index_in_memory(&compressed, CompressionFormat::Xz);
-    assert_eq!(index.entries.len(), files.len());
+    assert_eq!(index.len(), files.len());
 
     for (path, expected) in &files {
         let entry = index.get(path).unwrap();
@@ -399,7 +399,7 @@ fn test_zstd_index_and_read() {
     let compressed = create_tar_zst(&refs);
 
     let index = index_in_memory(&compressed, CompressionFormat::Zstd);
-    assert_eq!(index.entries.len(), files.len());
+    assert_eq!(index.len(), files.len());
 
     for (path, expected) in &files {
         let entry = index.get(path).unwrap();
@@ -521,7 +521,7 @@ fn test_index_save_and_load() {
     let bytes = std::fs::read(index_file.path()).unwrap();
     let loaded_index = ArchiveIndex::from_bytes(&bytes).unwrap();
 
-    assert_eq!(loaded_index.entries.len(), files.len());
+    assert_eq!(loaded_index.len(), files.len());
     for (path, expected) in &files {
         let entry = loaded_index.get(path).unwrap();
         assert_eq!(entry.size, expected.len() as u64);
@@ -867,7 +867,7 @@ fn test_index_bytes_roundtrip() {
     let bytes = index.to_bytes().unwrap();
     let restored = ArchiveIndex::from_bytes(&bytes).unwrap();
 
-    assert_eq!(restored.entries.len(), index.entries.len());
+    assert_eq!(restored.len(), index.len());
     assert_eq!(restored.checkpoints().len(), index.checkpoints().len());
     assert_eq!(restored.metadata.compression, index.metadata.compression);
 
@@ -971,7 +971,7 @@ fn test_snapshot_index_usable_for_reads() {
 
     let snap = snapshot.expect("should have taken a snapshot");
     assert!(!snap.metadata.complete);
-    assert!(snap.entries.len() >= 3);
+    assert!(snap.len() >= 3);
 
     // Verify we can read files from the snapshot
     for (path, expected) in &files {
@@ -984,7 +984,7 @@ fn test_snapshot_index_usable_for_reads() {
     // Final index should be complete and have all entries
     let final_index = engine.finish();
     assert!(final_index.metadata.complete);
-    assert_eq!(final_index.entries.len(), files.len());
+    assert_eq!(final_index.len(), files.len());
 }
 
 #[cfg(feature = "gzip")]
@@ -1029,8 +1029,8 @@ fn test_cancel_returns_partial_index() {
 
     let partial = engine.cancel();
     assert!(!partial.metadata.complete);
-    assert!(partial.entries.len() >= 5);
-    assert!(partial.entries.len() < files.len());
+    assert!(partial.len() >= 5);
+    assert!(partial.len() < files.len());
 
     // Files in the partial index should be readable
     for (path, expected) in &files {
@@ -1539,7 +1539,7 @@ fn test_cpio_index_and_read() {
 
     let index = index_in_memory(&cpio_data, CompressionFormat::None);
 
-    assert_eq!(index.entries.len(), 2);
+    assert_eq!(index.len(), 2);
     assert!(index.get("hello.txt").is_some());
     assert!(index.get("data.bin").is_some());
     assert_eq!(index.get("hello.txt").unwrap().size, 13);
@@ -1567,7 +1567,7 @@ fn test_cpio_gzip_index_and_read() {
 
     let index = index_in_memory(&compressed, CompressionFormat::Gzip);
 
-    assert_eq!(index.entries.len(), 2);
+    assert_eq!(index.len(), 2);
     assert_eq!(index.metadata.archive_format, ArchiveFormat::Cpio);
 
     let content1 = read_in_memory(&compressed, &index, "file1.txt");
@@ -1604,7 +1604,7 @@ fn test_cpio_many_files() {
     let cpio_data = create_cpio_bytes(&refs);
 
     let index = index_in_memory(&cpio_data, CompressionFormat::None);
-    assert_eq!(index.entries.len(), 50);
+    assert_eq!(index.len(), 50);
 
     for (path, expected) in &files {
         let content = read_in_memory(&cpio_data, &index, path);
@@ -1650,7 +1650,7 @@ fn test_cpio_empty_file() {
     let cpio_data = create_cpio_bytes(&[("empty.txt", &b""[..])]);
     let index = index_in_memory(&cpio_data, CompressionFormat::None);
 
-    assert_eq!(index.entries.len(), 1);
+    assert_eq!(index.len(), 1);
     assert_eq!(index.get("empty.txt").unwrap().size, 0);
 
     let content = read_in_memory(&cpio_data, &index, "empty.txt");
@@ -1799,7 +1799,7 @@ fn test_entry_checkpoints_usable_for_reading() {
     let index = engine.finish();
     assert!(index.checkpoints().len() > 2, "want several checkpoints");
 
-    for entry in index.entries.values() {
+    for entry in index.entries() {
         let cp = &index.checkpoints()[entry.checkpoint_index];
         assert!(
             cp.uncompressed_offset <= entry.uncompressed_offset,
@@ -1899,7 +1899,7 @@ fn test_ar_index_and_read() {
         let index = index_in_memory(&ar_data, CompressionFormat::None);
 
         assert_eq!(index.metadata.archive_format, ArchiveFormat::Ar);
-        assert_eq!(index.entries.len(), 3);
+        assert_eq!(index.len(), 3);
         let hello = index.get("hello.txt").unwrap();
         assert_eq!(hello.size, 13);
         assert_eq!(hello.mode, 0o644);
@@ -1924,7 +1924,7 @@ fn test_ar_gzip_index_and_read() {
 
     let index = index_in_memory(&compressed, CompressionFormat::Gzip);
     assert_eq!(index.metadata.archive_format, ArchiveFormat::Ar);
-    assert_eq!(index.entries.len(), 3);
+    assert_eq!(index.len(), 3);
 
     for (path, expected) in files {
         assert_eq!(&read_in_memory(&compressed, &index, path), expected);
@@ -1935,7 +1935,7 @@ fn test_ar_gzip_index_and_read() {
 fn test_ar_empty_archive() {
     let index = index_in_memory(b"!<arch>\n", CompressionFormat::None);
     assert_eq!(index.metadata.archive_format, ArchiveFormat::Ar);
-    assert!(index.entries.is_empty());
+    assert!(index.is_empty());
 }
 
 #[test]
@@ -1958,7 +1958,7 @@ fn test_ar_many_files_and_range_read() {
     let ar_data = create_ar_bytes(&refs);
 
     let index = index_in_memory(&ar_data, CompressionFormat::None);
-    assert_eq!(index.entries.len(), 50);
+    assert_eq!(index.len(), 50);
     for (path, expected) in &files {
         assert_eq!(
             &read_in_memory(&ar_data, &index, path),
@@ -2178,7 +2178,7 @@ fn check_every_prefix(archive: &[u8]) -> usize {
     for len in 0..archive.len() {
         match try_index_in_memory(&archive[..len], CompressionFormat::None) {
             Ok(index) => {
-                for entry in index.entries.values() {
+                for entry in index.entries() {
                     assert!(
                         entry.uncompressed_offset + entry.size <= len as u64,
                         "prefix {}: {} extends past the end",
@@ -2242,7 +2242,7 @@ fn test_truncated_ar_prefixes() {
     assert_eq!(ar_data.last(), Some(&b'\n'));
     let index =
         try_index_in_memory(&ar_data[..ar_data.len() - 1], CompressionFormat::None).unwrap();
-    assert_eq!(index.entries.len(), 3);
+    assert_eq!(index.len(), 3);
 }
 
 #[cfg(feature = "gzip")]
@@ -2294,4 +2294,112 @@ fn test_read_entry_past_end_of_stream_rejected() {
         try_read_in_memory(&ar_data, &index, "a.o").unwrap(),
         b"alpha"
     );
+}
+
+// ─── Archive order and duplicate paths ───
+
+#[test]
+fn test_entries_in_archive_order() {
+    let names = [
+        "zeta.txt",
+        "alpha.txt",
+        "mid/beta.txt",
+        "omega.txt",
+        "delta.txt",
+    ];
+    let files: Vec<(&str, &[u8])> = names.iter().map(|n| (*n, n.as_bytes())).collect();
+
+    for (format, data) in [
+        ("tar", create_tar_bytes(&files)),
+        ("cpio", create_cpio_bytes(&files)),
+        ("ar", create_ar_bytes(&files)),
+    ] {
+        let index = index_in_memory(&data, CompressionFormat::None);
+        let order: Vec<&str> = index.entries().iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(order, names, "{format}");
+        let listed: Vec<&str> = index.list(None).iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(listed, names, "{format}");
+
+        // Order survives serialization.
+        let restored = ArchiveIndex::from_bytes(&index.to_bytes().unwrap()).unwrap();
+        let order: Vec<&str> = restored.entries().iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(order, names, "{format}");
+    }
+}
+
+#[test]
+fn test_duplicate_paths_all_kept() {
+    // A static library with two different objects named foo.o, and a tar
+    // with an appended update (as `tar -r` produces).
+    let files: &[(&str, &[u8])] = &[
+        ("foo.o", b"first foo"),
+        ("bar.o", b"bar"),
+        ("foo.o", b"second foo"),
+    ];
+
+    for (format, data) in [
+        ("tar", create_tar_bytes(files)),
+        ("ar", create_ar_bytes(files)),
+    ] {
+        let index = index_in_memory(&data, CompressionFormat::None);
+        assert_eq!(index.len(), 3, "{format}");
+
+        // Path lookups resolve to the last member, as extraction would.
+        assert_eq!(
+            read_in_memory(&data, &index, "foo.o"),
+            b"second foo",
+            "{format}"
+        );
+
+        let all: Vec<_> = index.get_all("foo.o").collect();
+        assert_eq!(all.len(), 2, "{format}");
+        assert!(std::ptr::eq(all[1], index.get("foo.o").unwrap()));
+
+        // Every member is readable through its entry.
+        let mut contents = Vec::new();
+        for entry in &all {
+            let mut engine = ReadEngine::for_entry(&index, entry).unwrap();
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; 1024];
+            loop {
+                match engine.step() {
+                    EngineRequest::SeekAndRead { offset, .. } => {
+                        engine.provide_data(&data[offset as usize..]);
+                    }
+                    EngineRequest::NeedInput => engine.signal_eof(),
+                    EngineRequest::OutputReady => {
+                        let n = engine.read_output(&mut buf);
+                        out.extend_from_slice(&buf[..n]);
+                    }
+                    EngineRequest::Done => break,
+                    EngineRequest::Error(e) => panic!("{format}: {e}"),
+                }
+            }
+            contents.push(out);
+        }
+        assert_eq!(
+            contents,
+            [b"first foo".to_vec(), b"second foo".to_vec()],
+            "{format}"
+        );
+
+        // The lookup is rebuilt when an index is loaded.
+        let restored = ArchiveIndex::from_bytes(&index.to_bytes().unwrap()).unwrap();
+        assert_eq!(restored.len(), 3, "{format}");
+        assert_eq!(
+            restored.get("foo.o").unwrap().uncompressed_offset,
+            all[1].uncompressed_offset,
+            "{format}"
+        );
+        assert_eq!(restored.get_all("foo.o").count(), 2, "{format}");
+    }
+}
+
+#[test]
+fn test_get_all_matches_directory_slash_variants() {
+    let tar_data = create_tar_bytes(&[("dir/", &b""[..]), ("dir/a.txt", &b"a"[..])]);
+    let index = index_in_memory(&tar_data, CompressionFormat::None);
+    assert_eq!(index.get_all("dir").count(), 1);
+    assert_eq!(index.get_all("dir/").count(), 1);
+    assert_eq!(index.get_all("missing").count(), 0);
 }

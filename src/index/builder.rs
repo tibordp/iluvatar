@@ -3,12 +3,12 @@ use crate::compress::CompressionFormat;
 use crate::index::entry::IndexEntry;
 use crate::index::store::{ArchiveIndex, IndexMetadata, INDEX_VERSION};
 use crate::stream::StreamIndex;
-use std::collections::HashMap;
 
 /// Accumulates entries during the indexing pass; the checkpoints come from
 /// the stream indexer when the index is assembled.
 pub struct IndexBuilder {
-    entries: HashMap<String, IndexEntry>,
+    /// Entries in the order the parser reported them (archive order).
+    entries: Vec<IndexEntry>,
     compression: CompressionFormat,
     archive_format: ArchiveFormat,
     archive_size: u64,
@@ -23,7 +23,7 @@ impl IndexBuilder {
         archive_size: u64,
     ) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: Vec::new(),
             compression,
             archive_format,
             archive_size,
@@ -39,8 +39,8 @@ impl IndexBuilder {
     /// Add an archive entry to the index.
     pub fn add_entry(&mut self, entry: ArchiveEntry) {
         self.last_entry_path = Some(entry.path.clone());
-        let index_entry = IndexEntry {
-            path: entry.path.clone(),
+        self.entries.push(IndexEntry {
+            path: entry.path,
             size: entry.size,
             entry_type: entry.entry_type,
             mode: entry.mode,
@@ -50,8 +50,7 @@ impl IndexBuilder {
             link_target: entry.link_target,
             uncompressed_offset: entry.data_offset,
             checkpoint_index: 0,
-        };
-        self.entries.insert(entry.path, index_entry);
+        });
     }
 
     /// Number of entries added so far.
@@ -96,30 +95,27 @@ impl IndexBuilder {
 /// — a later checkpoint (one taken at the end of the chunk the entry was
 /// discovered in) cannot be used to read it.
 fn assemble(
-    mut entries: HashMap<String, IndexEntry>,
+    mut entries: Vec<IndexEntry>,
     compression: CompressionFormat,
     archive_format: ArchiveFormat,
     archive_size: u64,
     stream: StreamIndex,
     complete: bool,
 ) -> ArchiveIndex {
-    for entry in entries.values_mut() {
+    for entry in &mut entries {
         entry.checkpoint_index = stream
             .best_checkpoint_for_offset(entry.uncompressed_offset)
             .0;
     }
-    ArchiveIndex {
-        metadata: IndexMetadata {
-            version: INDEX_VERSION,
-            compression,
-            archive_format,
-            archive_size,
-            uncompressed_size: stream.indexed_to,
-            complete,
-        },
-        stream,
-        entries,
-    }
+    let metadata = IndexMetadata {
+        version: INDEX_VERSION,
+        compression,
+        archive_format,
+        archive_size,
+        uncompressed_size: stream.indexed_to,
+        complete,
+    };
+    ArchiveIndex::new(metadata, stream, entries)
 }
 
 #[cfg(test)]
@@ -163,7 +159,7 @@ mod tests {
         assert_eq!(builder.entry_count(), 1);
 
         let index = builder.finish(stream(&[(0, 0)], 2048), true);
-        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.len(), 1);
         assert_eq!(index.checkpoints().len(), 1);
         assert_eq!(index.metadata.uncompressed_size, 2048);
         assert_eq!(index.metadata.compression, CompressionFormat::Gzip);
@@ -176,7 +172,7 @@ mod tests {
         builder.add_entry(make_entry("a.txt", 100, 512));
 
         let snap = builder.snapshot(stream(&[(0, 0)], 1024));
-        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.len(), 1);
         assert!(!snap.metadata.complete);
         assert!(snap.get("a.txt").is_some());
 
@@ -185,7 +181,7 @@ mod tests {
         assert_eq!(builder.entry_count(), 2);
 
         let final_index = builder.finish(stream(&[(0, 0)], 4096), true);
-        assert_eq!(final_index.entries.len(), 2);
+        assert_eq!(final_index.len(), 2);
         assert!(final_index.metadata.complete);
     }
 
@@ -208,7 +204,7 @@ mod tests {
 
         let index = builder.finish(stream(&[(0, 0)], 1024), false);
         assert!(!index.metadata.complete);
-        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.len(), 1);
     }
 
     #[test]

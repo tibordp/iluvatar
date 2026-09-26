@@ -153,7 +153,7 @@ fn build_index(
     if tty {
         eprintln!(
             "\r\x1b[2K\x1b[1;32m done\x1b[0m  {} entries, {} checkpoints, {} compressed",
-            index.entries.len(),
+            index.len(),
             index.checkpoints().len(),
             human_size(size),
         );
@@ -199,8 +199,8 @@ fn cmd_ls(
     long: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let index = require_index(archive)?;
-    let mut entries: Vec<_> = index.list(path).into_iter().cloned().collect();
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    // Archive order, like `tar t` and `ar t`.
+    let entries: Vec<_> = index.list(path).into_iter().cloned().collect();
 
     let out = io::stdout();
     let color = out.is_terminal();

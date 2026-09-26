@@ -78,7 +78,7 @@ impl ArchiveIndex {
         // Consistency checks so a corrupt/crafted index cannot cause panics
         // downstream (checkpoint lookups index into `checkpoints` directly).
         index.stream.validate()?;
-        for entry in index.entries.values() {
+        for entry in index.entries() {
             if entry.checkpoint_index >= index.stream.checkpoints.len() {
                 return Err(Error::IndexError(format!(
                     "entry '{}' references checkpoint {} of {}",
@@ -102,28 +102,23 @@ mod tests {
     use crate::index::entry::IndexEntry;
     use crate::index::store::IndexMetadata;
     use crate::stream::StreamIndex;
-    use std::collections::HashMap;
 
     fn make_test_index() -> ArchiveIndex {
-        let mut entries = HashMap::new();
-        entries.insert(
-            "test.txt".into(),
-            IndexEntry {
-                path: "test.txt".into(),
-                size: 1234,
-                entry_type: EntryType::Regular,
-                mode: 0o644,
-                uid: 1000,
-                gid: 1000,
-                mtime: 1700000000,
-                link_target: None,
-                uncompressed_offset: 512,
-                checkpoint_index: 0,
-            },
-        );
+        let entries = vec![IndexEntry {
+            path: "test.txt".into(),
+            size: 1234,
+            entry_type: EntryType::Regular,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            mtime: 1700000000,
+            link_target: None,
+            uncompressed_offset: 512,
+            checkpoint_index: 0,
+        }];
 
-        ArchiveIndex {
-            metadata: IndexMetadata {
+        ArchiveIndex::new(
+            IndexMetadata {
                 version: INDEX_VERSION,
                 compression: CompressionFormat::Gzip,
                 archive_format: ArchiveFormat::Tar,
@@ -131,7 +126,7 @@ mod tests {
                 uncompressed_size: 10000,
                 complete: true,
             },
-            stream: {
+            {
                 let mut stream = StreamIndex::new(CompressionFormat::Gzip.into(), Some(5000));
                 stream.checkpoints.push(Checkpoint {
                     compressed_offset: 2500,
@@ -146,7 +141,7 @@ mod tests {
                 stream
             },
             entries,
-        }
+        )
     }
 
     #[test]
@@ -163,7 +158,7 @@ mod tests {
             index.metadata.uncompressed_size
         );
         assert_eq!(restored.checkpoints().len(), 2);
-        assert_eq!(restored.entries.len(), 1);
+        assert_eq!(restored.len(), 1);
 
         let entry = restored.get("test.txt").unwrap();
         assert_eq!(entry.size, 1234);
@@ -192,8 +187,10 @@ mod tests {
 
     #[test]
     fn test_out_of_range_checkpoint_index_rejected() {
-        let mut index = make_test_index();
-        index.entries.get_mut("test.txt").unwrap().checkpoint_index = 99;
+        let index = make_test_index();
+        let mut entries = index.entries().to_vec();
+        entries[0].checkpoint_index = 99;
+        let index = ArchiveIndex::new(index.metadata, index.stream, entries);
         let bytes = index.to_bytes().unwrap();
         assert!(ArchiveIndex::from_bytes(&bytes).is_err());
     }
@@ -202,7 +199,8 @@ mod tests {
     fn test_empty_checkpoints_rejected() {
         let mut index = make_test_index();
         index.stream.checkpoints.clear();
-        index.entries.clear(); // keep entry refs valid
+        // No entries, so none reference a missing checkpoint.
+        let index = ArchiveIndex::new(index.metadata, index.stream, Vec::new());
         let bytes = index.to_bytes().unwrap();
         assert!(ArchiveIndex::from_bytes(&bytes).is_err());
     }

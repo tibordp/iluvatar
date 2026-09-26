@@ -8,6 +8,7 @@ use crate::engine::progress::IndexProgress;
 use crate::engine::request::EngineRequest;
 use crate::error::Result;
 use crate::index::builder::IndexBuilder;
+use crate::index::entry::IndexEntry;
 use crate::index::store::ArchiveIndex;
 use crate::stream::{StreamIndexer, StreamReader, BUF_SIZE};
 
@@ -382,7 +383,9 @@ pub struct ReadEngine(StreamReader);
 impl ReadEngine {
     /// Create a read engine for a specific file.
     ///
-    /// Looks up the file in the index and prepares to read it.
+    /// Looks up the file in the index and prepares to read it. If several
+    /// members share the path, this reads the last one; use
+    /// [`for_entry`](Self::for_entry) to read another.
     pub fn new(index: &ArchiveIndex, path: &str) -> Result<Self> {
         Self::new_range(index, path, 0, u64::MAX)
     }
@@ -401,6 +404,23 @@ impl ReadEngine {
         let entry = index
             .get(path)
             .ok_or_else(|| crate::error::Error::FileNotFound(path.into()))?;
+        Self::for_entry_range(index, entry, file_offset, len)
+    }
+
+    /// Create a read engine for one entry of `index`, such as one of
+    /// several members sharing a path (see [`ArchiveIndex::get_all`]).
+    pub fn for_entry(index: &ArchiveIndex, entry: &IndexEntry) -> Result<Self> {
+        Self::for_entry_range(index, entry, 0, u64::MAX)
+    }
+
+    /// Create a read engine for a byte range within one entry of `index`.
+    /// Clamped like [`new_range`](Self::new_range).
+    pub fn for_entry_range(
+        index: &ArchiveIndex,
+        entry: &IndexEntry,
+        file_offset: u64,
+        len: u64,
+    ) -> Result<Self> {
         // An entry reaching past the end of the stream means the archive
         // was truncated (an index built before truncated archives were
         // rejected, or a crafted one); the reader would cut the read short.
@@ -540,7 +560,7 @@ mod tests {
         ]);
 
         let index = index_from_bytes(&tar_data, CompressionFormat::None);
-        assert_eq!(index.entries.len(), 2);
+        assert_eq!(index.len(), 2);
         assert!(index.get("file1.txt").is_some());
         assert!(index.get("file2.txt").is_some());
         assert_eq!(index.get("file1.txt").unwrap().size, 18);

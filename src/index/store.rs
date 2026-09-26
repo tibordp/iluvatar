@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Current index format version.
-pub(crate) const INDEX_VERSION: u32 = 5;
+pub(crate) const INDEX_VERSION: u32 = 6;
 
 /// Metadata about the indexed archive.
 ///
@@ -71,38 +71,104 @@ fn default_archive_format() -> ArchiveFormat {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Duplicate paths
+///
+/// An archive may hold several members with the same path: tar archives
+/// appended to with `tar -r`, or static libraries with two `foo.o`. All of
+/// them are kept, in archive order. Lookups by path ([`get`](Self::get),
+/// [`ReadEngine::new`](crate::ReadEngine::new)) resolve to the *last* one,
+/// which is what extracting the archive leaves on disk;
+/// [`get_all`](Self::get_all) and [`entries`](Self::entries) reach the
+/// others, and [`ReadEngine::for_entry`](crate::ReadEngine::for_entry)
+/// reads any of them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "IndexRepr")]
 pub struct ArchiveIndex {
     /// Archive metadata (compression format, size, completeness).
     pub metadata: IndexMetadata,
     /// The compressed stream's checkpoint table.
     pub stream: StreamIndex,
-    /// File entries keyed by path.
-    pub entries: HashMap<String, IndexEntry>,
+    /// File entries in archive order.
+    entries: Vec<IndexEntry>,
+    /// Path -> position in `entries` of the last entry with that path.
+    #[serde(skip)]
+    by_path: HashMap<String, usize>,
+}
+
+/// Serialized form of [`ArchiveIndex`]: the path lookup is rebuilt on load.
+#[derive(Deserialize)]
+struct IndexRepr {
+    metadata: IndexMetadata,
+    stream: StreamIndex,
+    entries: Vec<IndexEntry>,
+}
+
+impl From<IndexRepr> for ArchiveIndex {
+    fn from(repr: IndexRepr) -> Self {
+        Self::new(repr.metadata, repr.stream, repr.entries)
+    }
 }
 
 impl ArchiveIndex {
+    /// Assemble an index from entries in archive order.
+    pub(crate) fn new(
+        metadata: IndexMetadata,
+        stream: StreamIndex,
+        entries: Vec<IndexEntry>,
+    ) -> Self {
+        let by_path = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.path.clone(), i))
+            .collect();
+        Self {
+            metadata,
+            stream,
+            entries,
+            by_path,
+        }
+    }
+
+    /// All entries, in archive order, including every member of a
+    /// duplicated path.
+    pub fn entries(&self) -> &[IndexEntry] {
+        &self.entries
+    }
+
     /// Decompressor checkpoints, sorted by uncompressed offset.
     pub fn checkpoints(&self) -> &[Checkpoint] {
         &self.stream.checkpoints
     }
 
-    /// Look up a file by its path.
+    /// Look up a file by its path. If several members share the path, this
+    /// is the last one in the archive.
     ///
     /// Handles trailing-slash ambiguity: `get("dir")` will find an entry
     /// stored as `"dir/"` and vice versa.
     pub fn get(&self, path: &str) -> Option<&IndexEntry> {
-        self.entries.get(path).or_else(|| {
+        let position = self.by_path.get(path).or_else(|| {
             // Try with/without trailing slash for directories
             if path.ends_with('/') {
-                self.entries.get(path.trim_end_matches('/'))
+                self.by_path.get(path.trim_end_matches('/'))
             } else {
-                self.entries.get(&format!("{}/", path))
+                self.by_path.get(&format!("{}/", path))
             }
-        })
+        })?;
+        Some(&self.entries[*position])
     }
 
-    /// List all entries, optionally filtered by a directory prefix.
+    /// Every member with this path, in archive order; the last is the one
+    /// [`get`](Self::get) returns. Scans all entries.
+    pub fn get_all<'a>(&'a self, path: &str) -> impl Iterator<Item = &'a IndexEntry> + 'a {
+        let path = self.get(path).map(|e| e.path.as_str());
+        self.entries
+            .iter()
+            .filter(move |e| Some(e.path.as_str()) == path)
+    }
+
+    /// List all entries in archive order, optionally filtered by a
+    /// directory prefix. Every member of a duplicated path is included.
     ///
     /// Pass `None` to list everything, or `Some("dir")` to list entries
     /// under `dir/`. The prefix match is path-component-aware, so
@@ -112,7 +178,7 @@ impl ArchiveIndex {
             Some(prefix) => {
                 let prefix = prefix.trim_end_matches('/');
                 self.entries
-                    .values()
+                    .iter()
                     .filter(|e| {
                         e.path.starts_with(prefix)
                             && (e.path.len() == prefix.len()
@@ -120,7 +186,7 @@ impl ArchiveIndex {
                     })
                     .collect()
             }
-            None => self.entries.values().collect(),
+            None => self.entries.iter().collect(),
         }
     }
 
@@ -141,7 +207,8 @@ impl ArchiveIndex {
         self.stream.best_checkpoint_for_offset(uncompressed_offset)
     }
 
-    /// Returns the number of file entries in the index.
+    /// Returns the number of entries in the index, counting every member
+    /// of a duplicated path.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -158,9 +225,7 @@ mod tests {
     use crate::archive::EntryType;
 
     fn make_test_index() -> ArchiveIndex {
-        let mut entries = HashMap::new();
-        entries.insert(
-            "file1.txt".into(),
+        let entries = vec![
             IndexEntry {
                 path: "file1.txt".into(),
                 size: 100,
@@ -173,9 +238,6 @@ mod tests {
                 uncompressed_offset: 512,
                 checkpoint_index: 0,
             },
-        );
-        entries.insert(
-            "dir/file2.txt".into(),
             IndexEntry {
                 path: "dir/file2.txt".into(),
                 size: 200,
@@ -188,9 +250,6 @@ mod tests {
                 uncompressed_offset: 2048,
                 checkpoint_index: 0,
             },
-        );
-        entries.insert(
-            "dir/".into(),
             IndexEntry {
                 path: "dir/".into(),
                 size: 0,
@@ -203,10 +262,10 @@ mod tests {
                 uncompressed_offset: 1536,
                 checkpoint_index: 0,
             },
-        );
+        ];
 
-        ArchiveIndex {
-            metadata: IndexMetadata {
+        ArchiveIndex::new(
+            IndexMetadata {
                 version: INDEX_VERSION,
                 compression: CompressionFormat::Gzip,
                 archive_format: ArchiveFormat::Tar,
@@ -214,9 +273,9 @@ mod tests {
                 uncompressed_size: 5000,
                 complete: true,
             },
-            stream: StreamIndex::new(CompressionFormat::Gzip.into(), Some(1000)),
+            StreamIndex::new(CompressionFormat::Gzip.into(), Some(1000)),
             entries,
-        }
+        )
     }
 
     #[test]
