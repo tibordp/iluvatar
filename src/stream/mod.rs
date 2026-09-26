@@ -4,7 +4,7 @@
 //! A [`StreamIndex`] is the checkpoint table of one stream;
 //! a [`StreamIndexer`] lays checkpoints while decoding forward, in one pass
 //! or in resumable increments; a [`StreamReader`] decodes an unpacked byte
-//! range by restoring the nearest checkpoint. The tar and cpio engines in
+//! range by restoring the nearest checkpoint. The tar, cpio and ar engines in
 //! [`engine`](crate::engine) are compositions of these, and a container
 //! that already knows where its members live (a bare `.gz`, a 7z folder)
 //! uses them directly.

@@ -24,7 +24,7 @@ enum State {
 /// The decoded bytes are discarded unless [`emit_output`](Self::emit_output)
 /// is on, in which case each decoded chunk is handed out through
 /// [`EngineRequest::OutputReady`] and [`read_output`](Self::read_output)
-/// before decoding continues (this is how the tar and cpio parsers see the
+/// before decoding continues (this is how the archive parsers see the
 /// stream).
 ///
 /// An indexer can stop early ([`stop_at`](Self::stop_at)) and a partial

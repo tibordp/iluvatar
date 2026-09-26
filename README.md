@@ -1,7 +1,7 @@
 # iluvatar
 
 Random access into compressed streams: read individual files from
-compressed tar and cpio archives, or any byte range of a bare `.gz`,
+compressed tar, cpio and ar archives (including `.deb` packages), or any byte range of a bare `.gz`,
 `.xz`, `.zst` or `.bz2` file, without decompressing the whole thing.
 
 iluvatar works by making an indexing pass over the compressed archive,
@@ -44,7 +44,7 @@ use iluvatar::{IndexingEngine, EngineRequest, CompressionFormat};
 
 let mut engine = IndexingEngine::new(
     CompressionFormat::Gzip,
-    None,      // auto-detect archive format (tar vs cpio)
+    None,      // auto-detect archive format (tar, cpio or ar)
     file_size, // used for progress reporting
 )?;
 
@@ -88,7 +88,7 @@ let tail = stream.read_range(total.saturating_sub(64 * 1024), 64 * 1024)?;
 
 Underneath, a `StreamIndexer` lays checkpoints over one compressed stream
 and a `StreamReader` decodes any unpacked range from the nearest one. The
-tar and cpio engines are compositions of the two, and a container that
+tar, cpio and ar engines are compositions of the two, and a container that
 already knows where its members live (7z folders, for instance) uses them
 directly. Indexing can stop early and resume later without re-decoding:
 
@@ -227,6 +227,7 @@ let index = Archive::build_index_with_progress(
 |--------|----------|
 | tar    | ustar, GNU, PAX, V7 (including long name extensions) |
 | cpio   | newc (SVR4), odc (POSIX.1) |
+| ar     | GNU/SysV, BSD, Windows `.lib` (long names; symbol tables are skipped; not thin archives) |
 
 **Codecs** (any of them may be a stage in a chain):
 

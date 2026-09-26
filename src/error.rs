@@ -11,7 +11,11 @@
 /// let err = Error::FileNotFound("missing.txt".into());
 /// assert_eq!(err.to_string(), "file not found in archive: missing.txt");
 /// ```
+///
+/// Marked `#[non_exhaustive]`: supporting a new format usually brings a new
+/// error variant, so matches on it need a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The compression format is not recognized or not enabled via feature flags.
     #[error("unsupported compression format")]
@@ -24,6 +28,10 @@ pub enum Error {
     /// A cpio header could not be parsed.
     #[error("invalid cpio header: {0}")]
     InvalidCpioHeader(String),
+
+    /// An ar header could not be parsed.
+    #[error("invalid ar header: {0}")]
+    InvalidArHeader(String),
 
     /// The decompressor encountered invalid or corrupt data.
     #[error("decompression error: {0}")]

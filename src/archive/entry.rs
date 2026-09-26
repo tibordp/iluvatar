@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Format-agnostic entry type for any archive format (tar, cpio, etc.).
+/// Format-agnostic entry type for any archive format (tar, cpio, ar).
 ///
 /// Format-specific metadata entries (PAX headers, GNU long names, cpio trailers)
 /// are handled internally by each parser and never surface here.
@@ -51,7 +51,7 @@ impl EntryType {
 /// A parsed archive entry with path, metadata, and location info.
 ///
 /// Produced by any `ArchiveParser` implementation. Contains the union
-/// of metadata fields meaningful across tar and cpio.
+/// of metadata fields meaningful across tar, cpio and ar.
 #[derive(Debug, Clone)]
 pub(crate) struct ArchiveEntry {
     /// Path of the entry within the archive.

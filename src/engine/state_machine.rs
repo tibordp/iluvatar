@@ -16,6 +16,7 @@ fn create_archive_parser(format: ArchiveFormat) -> Box<dyn ArchiveParser> {
     match format {
         ArchiveFormat::Tar => Box::new(crate::tar::parser::TarParser::new()),
         ArchiveFormat::Cpio => Box::new(crate::cpio::parser::CpioParser::new()),
+        ArchiveFormat::Ar => Box::new(crate::ar::parser::ArParser::new()),
     }
 }
 
@@ -30,7 +31,7 @@ fn create_archive_parser(format: ArchiveFormat) -> Box<dyn ArchiveParser> {
 /// 4. Calling [`finish()`](Self::finish) to get the completed [`ArchiveIndex`]
 ///
 /// Underneath, a [`StreamIndexer`] decodes the stream and lays checkpoints
-/// while the tar or cpio parser reads its output for entries.
+/// while the tar, cpio or ar parser reads its output for entries.
 ///
 /// The type parameter `S` controls when decompressor checkpoints are
 /// created. Use [`IndexingEngine::new`] for the format-aware default

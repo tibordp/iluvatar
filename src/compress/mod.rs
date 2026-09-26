@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CompressionFormat {
-    /// No compression (raw tar/cpio).
+    /// No compression (raw tar/cpio/ar).
     None,
     /// Gzip (DEFLATE) compression.
     Gzip,

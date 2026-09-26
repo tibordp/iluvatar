@@ -1,3 +1,4 @@
+use crate::ar::header::{AR_MAGIC, THIN_MAGIC};
 use crate::archive::ArchiveFormat;
 
 /// Minimum bytes needed for reliable archive format detection.
@@ -8,8 +9,16 @@ pub const MIN_DETECT_BYTES: usize = 263;
 ///
 /// Returns `None` if there isn't enough data to decide.
 /// Needs at least 263 bytes for reliable tar detection (ustar magic
-/// at offset 257). Cpio magic is at byte 0, so 6 bytes suffice.
+/// at offset 257). Cpio magic is at byte 0, so 6 bytes suffice; ar
+/// magic is at byte 0 too and needs 8.
 pub fn detect_archive_format(data: &[u8]) -> Option<ArchiveFormat> {
+    if data.len() >= 8 {
+        // ar: "!<arch>\n", or "!<thin>\n" (GNU thin archive; the parser
+        // rejects it with a clear error rather than tar misreading it).
+        if &data[0..8] == AR_MAGIC || &data[0..8] == THIN_MAGIC {
+            return Some(ArchiveFormat::Ar);
+        }
+    }
     if data.len() >= 6 {
         // cpio newc: "070701" or "070702" (with CRC)
         if &data[0..6] == b"070701" || &data[0..6] == b"070702" {
@@ -63,6 +72,14 @@ mod tests {
         let mut data = vec![0u8; 300];
         data[..6].copy_from_slice(b"070707");
         assert_eq!(detect_archive_format(&data), Some(ArchiveFormat::Cpio));
+    }
+
+    #[test]
+    fn test_detect_ar() {
+        assert_eq!(detect_archive_format(b"!<arch>\n"), Some(ArchiveFormat::Ar));
+        assert_eq!(detect_archive_format(b"!<thin>\n"), Some(ArchiveFormat::Ar));
+        // A prefix of the magic is not enough to decide.
+        assert_eq!(detect_archive_format(b"!<arch"), None);
     }
 
     #[test]

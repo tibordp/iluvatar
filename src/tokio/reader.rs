@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 /// Default read buffer size.
 const BUF_SIZE: usize = 64 * 1024;
 
-/// High-level asynchronous API for reading compressed tar/cpio archives.
+/// High-level asynchronous API for reading compressed tar/cpio/ar archives.
 ///
 /// This is the async equivalent of [`crate::sync::Archive`], using
 /// Tokio's [`AsyncRead`] and [`AsyncSeek`] traits. See the

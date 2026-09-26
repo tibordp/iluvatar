@@ -1812,6 +1812,179 @@ fn test_entry_checkpoints_usable_for_reading() {
     }
 }
 
+// ─── ar Helpers ───
+
+/// Append one ar member (header, data, even-offset padding).
+fn push_ar_member(archive: &mut Vec<u8>, name: &str, data: &[u8]) {
+    let header = format!(
+        "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+        name,
+        1700000000u64,
+        1000,
+        1000,
+        "100644",
+        data.len()
+    );
+    archive.extend_from_slice(header.as_bytes());
+    archive.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        archive.push(b'\n');
+    }
+}
+
+/// Create a GNU-style ar archive: a symbol table, a `//` long-name table
+/// for names over 15 bytes, and `name/` short names.
+fn create_ar_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = b"!<arch>\n".to_vec();
+    push_ar_member(&mut archive, "/", &[0; 4]);
+
+    let mut table = Vec::new();
+    let names: Vec<String> = files
+        .iter()
+        .map(|(path, _)| {
+            if path.len() > 15 {
+                let name = format!("/{}", table.len());
+                table.extend_from_slice(path.as_bytes());
+                table.extend_from_slice(b"/\n");
+                name
+            } else {
+                format!("{}/", path)
+            }
+        })
+        .collect();
+    if !table.is_empty() {
+        push_ar_member(&mut archive, "//", &table);
+    }
+    for (name, (_, data)) in names.iter().zip(files) {
+        push_ar_member(&mut archive, name, data);
+    }
+    archive
+}
+
+/// Create a BSD-style ar archive with `#1/<len>` inline names.
+fn create_bsd_ar_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = b"!<arch>\n".to_vec();
+    for (path, data) in files {
+        let mut body = path.as_bytes().to_vec();
+        body.extend_from_slice(data);
+        push_ar_member(&mut archive, &format!("#1/{}", path.len()), &body);
+    }
+    archive
+}
+
+/// Create a gzip-compressed ar archive.
+#[cfg(feature = "gzip")]
+fn create_ar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let ar_data = create_ar_bytes(files);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&ar_data).unwrap();
+    encoder.finish().unwrap()
+}
+
+// ─── ar Tests ───
+
+#[test]
+fn test_ar_index_and_read() {
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        ("hello.txt", b"Hello, world!".to_vec()),
+        (
+            "a_long_object_file_name.o",
+            (0..1000).map(|i| (i % 256) as u8).collect(),
+        ),
+        ("empty", Vec::new()),
+    ];
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+
+    for ar_data in [create_ar_bytes(&refs), create_bsd_ar_bytes(&refs)] {
+        let index = index_in_memory(&ar_data, CompressionFormat::None);
+
+        assert_eq!(index.metadata.archive_format, ArchiveFormat::Ar);
+        assert_eq!(index.entries.len(), 3);
+        let hello = index.get("hello.txt").unwrap();
+        assert_eq!(hello.size, 13);
+        assert_eq!(hello.mode, 0o644);
+        assert_eq!(hello.mtime, 1700000000);
+
+        for (path, expected) in &files {
+            let content = read_in_memory(&ar_data, &index, path);
+            assert_eq!(&content, expected, "content mismatch for {}", path);
+        }
+    }
+}
+
+#[cfg(feature = "gzip")]
+#[test]
+fn test_ar_gzip_index_and_read() {
+    let files = &[
+        ("debian-binary", &b"2.0\n"[..]),
+        ("control.tar.gz", &b"control"[..]),
+        ("data.tar.xz", &b"data payload"[..]),
+    ];
+    let compressed = create_ar_gz(files);
+
+    let index = index_in_memory(&compressed, CompressionFormat::Gzip);
+    assert_eq!(index.metadata.archive_format, ArchiveFormat::Ar);
+    assert_eq!(index.entries.len(), 3);
+
+    for (path, expected) in files {
+        assert_eq!(&read_in_memory(&compressed, &index, path), expected);
+    }
+}
+
+#[test]
+fn test_ar_empty_archive() {
+    let index = index_in_memory(b"!<arch>\n", CompressionFormat::None);
+    assert_eq!(index.metadata.archive_format, ArchiveFormat::Ar);
+    assert!(index.entries.is_empty());
+}
+
+#[test]
+fn test_ar_many_files_and_range_read() {
+    let files: Vec<(String, Vec<u8>)> = (0..50)
+        .map(|i| {
+            // Mix short names and long-name-table names.
+            let name = if i % 2 == 0 {
+                format!("f{:03}.o", i)
+            } else {
+                format!("a_long_member_name_{:03}.o", i)
+            };
+            (name, vec![(i * 7 + 13) as u8; 499 + i])
+        })
+        .collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
+    let ar_data = create_ar_bytes(&refs);
+
+    let index = index_in_memory(&ar_data, CompressionFormat::None);
+    assert_eq!(index.entries.len(), 50);
+    for (path, expected) in &files {
+        assert_eq!(
+            &read_in_memory(&ar_data, &index, path),
+            expected,
+            "{}",
+            path
+        );
+    }
+
+    let (path, content) = &files[7];
+    let range = read_range_in_memory(&ar_data, &index, path, 100, 200);
+    assert_eq!(&range, &content[100..300]);
+}
+
+#[cfg(feature = "gzip")]
+#[test]
+fn test_ar_sync_archive() {
+    let files = &[("a.o", &b"alpha"[..]), ("b.o", &b"beta"[..])];
+    let tmp = write_temp(&create_ar_gz(files));
+
+    let mut archive = Archive::new(File::open(tmp.path()).unwrap()).unwrap();
+    assert_eq!(archive.list().len(), 2);
+    assert_eq!(archive.read_file("a.o").unwrap(), b"alpha");
+    assert_eq!(archive.read_file("b.o").unwrap(), b"beta");
+}
+
 // ─── Extraction with one live reader ───
 
 /// The extraction loop from the `StreamReader` docs, verbatim: every

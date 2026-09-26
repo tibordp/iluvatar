@@ -15,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom};
 /// Default read buffer size.
 const BUF_SIZE: usize = 64 * 1024;
 
-/// High-level synchronous API for reading compressed tar/cpio archives.
+/// High-level synchronous API for reading compressed tar/cpio/ar archives.
 ///
 /// Wraps the sans-I/O engine, providing a simple interface for any
 /// reader that implements [`Read`] (for indexing) or [`Read`] + [`Seek`]

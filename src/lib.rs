@@ -1,7 +1,7 @@
 //! # iluvatar
 //!
 //! Random access into compressed streams: read individual files from
-//! compressed tar and cpio archives, or any byte range of a bare compressed
+//! compressed tar, cpio and ar archives, or any byte range of a bare compressed
 //! file, without decompressing the whole thing.
 //!
 //! The library makes an indexing pass over the stream, periodically
@@ -102,11 +102,12 @@
 //! - [`tokio`] — Async equivalents using tokio
 //! - [`stream`] — Sans-I/O [`StreamIndexer`] and [`StreamReader`] over one
 //!   compressed stream, container-agnostic
-//! - [`engine`] — Sans-I/O [`IndexingEngine`] and [`ReadEngine`] for tar/cpio
+//! - [`engine`] — Sans-I/O [`IndexingEngine`] and [`ReadEngine`] for tar/cpio/ar
 //! - [`compress`] — Codecs, filters, chains and format detection
-//! - [`archive`] — Archive format types and parsers (tar, cpio)
+//! - [`archive`] — Archive format types and parsers (tar, cpio, ar)
 //! - [`index`] — Index types and serialization
 
+pub(crate) mod ar;
 pub mod archive;
 pub mod compress;
 pub(crate) mod cpio;

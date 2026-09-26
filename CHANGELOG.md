@@ -1,6 +1,24 @@
 # Changelog
 
-## 0.4.0 — unreleased
+## Unreleased
+
+### Added
+
+- **ar archives.** `ArchiveFormat::Ar` indexes and reads Unix ar archives
+  — static libraries (`.a`, `.lib`) and Debian packages (`.deb`) — plain
+  or compressed, and auto-detection recognizes them. GNU/SysV long names
+  (the `//` table), BSD inline names (`#1/<len>`) and Windows import
+  library layouts are supported; symbol tables are skipped. GNU thin
+  archives, whose members live outside the archive, are rejected with
+  `Error::InvalidArHeader`.
+
+### Changed
+
+- `ArchiveFormat` and `Error` are now `#[non_exhaustive]`, so future
+  formats (and their error variants) can be added without a breaking
+  release. Exhaustive matches on either need a wildcard arm.
+
+## 0.4.0 — 2026-09-23
 
 ### Added
 
