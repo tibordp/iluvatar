@@ -161,3 +161,22 @@ async fn test_async_io_copy() {
     tokio::io::copy(&mut reader, &mut dest).await.unwrap();
     assert_eq!(dest, b"hello async");
 }
+
+#[tokio::test]
+async fn test_async_open_zero_length_read() {
+    // A read into an empty buffer returns 0 at once and consumes nothing.
+    let compressed = create_tar_gz(&[("a.txt", b"alpha beta")]);
+    let mut archive = Archive::new(std::io::Cursor::new(compressed))
+        .await
+        .unwrap();
+    let mut reader = archive.open("a.txt").await.unwrap();
+    assert_eq!(reader.read(&mut []).await.unwrap(), 0);
+    let mut first = [0u8; 5];
+    reader.read_exact(&mut first).await.unwrap();
+    // Again with output already decoded and waiting.
+    assert_eq!(reader.read(&mut []).await.unwrap(), 0);
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest).await.unwrap();
+    assert_eq!(&first, b"alpha");
+    assert_eq!(rest, b" beta");
+}

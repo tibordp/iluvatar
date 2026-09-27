@@ -2464,3 +2464,21 @@ fn test_cut_compressed_archive_is_truncated_archive() {
         }
     }
 }
+
+#[cfg(feature = "gzip")]
+#[test]
+fn test_open_zero_length_read() {
+    // A read into an empty buffer returns 0 at once and consumes nothing.
+    let compressed = create_tar_gz(&[("a.txt", &b"alpha beta"[..])]);
+    let mut archive = Archive::new(std::io::Cursor::new(compressed)).unwrap();
+    let mut reader = archive.open("a.txt").unwrap();
+    assert_eq!(std::io::Read::read(&mut reader, &mut []).unwrap(), 0);
+    let mut first = [0u8; 5];
+    std::io::Read::read_exact(&mut reader, &mut first).unwrap();
+    // Again with output already decoded and waiting.
+    assert_eq!(std::io::Read::read(&mut reader, &mut []).unwrap(), 0);
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut rest).unwrap();
+    assert_eq!(&first, b"alpha");
+    assert_eq!(rest, b" beta");
+}

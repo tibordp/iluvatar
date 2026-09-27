@@ -36,11 +36,11 @@ pub(crate) struct FrameHeader {
     pub header_size: usize,
 }
 
-/// Parse a zstd frame header from the given data.
-/// Returns the frame header or an error.
-pub(crate) fn parse_frame_header(data: &[u8]) -> Result<FrameHeader, String> {
+/// Parse a zstd frame header from the given data: `Ok(None)` while more
+/// bytes are needed, an error if the header is invalid.
+pub(crate) fn parse_frame_header(data: &[u8]) -> Result<Option<FrameHeader>, String> {
     if data.len() < 5 {
-        return Err("frame header too short".into());
+        return Ok(None);
     }
 
     // Check magic number
@@ -54,14 +54,17 @@ pub(crate) fn parse_frame_header(data: &[u8]) -> Result<FrameHeader, String> {
     let single_segment = (descriptor & 0x20) != 0;
     let content_size_flag = (descriptor >> 6) & 3;
     let dict_id_flag = descriptor & 3;
-    let _reserved = (descriptor >> 3) & 3;
+    // Bit 3 is reserved and must be zero; bit 4 is unused.
+    if descriptor & 0x08 != 0 {
+        return Err("reserved bit set in frame header descriptor".into());
+    }
 
     let mut pos = 5;
 
     // Window descriptor (absent if single_segment)
     let window_size = if !single_segment {
         if pos >= data.len() {
-            return Err("frame header truncated at window descriptor".into());
+            return Ok(None);
         }
         let win_byte = data[pos];
         pos += 1;
@@ -83,7 +86,7 @@ pub(crate) fn parse_frame_header(data: &[u8]) -> Result<FrameHeader, String> {
         _ => unreachable!(),
     };
     if pos + dict_id_size > data.len() {
-        return Err("frame header truncated at dictionary ID".into());
+        return Ok(None);
     }
     let dictionary_id = match dict_id_size {
         0 => 0,
@@ -110,7 +113,7 @@ pub(crate) fn parse_frame_header(data: &[u8]) -> Result<FrameHeader, String> {
     };
 
     if pos + fcs_size > data.len() {
-        return Err("frame header truncated at content size".into());
+        return Ok(None);
     }
 
     let content_size = if fcs_size == 0 {
@@ -155,14 +158,14 @@ pub(crate) fn parse_frame_header(data: &[u8]) -> Result<FrameHeader, String> {
         final_window_size
     };
 
-    Ok(FrameHeader {
+    Ok(Some(FrameHeader {
         checksum_flag,
         single_segment,
         window_size: clamped_window_size,
         dictionary_id,
         content_size,
         header_size: pos,
-    })
+    }))
 }
 
 /// Check if data starts with a skippable frame magic.
@@ -200,7 +203,7 @@ mod tests {
         data.push(0x20); // descriptor: single_segment=1
         data.push(42); // FCS = 42 bytes
 
-        let header = parse_frame_header(&data).unwrap();
+        let header = parse_frame_header(&data).unwrap().unwrap();
         assert!(!header.checksum_flag);
         assert!(header.single_segment);
         assert_eq!(header.content_size, Some(42));
@@ -217,7 +220,7 @@ mod tests {
         data.push(0x00); // descriptor
         data.push(0x00); // window descriptor: exponent=0, mantissa=0 -> 1<<10 = 1024
 
-        let header = parse_frame_header(&data).unwrap();
+        let header = parse_frame_header(&data).unwrap().unwrap();
         assert!(!header.single_segment);
         assert_eq!(header.window_size, 1024);
         assert_eq!(header.content_size, None);
@@ -230,10 +233,24 @@ mod tests {
         data.push(0x24); // single_segment + checksum
         data.push(100); // FCS = 100
 
-        let header = parse_frame_header(&data).unwrap();
+        let header = parse_frame_header(&data).unwrap().unwrap();
         assert!(header.checksum_flag);
         assert!(header.single_segment);
         assert_eq!(header.content_size, Some(100));
+    }
+
+    #[test]
+    fn test_incomplete_header_needs_more() {
+        // Magic, a descriptor asking for an 8-byte content size, 3 bytes.
+        let data = [0x28, 0xB5, 0x2F, 0xFD, 0xC0, 1, 2, 3];
+        assert!(parse_frame_header(&data).unwrap().is_none());
+        assert!(parse_frame_header(&data[..4]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_reserved_bit_rejected() {
+        let data = [0x28, 0xB5, 0x2F, 0xFD, 0x20 | 0x08, 10];
+        assert!(parse_frame_header(&data).is_err());
     }
 
     #[test]
@@ -257,13 +274,13 @@ mod tests {
         // window byte = 0x18: exponent=3, mantissa=0
         // window = 1 << (10+3) = 8192
         let mut data = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x18];
-        let header = parse_frame_header(&data).unwrap();
+        let header = parse_frame_header(&data).unwrap().unwrap();
         assert_eq!(header.window_size, 8192);
 
         // window byte = 0x1F: exponent=3, mantissa=7
         // base = 1 << 13 = 8192, window = 8192 + 7 * (8192 >> 3) = 8192 + 7*1024 = 15360
         data[5] = 0x1F;
-        let header = parse_frame_header(&data).unwrap();
+        let header = parse_frame_header(&data).unwrap().unwrap();
         assert_eq!(header.window_size, 15360);
     }
 }

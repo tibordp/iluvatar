@@ -554,7 +554,9 @@ impl<'a, R> EntryReader<'a, R> {
 
 impl<R: Read + Seek> std::io::Read for EntryReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.done {
+        // Nothing fits: return at once rather than decode with nowhere to
+        // put the output.
+        if self.done || buf.is_empty() {
             return Ok(0);
         }
 

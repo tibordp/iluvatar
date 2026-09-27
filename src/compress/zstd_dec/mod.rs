@@ -36,9 +36,8 @@
 //!   `0xFD2FB528`) and skippable frames are supported. Legacy formats from
 //!   pre-1.0 zstd are not recognized.
 //!
-//! - **Trailing data**: Concatenated frames are decoded in turn, but four or
-//!   more bytes after a frame that start with neither frame magic end the
-//!   stream silently instead of failing.
+//! - **Trailing data**: Concatenated frames and skippable frames are
+//!   decoded in turn; anything else where a frame should start is an error.
 
 pub(crate) mod bits;
 pub(crate) mod block;
@@ -287,17 +286,18 @@ impl Decompressor for ZstdDecompressor {
                         self.buffer[pos + 3],
                     ]);
                     if magic != ZSTD_MAGIC {
-                        // Not a zstd frame: take the rest as trailing data and
-                        // end the stream.
-                        self.finished = true;
-                        self.phase = DecoderPhase::Done;
-                        break;
+                        return Err(Error::DecompressionError(format!(
+                            "zstd: unknown frame magic 0x{:08X}",
+                            magic
+                        )));
                     }
 
                     // Try to parse frame header (need at least 5 bytes)
                     let available = &self.buffer[pos..];
-                    match parse_frame_header(available) {
-                        Ok(header) => {
+                    match parse_frame_header(available).map_err(|e| {
+                        Error::DecompressionError(format!("zstd frame header: {}", e))
+                    })? {
+                        Some(header) => {
                             self.window_size = header.window_size.max(1024);
                             // Clear block state for new frame
                             self.block_state = BlockDecoderState::new();
@@ -305,10 +305,8 @@ impl Decompressor for ZstdDecompressor {
                             self.frame_header = Some(header);
                             self.phase = DecoderPhase::BlockHeader;
                         }
-                        Err(_) => {
-                            // May need more data
-                            break;
-                        }
+                        // Need more data
+                        None => break,
                     }
                 }
                 DecoderPhase::BlockHeader => {
@@ -1021,5 +1019,51 @@ mod tests {
         }
 
         assert_eq!(restored_output, all_output[output_at_checkpoint..]);
+    }
+
+    /// Decode all of `data` in 4 KiB pieces, then signal the end.
+    fn try_decode(data: &[u8]) -> Result<Vec<u8>> {
+        let mut dec = ZstdDecompressor::new();
+        let mut out = vec![0u8; 1 << 20];
+        let mut all = Vec::new();
+        let mut pos = 0;
+        loop {
+            let input = &data[pos..(pos + 4096).min(data.len())];
+            let r = dec.decompress(input, &mut out)?;
+            pos += r.bytes_consumed;
+            all.extend_from_slice(&out[..r.bytes_produced]);
+            if r.status == DecompressStatus::StreamEnd {
+                return Ok(all);
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_zstd_input_is_an_error() {
+        assert!(matches!(
+            try_decode(b"this is plain text, not zstd"),
+            Err(Error::DecompressionError(_))
+        ));
+    }
+
+    #[test]
+    fn test_trailing_garbage_is_an_error() {
+        let mut data = compress_zstd(b"hello, frame");
+        data.extend_from_slice(b"GARBAGE!");
+        assert!(matches!(
+            try_decode(&data),
+            Err(Error::DecompressionError(_))
+        ));
+    }
+
+    #[test]
+    fn test_frames_and_skippable_frames_concatenate() {
+        let mut data = compress_zstd(b"first ");
+        // Skippable frame: magic 0x184D2A50, 4-byte length, payload.
+        data.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(b"xyz");
+        data.extend_from_slice(&compress_zstd(b"second"));
+        assert_eq!(try_decode(&data).unwrap(), b"first second");
     }
 }

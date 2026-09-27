@@ -89,6 +89,10 @@ impl Decompressor for AesCbcDecryptor {
                 return Err(Error::TruncatedInput);
             }
             if self.staged.is_empty() {
+                // Out of ciphertext before the known plaintext length.
+                if self.len.is_some() && self.remaining() > 0 {
+                    return Err(Error::TruncatedInput);
+                }
                 self.finished = true;
             }
         } else if produced < output.len() && self.staged.is_empty() {
@@ -244,5 +248,37 @@ mod tests {
             }
         }
         assert_eq!(got2, plain);
+    }
+
+    #[test]
+    fn ciphertext_short_of_known_length_is_truncated() {
+        let key = [7u8; 32];
+        let iv = [9u8; 16];
+        let plain: Vec<u8> = (0..64u8).collect();
+        let cipher = encrypt(&key, iv, &plain);
+
+        // Two whole blocks of four: a clean block boundary, but short.
+        let mut dec = AesCbcDecryptor::new(&key, iv, Some(64));
+        let mut out = vec![0u8; 128];
+        let r = dec.decompress(&cipher[..32], &mut out).unwrap();
+        assert_eq!(&out[..r.bytes_produced], &plain[..r.bytes_produced]);
+        let mut result = dec.decompress(&[], &mut out);
+        while let Ok(r) = &result {
+            assert!(r.status != DecompressStatus::StreamEnd, "ended short");
+            result = dec.decompress(&[], &mut out);
+        }
+        assert!(matches!(result, Err(Error::TruncatedInput)));
+
+        // Without a known length, the end of the ciphertext is the end.
+        let mut dec = AesCbcDecryptor::new(&key, iv, None);
+        dec.decompress(&cipher[..32], &mut out).unwrap();
+        let mut ended = false;
+        for _ in 0..4 {
+            if dec.decompress(&[], &mut out).unwrap().status == DecompressStatus::StreamEnd {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended);
     }
 }

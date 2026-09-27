@@ -465,6 +465,11 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRead for EntryReader<'_, R> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        // Nothing fits: return at once rather than decode with nowhere to
+        // put the output.
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
         loop {
             let state = this.state;

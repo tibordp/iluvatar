@@ -184,9 +184,9 @@ impl BitShifter {
 /// the data to align the block at a byte boundary.
 ///
 /// Decodes only the first bzip2 stream; later streams (e.g. pbzip2 output)
-/// are ignored. After a restore the combined stream CRC cannot match, so a
-/// libbzip2 error once output has been produced is taken as the end of the
-/// stream, which also hides corruption in later blocks.
+/// are ignored. After a restore the combined stream CRC cannot match, so
+/// the error libbzip2 raises at the end-of-stream marker is taken as the
+/// end of the stream; errors before it still surface.
 pub struct Bzip2Decompressor {
     inner: BzDecompress,
     total_in: u64,
@@ -209,6 +209,9 @@ pub struct Bzip2Decompressor {
     bit_shifter: Option<BitShifter>,
     /// Buffer of shifted bytes not yet consumed by the decoder.
     shift_buffer: Vec<u8>,
+    /// Restore mode: scans what libbzip2 has consumed of the shifted
+    /// stream, to tell when its end-of-stream marker has gone in.
+    restore_scanner: MagicScanner,
 }
 
 impl Bzip2Decompressor {
@@ -226,6 +229,7 @@ impl Bzip2Decompressor {
             restore_header: Vec::new(),
             bit_shifter: None,
             shift_buffer: Vec::new(),
+            restore_scanner: MagicScanner::new(),
         }
     }
 }
@@ -449,6 +453,7 @@ impl Decompressor for Bzip2Decompressor {
                     self.bit_shifter = None;
                 }
                 self.shift_buffer.clear();
+                self.restore_scanner = MagicScanner::new();
 
                 // Reset scanner for the restored stream
                 self.scanner = MagicScanner::new();
@@ -479,8 +484,8 @@ impl Decompressor for Bzip2Decompressor {
 
 impl Bzip2Decompressor {
     /// Decompress in restore mode: prepend stream header, bit-shift input,
-    /// and take any decoder error after output as the end of stream (the
-    /// combined CRC covers skipped blocks, so it never matches).
+    /// and take the decoder's error at the end-of-stream marker as the end
+    /// (the combined CRC covers skipped blocks, so it never matches).
     fn decompress_restore(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
         // Phase 1: Feed the stream header to the fresh decoder
         if !self.restore_header.is_empty() {
@@ -551,6 +556,10 @@ impl Bzip2Decompressor {
         let produced = (self.inner.total_out() - before_out) as usize;
         self.total_out += produced as u64;
 
+        for &byte in &feed[..consumed_d] {
+            self.restore_scanner.scan_byte(byte);
+        }
+
         // Buffer any shifted bytes not consumed by the decoder
         if consumed_d < feed.len() {
             self.shift_buffer = feed[consumed_d..].to_vec();
@@ -576,20 +585,19 @@ impl Bzip2Decompressor {
                     status,
                 })
             }
-            Err(_) => {
-                // In restore mode, the combined CRC at end-of-stream won't
-                // match (it includes blocks we skipped). If the decoder has
-                // produced output, treat this as StreamEnd.
-                if produced > 0 || self.total_out > 0 {
+            Err(e) => {
+                // The combined CRC after the end-of-stream marker covers the
+                // blocks skipped by the restore, so it never matches: an
+                // error once the marker has gone in is the stream's end.
+                // Anything before it is corrupt data.
+                if self.restore_scanner.eos_found {
                     Ok(DecompressResult {
                         bytes_consumed: original_consumed,
                         bytes_produced: produced,
                         status: DecompressStatus::StreamEnd,
                     })
                 } else {
-                    Err(Error::DecompressionError(
-                        "bzip2 restore: decompression error before any output".into(),
-                    ))
+                    Err(Error::DecompressionError(format!("bzip2: {}", e)))
                 }
             }
         }
@@ -1081,5 +1089,79 @@ mod tests {
             restored_output, expected_tail,
             "restored output doesn't match expected tail"
         );
+    }
+
+    /// Decode from a fresh decoder, returning the first checkpoint past the
+    /// start of the stream.
+    fn first_mid_checkpoint(compressed: &[u8]) -> Checkpoint {
+        let mut dec = Bzip2Decompressor::new();
+        let (mut offset, mut produced) = (0usize, 0u64);
+        let mut out = vec![0u8; 1024 * 1024];
+        loop {
+            let input = &compressed[offset..(offset + 4096).min(compressed.len())];
+            let r = dec.decompress(input, &mut out).unwrap();
+            offset += r.bytes_consumed;
+            produced += r.bytes_produced as u64;
+            if let Some(cp) = dec.checkpoint(offset as u64, produced).unwrap() {
+                if cp.compressed_offset > 0 {
+                    return cp;
+                }
+            }
+            assert!(
+                r.status != DecompressStatus::StreamEnd,
+                "no mid-stream checkpoint"
+            );
+        }
+    }
+
+    /// Restore `cp` and decode the rest of `compressed`.
+    fn decode_from(compressed: &[u8], cp: &Checkpoint) -> Result<Vec<u8>> {
+        let mut dec = Bzip2Decompressor::new();
+        dec.restore(cp).unwrap();
+        let mut offset = cp.compressed_offset as usize;
+        let mut all = Vec::new();
+        let mut out = vec![0u8; 1024 * 1024];
+        loop {
+            let input =
+                &compressed[offset.min(compressed.len())..(offset + 4096).min(compressed.len())];
+            let r = dec.decompress(input, &mut out)?;
+            offset += r.bytes_consumed;
+            all.extend_from_slice(&out[..r.bytes_produced]);
+            if r.status == DecompressStatus::StreamEnd {
+                return Ok(all);
+            }
+        }
+    }
+
+    #[test]
+    fn test_restore_reports_corruption_after_checkpoint() {
+        // After a restore, the expected mismatch of the stream's combined
+        // CRC is the only error to absorb; corrupt block data is an error.
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let original: Vec<u8> = (0..400_000)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                if i % 3 == 0 {
+                    (state >> 56) as u8
+                } else {
+                    b'a' + (i % 7) as u8
+                }
+            })
+            .collect();
+        let compressed = compress_bz2_small_blocks(&original);
+        let cp = first_mid_checkpoint(&compressed);
+
+        // Intact: decodes to the end, absorbing the combined-CRC mismatch.
+        let tail = decode_from(&compressed, &cp).unwrap();
+        assert_eq!(tail, &original[cp.uncompressed_offset as usize..]);
+
+        // A flipped byte in the block after the checkpoint.
+        let mut corrupt = compressed.clone();
+        let at = cp.compressed_offset as usize + 5000;
+        assert!(at < corrupt.len() - 100);
+        corrupt[at] ^= 0x55;
+        assert!(decode_from(&corrupt, &cp).is_err());
     }
 }

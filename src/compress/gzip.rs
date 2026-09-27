@@ -58,6 +58,10 @@ pub struct GzipDecompressor {
     last_boundary: Option<SavedBoundary>,
     /// Raw deflate without gzip framing; `reset` must not expect a header.
     raw: bool,
+    /// Input already taken from the caller but not yet inflated: the bytes
+    /// held while looking for a gzip header that turned out not to be one,
+    /// plus input appended until they are used up.
+    replay: Vec<u8>,
 }
 
 struct SavedBoundary {
@@ -99,6 +103,7 @@ impl GzipDecompressor {
             total_out: 0,
             last_boundary: None,
             raw: false,
+            replay: Vec::new(),
         }
     }
 
@@ -213,6 +218,24 @@ impl GzipDecompressor {
                 DecompressStatus::Continue
             },
         }
+    }
+
+    /// Inflate from `replay`, reporting `consumed` caller bytes (all of
+    /// them were moved into `replay`).
+    fn inflate_replay(
+        &mut self,
+        consumed: usize,
+        has_more_input: bool,
+        output: &mut [u8],
+    ) -> Result<DecompressResult> {
+        let buf = std::mem::take(&mut self.replay);
+        let result = self.inflate_to_output(&buf, has_more_input, output)?;
+        self.replay = buf[result.bytes_consumed..].to_vec();
+        Ok(DecompressResult {
+            bytes_consumed: consumed,
+            bytes_produced: result.bytes_produced,
+            status: result.status,
+        })
     }
 
     /// Single call to miniz_oxide decompress using wrapping mode.
@@ -365,6 +388,14 @@ impl Decompressor for GzipDecompressor {
                 self.header_buf.extend_from_slice(input);
 
                 match self.try_parse_header() {
+                    // No gzip magic: raw deflate, starting with the bytes
+                    // held so far (this input included).
+                    Ok(0) => {
+                        self.header_state = GzipHeaderState::Decompressing;
+                        self.header_size = 0;
+                        self.replay = std::mem::take(&mut self.header_buf);
+                        self.inflate_replay(input.len(), true, output)
+                    }
                     Ok(header_size) => {
                         self.header_state = GzipHeaderState::Decompressing;
                         self.header_size = header_size;
@@ -398,6 +429,10 @@ impl Decompressor for GzipDecompressor {
                 }
             }
 
+            GzipHeaderState::Decompressing if !self.replay.is_empty() => {
+                self.replay.extend_from_slice(input);
+                self.inflate_replay(input.len(), !input.is_empty(), output)
+            }
             GzipHeaderState::Decompressing => {
                 let has_more = !input.is_empty();
                 self.inflate_to_output(input, has_more, output)
@@ -439,8 +474,9 @@ impl Decompressor for GzipDecompressor {
     ) -> Result<Option<Checkpoint>> {
         // Deflate resumes only at block boundaries, and inflate stops on
         // each one, so a boundary is "now" exactly when nothing has been
-        // produced since it.
-        if self.stage_pos < self.stage.len() {
+        // produced since it. Input still held in `replay` puts the caller's
+        // count ahead of the decoder, so no checkpoint until it is used up.
+        if self.stage_pos < self.stage.len() || !self.replay.is_empty() {
             return Ok(None);
         }
         if let Some(ref boundary) = self.last_boundary {
@@ -493,6 +529,7 @@ impl Decompressor for GzipDecompressor {
                     self.header_state = GzipHeaderState::Decompressing;
                     self.header_size = state.header_size;
                     self.header_buf.clear();
+                    self.replay.clear();
                     self.stage.clear();
                     self.stage_pos = 0;
                     self.deflate_in = 0;
@@ -530,6 +567,7 @@ impl GzipDecompressor {
         };
         self.header_buf.clear();
         self.header_size = 0;
+        self.replay.clear();
         self.deflate_in = 0;
         self.total_out = 0;
         self.last_boundary = None;
@@ -821,6 +859,38 @@ mod tests {
                     expected_tail.len()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_raw_fallback_keeps_bytes_from_short_reads() {
+        // Without the gzip magic the input is decoded as raw deflate; the
+        // bytes held while deciding must not be lost, however the input is
+        // split.
+        let plain: Vec<u8> = (0..50_000u32)
+            .map(|i| (i % 97) as u8 ^ (i / 1000) as u8)
+            .collect();
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &plain).unwrap();
+        let raw = enc.finish().unwrap();
+
+        for first in [1, 3, 9, 10, 64] {
+            let mut dec = GzipDecompressor::new();
+            let mut out = vec![0u8; 8192];
+            let mut all = Vec::new();
+            let mut pos = 0;
+            loop {
+                let len = if pos == 0 { first } else { 4096 };
+                let input = &raw[pos..(pos + len).min(raw.len())];
+                let r = dec.decompress(input, &mut out).unwrap();
+                pos += r.bytes_consumed;
+                all.extend_from_slice(&out[..r.bytes_produced]);
+                if r.status == DecompressStatus::StreamEnd {
+                    break;
+                }
+            }
+            assert!(all == plain, "first read of {first} bytes");
         }
     }
 }

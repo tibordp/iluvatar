@@ -78,6 +78,18 @@
 - cpio: only the first header's magic was checked, and hard links were
   matched on inode alone, so the same inode number on two devices joined
   unrelated files. Links are now matched on device and inode.
+- `EntryReader` (sync and tokio) looped forever on a read into an empty
+  buffer; it now returns 0 at once.
+- bzip2: after a checkpoint restore, any libbzip2 error was taken as the
+  end of the stream, hiding corrupt blocks. Only the expected mismatch
+  of the combined CRC at the end-of-stream marker is absorbed now.
+- zstd: data that is not a zstd or skippable frame where a frame should
+  start ended the stream silently (so non-zstd input decoded as empty);
+  it is now an error, as is a frame header with its reserved bit set.
+- AES: ciphertext that ended on a block boundary short of the known
+  plaintext length ended cleanly; it is `Error::TruncatedInput` now.
+- gzip: with gzip framing requested but no gzip magic, the raw-deflate
+  fallback dropped the bytes held from earlier short reads.
 
 ## 0.4.0 — 2026-09-23
 
