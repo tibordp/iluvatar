@@ -26,7 +26,11 @@ pub enum DecompressStatus {
 ///
 /// Empty `input` means the compressed stream has ended: a decompressor
 /// drains whatever it still holds and then reports
-/// [`DecompressStatus::StreamEnd`].
+/// [`DecompressStatus::StreamEnd`], or, if the stream stopped somewhere it
+/// cannot end (inside a block, before a trailer or footer), fails with
+/// [`Error::TruncatedInput`](crate::Error::TruncatedInput). The stream
+/// layer also treats a decompressor that makes no progress on empty input
+/// without reporting the end as truncated.
 pub trait Decompressor: Send {
     /// Decompress from `input` into `output`.
     ///

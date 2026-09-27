@@ -163,6 +163,15 @@ impl BitShifter {
         }
         count
     }
+
+    /// At the end of input, emit the carried byte's remaining bits (the
+    /// tail of the stream: end-of-stream marker, CRC, padding).
+    fn flush(&mut self, out: &mut Vec<u8>) {
+        if self.has_carry {
+            out.push(self.carry << self.bit_offset);
+            self.has_carry = false;
+        }
+    }
 }
 
 // ─── Bzip2 Decompressor ─────────────────────────────────────────────
@@ -264,8 +273,8 @@ impl Default for Bzip2Decompressor {
     }
 }
 
-impl Decompressor for Bzip2Decompressor {
-    fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
+impl Bzip2Decompressor {
+    fn decompress_any(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
         // ── Restore mode: bit-shift input and prepend header ──
         if self.restore_active {
             return self.decompress_restore(input, output);
@@ -357,6 +366,23 @@ impl Decompressor for Bzip2Decompressor {
             bytes_produced: total_produced,
             status: final_status,
         })
+    }
+}
+
+impl Decompressor for Bzip2Decompressor {
+    fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
+        let result = self.decompress_any(input, output)?;
+        // libbzip2 has no notion of end of input: out of input before the
+        // end-of-stream marker, it just stops. An empty file is an empty
+        // stream.
+        if input.is_empty()
+            && result.bytes_produced == 0
+            && result.status == DecompressStatus::Continue
+            && self.total_in > 0
+        {
+            return Err(Error::TruncatedInput);
+        }
+        Ok(result)
     }
 
     fn checkpoint(
@@ -494,6 +520,9 @@ impl Bzip2Decompressor {
         let mut feed = std::mem::take(&mut self.shift_buffer);
         if let Some(ref mut shifter) = self.bit_shifter {
             shifter.shift(input, &mut feed);
+            if input.is_empty() {
+                shifter.flush(&mut feed);
+            }
         } else {
             feed.extend_from_slice(input);
         }

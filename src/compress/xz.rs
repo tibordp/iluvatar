@@ -83,6 +83,48 @@ fn decode_vli(data: &[u8]) -> Option<(u64, usize)> {
     None // Incomplete
 }
 
+/// Size of an XZ stream footer.
+const FOOTER_SIZE: usize = 12;
+
+/// Length of the index (after its indicator byte, already consumed) plus
+/// the stream footer, once `data` holds all of it; `None` while more bytes
+/// are needed. The index's contents are not verified, only its layout.
+fn index_and_footer_len(data: &[u8]) -> Result<Option<usize>> {
+    let vli = |pos: usize| -> Result<Option<(u64, usize)>> {
+        match decode_vli(&data[pos.min(data.len())..]) {
+            Some(v) => Ok(Some(v)),
+            None if data.len() - pos.min(data.len()) >= 9 => {
+                Err(Error::DecompressionError("xz: invalid VLI in index".into()))
+            }
+            None => Ok(None),
+        }
+    };
+    let Some((records, mut pos)) = vli(0)? else {
+        return Ok(None);
+    };
+    for _ in 0..records {
+        // Unpadded size and uncompressed size.
+        for _ in 0..2 {
+            let Some((_, len)) = vli(pos)? else {
+                return Ok(None);
+            };
+            pos += len;
+        }
+    }
+    // Padding to a multiple of four (counting the indicator), then CRC32.
+    let index_len = 1 + pos;
+    let end = pos + (4 - index_len % 4) % 4 + 4 + FOOTER_SIZE;
+    if data.len() < end {
+        return Ok(None);
+    }
+    if &data[end - 2..end] != b"YZ" {
+        return Err(Error::DecompressionError(
+            "xz: invalid stream footer".into(),
+        ));
+    }
+    Ok(Some(end))
+}
+
 /// Processing phase of the XZ decompressor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum XzPhase {
@@ -261,6 +303,11 @@ impl Decompressor for XzDecompressor {
         }
 
         if input.is_empty() && self.buffer.is_empty() && self.lzma2.is_none() {
+            // End of the compressed stream before its footer. Only an empty
+            // file ends cleanly here.
+            if self.total_in > 0 || !matches!(self.phase, XzPhase::StreamHeader) {
+                return Err(Error::TruncatedInput);
+            }
             self.finished = true;
             return Ok(DecompressResult {
                 bytes_consumed: 0,
@@ -406,11 +453,13 @@ impl Decompressor for XzDecompressor {
                 }
 
                 XzPhase::Index => {
-                    // Skip the index and stream footer. We don't verify them.
-                    // Just consume everything remaining and declare done.
-                    pos = self.buffer.len();
-                    self.finished = true;
-                    self.phase = XzPhase::Done;
+                    // Skip the index and stream footer once all of it has
+                    // arrived; their contents are not verified.
+                    if let Some(len) = index_and_footer_len(&self.buffer[pos..])? {
+                        pos += len;
+                        self.finished = true;
+                        self.phase = XzPhase::Done;
+                    }
                     break;
                 }
 
@@ -431,6 +480,11 @@ impl Decompressor for XzDecompressor {
 
         let produced = self.drain_staged(output);
         self.total_out += produced as u64;
+
+        // End of the compressed stream with an incomplete stream buffered.
+        if input.is_empty() && pos == 0 && produced == 0 && !self.finished {
+            return Err(Error::TruncatedInput);
+        }
 
         let status = if self.finished && self.staged_pos >= self.staged_output.len() {
             DecompressStatus::StreamEnd
@@ -1192,6 +1246,36 @@ mod tests {
             assert!(
                 try_full_decompress(data).is_err(),
                 "bad-1-{name} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_xzvec_bad_cut_short() {
+        // Streams that end before they are complete: cut off, or LZMA2 data
+        // that runs out before its chunk sizes or end marker say it should.
+        let must_reject: &[(&str, &[u8])] = &[
+            (
+                "0-empty-truncated",
+                include_bytes!("../../tests/vectors/xz/bad/bad-0-empty-truncated.xz"),
+            ),
+            (
+                "1-lzma2-9",
+                include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-9.xz"),
+            ),
+            (
+                "1-lzma2-10",
+                include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-10.xz"),
+            ),
+            (
+                "1-lzma2-11",
+                include_bytes!("../../tests/vectors/xz/bad/bad-1-lzma2-11.xz"),
+            ),
+        ];
+        for (name, data) in must_reject {
+            assert!(
+                matches!(try_full_decompress(data), Err(Error::TruncatedInput)),
+                "bad-{name} should have been rejected as truncated"
             );
         }
     }

@@ -2403,3 +2403,64 @@ fn test_get_all_matches_directory_slash_variants() {
     assert_eq!(index.get_all("dir/").count(), 1);
     assert_eq!(index.get_all("missing").count(), 0);
 }
+
+#[cfg(all(
+    feature = "gzip",
+    feature = "bz2",
+    feature = "xz",
+    feature = "zstandard"
+))]
+#[test]
+fn test_cut_compressed_archive_is_truncated_archive() {
+    // ar has no trailer, so wherever the compressed stream is cut, indexing
+    // reaches its end and the codec must notice.
+    let files: Vec<(String, Vec<u8>)> = (0..6)
+        .map(|i| {
+            (
+                format!("member_{i}.o"),
+                incompressible(i, 3000 + 700 * i as usize),
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
+    let ar_data = create_ar_bytes(&refs);
+
+    let gz = create_ar_gz(&refs);
+    let bz2 = {
+        let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(1));
+        e.write_all(&ar_data).unwrap();
+        e.finish().unwrap()
+    };
+    let xz = {
+        let mut e = xz2::write::XzEncoder::new(Vec::new(), 6);
+        e.write_all(&ar_data).unwrap();
+        e.finish().unwrap()
+    };
+    let zst = zstd::encode_all(&ar_data[..], 3).unwrap();
+
+    for (name, format, data) in [
+        ("gzip", CompressionFormat::Gzip, gz),
+        ("bzip2", CompressionFormat::Bzip2, bz2),
+        ("xz", CompressionFormat::Xz, xz),
+        ("zstd", CompressionFormat::Zstd, zst),
+    ] {
+        assert_eq!(
+            try_index_in_memory(&data, format).unwrap().len(),
+            6,
+            "{name}"
+        );
+        let n = data.len();
+        let mut cuts: Vec<usize> = (1..40).collect();
+        cuts.extend((1..40).map(|i| i * n / 40));
+        cuts.extend(n - 40..n);
+        for cut in cuts {
+            match try_index_in_memory(&data[..cut], format) {
+                Err(iluvatar::Error::TruncatedArchive(_)) => {}
+                other => panic!("{name}: cut at {cut}/{n}: {:?}", other.map(|i| i.len())),
+            }
+        }
+    }
+}

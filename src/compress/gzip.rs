@@ -68,8 +68,15 @@ struct SavedBoundary {
 enum GzipHeaderState {
     ReadingFixedHeader,
     Decompressing,
+    /// Skipping the gzip trailer (CRC32 and ISIZE, not verified).
+    Trailer {
+        remaining: usize,
+    },
     Finished,
 }
+
+/// Size of the gzip trailer.
+const TRAILER_SIZE: usize = 8;
 
 impl GzipDecompressor {
     pub fn new() -> Self {
@@ -276,6 +283,14 @@ impl GzipDecompressor {
         }
 
         let decom_status = match status {
+            // Gzip framing (a parsed header) ends with a trailer that must
+            // still arrive; raw deflate ends here.
+            TINFLStatus::Done if !self.raw && self.header_size > 0 => {
+                self.header_state = GzipHeaderState::Trailer {
+                    remaining: TRAILER_SIZE,
+                };
+                DecompressStatus::Continue
+            }
             TINFLStatus::Done => {
                 self.finished = true;
                 self.header_state = GzipHeaderState::Finished;
@@ -291,12 +306,10 @@ impl GzipDecompressor {
             | TINFLStatus::HasMoreOutput
             | TINFLStatus::BlockBoundary => DecompressStatus::Continue,
             TINFLStatus::FailedCannotMakeProgress => {
-                // The deflate stream is truncated or corrupt: inflate cannot
-                // proceed even though the caller has no more input. Surface
-                // an error instead of masquerading as a clean end of stream.
-                return Err(Error::DecompressionError(
-                    "truncated or corrupt deflate stream".into(),
-                ));
+                // Inflate needs more input and the caller has none: the
+                // deflate stream was cut short (corrupt data fails with
+                // other statuses).
+                return Err(Error::TruncatedInput);
             }
             _ => {
                 return Err(Error::DecompressionError(format!(
@@ -330,6 +343,11 @@ impl Decompressor for GzipDecompressor {
         match self.header_state {
             GzipHeaderState::ReadingFixedHeader => {
                 if input.is_empty() {
+                    // End of input inside the header; an empty file is an
+                    // empty stream.
+                    if !self.header_buf.is_empty() {
+                        return Err(Error::TruncatedInput);
+                    }
                     return Ok(DecompressResult {
                         bytes_consumed: 0,
                         bytes_produced: 0,
@@ -377,6 +395,27 @@ impl Decompressor for GzipDecompressor {
             GzipHeaderState::Decompressing => {
                 let has_more = !input.is_empty();
                 self.inflate_to_output(input, has_more, output)
+            }
+
+            GzipHeaderState::Trailer { remaining } => {
+                if input.is_empty() {
+                    return Err(Error::TruncatedInput);
+                }
+                let take = remaining.min(input.len());
+                let remaining = remaining - take;
+                let status = if remaining == 0 {
+                    self.finished = true;
+                    self.header_state = GzipHeaderState::Finished;
+                    DecompressStatus::StreamEnd
+                } else {
+                    self.header_state = GzipHeaderState::Trailer { remaining };
+                    DecompressStatus::Continue
+                };
+                Ok(DecompressResult {
+                    bytes_consumed: take,
+                    bytes_produced: 0,
+                    status,
+                })
             }
 
             GzipHeaderState::Finished => Ok(DecompressResult {

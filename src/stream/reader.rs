@@ -493,6 +493,12 @@ impl StreamReader {
         if self.input_pos >= self.input_buf.len() {
             if self.eof {
                 if result.bytes_consumed == 0 && result.bytes_produced == 0 {
+                    // Nothing left to give but no end of stream: the
+                    // compressed stream was cut short (an empty file is an
+                    // empty stream).
+                    if self.compressed_pos > 0 && result.status != DecompressStatus::StreamEnd {
+                        return Some(EngineRequest::Error(Error::TruncatedInput));
+                    }
                     self.stream_ended = true;
                     self.state = State::Done;
                     return Some(EngineRequest::Done);

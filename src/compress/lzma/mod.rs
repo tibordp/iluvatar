@@ -78,6 +78,12 @@ impl Decompressor for Lzma2Decompressor {
                     status: DecompressStatus::StreamEnd,
                 })
             }
+            // Out of input before the end marker.
+            Lzma2DecodeStatus::Continue | Lzma2DecodeStatus::NeedInput
+                if input.is_empty() && result.bytes_produced == 0 =>
+            {
+                Err(Error::TruncatedInput)
+            }
             Lzma2DecodeStatus::Continue | Lzma2DecodeStatus::NeedInput => Ok(DecompressResult {
                 bytes_consumed: result.bytes_consumed,
                 bytes_produced: result.bytes_produced,
@@ -189,7 +195,7 @@ impl Decompressor for LzmaDecompressor {
             }
             decoder::LzmaDecodeStatus::Continue | decoder::LzmaDecodeStatus::NeedInput => {
                 if input.is_empty() && result.bytes_produced == 0 {
-                    return Err(Error::DecompressionError("truncated LZMA stream".into()));
+                    return Err(Error::TruncatedInput);
                 }
                 DecompressStatus::Continue
             }

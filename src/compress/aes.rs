@@ -85,9 +85,8 @@ impl Decompressor for AesCbcDecryptor {
         }
         if input.is_empty() {
             if !self.carry.is_empty() {
-                return Err(Error::DecompressionError(
-                    "encrypted stream ends mid-block".into(),
-                ));
+                // The ciphertext ends mid-block: it was cut short.
+                return Err(Error::TruncatedInput);
             }
             if self.staged.is_empty() {
                 self.finished = true;

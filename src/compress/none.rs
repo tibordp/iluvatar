@@ -29,7 +29,7 @@ impl Decompressor for NoneDecompressor {
             return Ok(DecompressResult {
                 bytes_consumed: 0,
                 bytes_produced: 0,
-                status: DecompressStatus::Continue,
+                status: DecompressStatus::StreamEnd,
             });
         }
 
@@ -103,12 +103,12 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_input() {
+    fn test_empty_input_ends_stream() {
         let mut dec = NoneDecompressor::new();
         let mut output = vec![0u8; 64];
         let result = dec.decompress(&[], &mut output).unwrap();
         assert_eq!(result.bytes_consumed, 0);
         assert_eq!(result.bytes_produced, 0);
-        assert_eq!(result.status, DecompressStatus::Continue);
+        assert_eq!(result.status, DecompressStatus::StreamEnd);
     }
 }

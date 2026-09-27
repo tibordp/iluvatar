@@ -169,6 +169,12 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
                     self.done = true;
                     return EngineRequest::Done;
                 }
+                // A cut-short compressed stream is a truncated archive.
+                EngineRequest::Error(crate::error::Error::TruncatedInput) => {
+                    return EngineRequest::Error(crate::error::Error::TruncatedArchive(
+                        "the compressed stream ends prematurely".into(),
+                    ));
+                }
                 other => return other,
             }
         }

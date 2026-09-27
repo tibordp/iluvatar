@@ -237,13 +237,17 @@ impl Decompressor for ZstdDecompressor {
         }
 
         if input.is_empty() && self.buffer.is_empty() {
-            // No input available and nothing buffered — caller may have more data.
-            // Don't set finished; the engine handles EOF via signal_eof() and
-            // the 0/0 progress check.
+            // End of the compressed stream, which may only fall between
+            // frames.
+            if !matches!(self.phase, DecoderPhase::FrameHeader) {
+                return Err(Error::TruncatedInput);
+            }
+            self.finished = true;
+            self.phase = DecoderPhase::Done;
             return Ok(DecompressResult {
                 bytes_consumed: 0,
                 bytes_produced: 0,
-                status: DecompressStatus::Continue,
+                status: DecompressStatus::StreamEnd,
             });
         }
 
@@ -410,6 +414,11 @@ impl Decompressor for ZstdDecompressor {
         // Deliver staged output
         let produced = self.drain_staged(output);
         self.total_out += produced as u64;
+
+        // End of the compressed stream with a partial frame buffered.
+        if input.is_empty() && pos == 0 && produced == 0 && !self.finished {
+            return Err(Error::TruncatedInput);
+        }
 
         let status = if self.finished && self.staged_len() == 0 {
             DecompressStatus::StreamEnd

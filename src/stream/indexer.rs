@@ -214,8 +214,13 @@ impl<S: CheckpointStrategy> StreamIndexer<S> {
         }
 
         let stopped = self.stop_at.is_some_and(|stop| self.unpacked_pos >= stop);
-        let ended = result.status == DecompressStatus::StreamEnd
-            || (!had_input && result.bytes_consumed == 0 && produced == 0);
+        // Out of input with nothing left to give but no end of stream: the
+        // compressed stream was cut short. An empty file is an empty stream.
+        let idle_at_eof = !had_input && result.bytes_consumed == 0 && produced == 0;
+        if idle_at_eof && result.status != DecompressStatus::StreamEnd && self.compressed_pos > 0 {
+            return Some(EngineRequest::Error(Error::TruncatedInput));
+        }
+        let ended = result.status == DecompressStatus::StreamEnd || idle_at_eof;
         if ended || stopped {
             if ended {
                 self.index.complete = true;

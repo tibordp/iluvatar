@@ -25,6 +25,10 @@ pub struct RangeDecoder {
     pub code: u32,
     /// Whether corruption has been detected (informational; decoding continues).
     pub corrupted: bool,
+    /// The first bytes of an initialization that arrived split across
+    /// inputs.
+    init_buf: [u8; 5],
+    init_len: u8,
 }
 
 /// Result of a range decoder operation that may need more input.
@@ -41,6 +45,8 @@ impl RangeDecoder {
             range: 0xFFFF_FFFF,
             code: 0,
             corrupted: false,
+            init_buf: [0; 5],
+            init_len: 0,
         }
     }
 
@@ -48,23 +54,30 @@ impl RangeDecoder {
     /// Returns how many bytes were consumed (up to 5), or NeedInput if
     /// not enough bytes are available.
     pub fn init(&mut self, input: &[u8]) -> (RangeCoderStatus, usize) {
-        if input.len() < 5 {
-            return (RangeCoderStatus::NeedInput, 0);
+        let have = self.init_len as usize;
+        let take = (5 - have).min(input.len());
+        self.init_buf[have..have + take].copy_from_slice(&input[..take]);
+        self.init_len += take as u8;
+        if self.init_len < 5 {
+            return (RangeCoderStatus::NeedInput, take);
         }
+        self.init_len = 0;
         self.corrupted = false;
         self.range = 0xFFFF_FFFF;
 
-        let b0 = input[0];
-        self.code = (input[1] as u32) << 24
-            | (input[2] as u32) << 16
-            | (input[3] as u32) << 8
-            | (input[4] as u32);
+        let b = self.init_buf;
+        self.code = u32::from_be_bytes([b[1], b[2], b[3], b[4]]);
 
-        if b0 != 0 || self.code == self.range {
+        if b[0] != 0 || self.code == self.range {
             self.corrupted = true;
         }
 
-        (RangeCoderStatus::Ok, 5)
+        (RangeCoderStatus::Ok, take)
+    }
+
+    /// Discard a partially received initialization.
+    pub fn reset_init(&mut self) {
+        self.init_len = 0;
     }
 
     /// Normalize the range decoder, consuming one byte from input if needed.
@@ -189,12 +202,18 @@ mod tests {
     }
 
     #[test]
-    fn test_init_not_enough_data() {
+    fn test_init_split_across_inputs() {
         let mut rc = RangeDecoder::new();
-        let data = [0u8, 0x12, 0x34];
-        let (status, consumed) = rc.init(&data);
+        let (status, consumed) = rc.init(&[0u8, 0x12, 0x34]);
         assert_eq!(status, RangeCoderStatus::NeedInput);
-        assert_eq!(consumed, 0);
+        assert_eq!(consumed, 3);
+        let (status, consumed) = rc.init(&[]);
+        assert_eq!((status, consumed), (RangeCoderStatus::NeedInput, 0));
+        let (status, consumed) = rc.init(&[0x56, 0x78, 0x9A]);
+        assert_eq!(status, RangeCoderStatus::Ok);
+        assert_eq!(consumed, 2);
+        assert_eq!(rc.code, 0x12345678);
+        assert!(!rc.corrupted);
     }
 
     #[test]
@@ -236,15 +255,17 @@ mod tests {
 
     #[test]
     fn test_serialization_roundtrip() {
-        let rc = RangeDecoder {
-            range: 0x12345678,
-            code: 0xABCDEF01,
-            corrupted: false,
-        };
+        let mut rc = RangeDecoder::new();
+        rc.range = 0x12345678;
+        rc.code = 0xABCDEF01;
+        // A partially received initialization survives too.
+        rc.init(&[0, 0x11]);
         let serialized = bincode::serialize(&rc).unwrap();
-        let rc2: RangeDecoder = bincode::deserialize(&serialized).unwrap();
+        let mut rc2: RangeDecoder = bincode::deserialize(&serialized).unwrap();
         assert_eq!(rc2.range, rc.range);
         assert_eq!(rc2.code, rc.code);
         assert_eq!(rc2.corrupted, rc.corrupted);
+        assert_eq!(rc2.init(&[0x22, 0x33, 0x44]), (RangeCoderStatus::Ok, 3));
+        assert_eq!(rc2.code, 0x11223344);
     }
 }

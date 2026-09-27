@@ -520,6 +520,7 @@ impl Lzma2Decoder {
         self.decoder.set_unpack_size(Some(self.unpack_size as u64));
         self.decoder.decoded_size = 0;
         self.decoder.rc_initialized = false;
+        self.decoder.range_decoder.reset_init();
         // Reset the decode phase to start fresh for this chunk
         self.decoder.phase = super::decoder::DecodePhase::NewSymbol;
         self.decoder.len_decode_state = None;

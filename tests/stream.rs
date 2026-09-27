@@ -762,3 +762,250 @@ fn sync_stream_repeated_reads_through_one_handle() {
         }
     }
 }
+
+// ─── Cut-short streams ───
+
+/// Index `compressed` in one pass, returning the indexer's error if any.
+fn try_index(compressed: &[u8], codec: CodecSpec) -> iluvatar::Result<StreamIndex> {
+    let mut indexer = StreamIndexer::new(codec, FixedInterval::new(32 * 1024), None)?;
+    let mut offset = 0;
+    loop {
+        match indexer.step() {
+            EngineRequest::NeedInput | EngineRequest::SeekAndRead { .. } => {
+                if offset >= compressed.len() {
+                    indexer.signal_eof();
+                } else {
+                    let end = (offset + 4096).min(compressed.len());
+                    indexer.provide_data(&compressed[offset..end]);
+                    offset = end;
+                }
+            }
+            EngineRequest::OutputReady => {}
+            EngineRequest::Done => return Ok(indexer.finish()),
+            EngineRequest::Error(e) => return Err(e),
+        }
+    }
+}
+
+/// Cut positions: every byte near both ends, and a spread in between.
+fn cuts(len: usize) -> Vec<usize> {
+    let mut cuts: Vec<usize> = (1..64.min(len)).collect();
+    cuts.extend((1..50).map(|i| i * len / 50));
+    cuts.extend(len.saturating_sub(64)..len);
+    cuts.retain(|&c| c > 0 && c < len);
+    cuts
+}
+
+#[test]
+fn every_codec_reports_a_cut_stream_as_truncated() {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    let plain = mixed(9, 200_000);
+
+    let packed = raw_lzma2(&plain);
+    let key = [0x11u8; 32];
+    let iv = [0x22u8; 16];
+    let cipher = aes::Aes256::new(&key.into());
+    let mut prev = iv;
+    let mut encrypted = Vec::new();
+    let mut padded = packed.clone();
+    padded.resize(packed.len().div_ceil(16) * 16, 0);
+    for chunk in padded.chunks(16) {
+        let mut b = [0u8; 16];
+        for (i, (c, p)) in chunk.iter().zip(prev.iter()).enumerate() {
+            b[i] = c ^ p;
+        }
+        cipher.encrypt_block((&mut b).into());
+        encrypted.extend_from_slice(&b);
+        prev = b;
+    }
+    let (props, dict_size, lzma1) = raw_lzma1(&plain);
+
+    let lzma2 = Codec::Lzma2 {
+        dict_prop: LZMA2_1MIB,
+    };
+    let cases: Vec<(&str, Vec<u8>, CodecSpec)> = vec![
+        (
+            "gzip",
+            gzip(&plain),
+            CodecSpec::single(Codec::Deflate { raw: false }),
+        ),
+        (
+            "deflate",
+            raw_deflate(&plain),
+            CodecSpec::single(Codec::Deflate { raw: true }),
+        ),
+        ("bzip2", bzip2(&plain), CodecSpec::single(Codec::Bzip2)),
+        ("xz", xz(&plain), CodecSpec::single(Codec::Xz)),
+        ("zstd", zstd(&plain), CodecSpec::single(Codec::Zstd)),
+        ("lzma2", packed.clone(), CodecSpec::single(lzma2.clone())),
+        (
+            "lzma1",
+            lzma1.clone(),
+            CodecSpec::single(Codec::Lzma {
+                props,
+                dict_size,
+                unpacked_len: None,
+            }),
+        ),
+        (
+            "lzma1 with known length",
+            lzma1,
+            CodecSpec::single(Codec::Lzma {
+                props,
+                dict_size,
+                unpacked_len: Some(plain.len() as u64),
+            }),
+        ),
+        (
+            "aes + lzma2",
+            encrypted,
+            CodecSpec(vec![
+                Codec::AesCbc {
+                    key: Some(key),
+                    iv,
+                    len: Some(packed.len() as u64),
+                },
+                lzma2,
+            ]),
+        ),
+    ];
+
+    for (name, compressed, codec) in cases {
+        let index = try_index(&compressed, codec.clone())
+            .unwrap_or_else(|e| panic!("{name}: complete stream failed: {e}"));
+        assert_eq!(index.unpacked_len, Some(plain.len() as u64), "{name}");
+        let framed = ["gzip", "bzip2", "xz", "zstd"].contains(&name);
+        for cut in cuts(compressed.len()) {
+            match try_index(&compressed[..cut], codec.clone()) {
+                Err(iluvatar::Error::TruncatedInput) => {}
+                // A raw stream of known length may lose only its optional
+                // end marker; never data. Framed formats need their trailer.
+                Ok(index) if !framed && index.unpacked_len == Some(plain.len() as u64) => {}
+                other => panic!("{name}: cut at {cut}: {:?}", other.map(|i| i.unpacked_len)),
+            }
+        }
+        eprintln!(
+            "EMPTY {name}: {:?}",
+            try_index(&[], codec).map(|i| i.unpacked_len)
+        );
+    }
+}
+
+#[test]
+fn reading_a_stream_cut_after_indexing_is_truncated() {
+    let plain = mixed(10, 300_000);
+    for (name, compressed, codec) in [
+        (
+            "gzip",
+            gzip(&plain),
+            CodecSpec::single(Codec::Deflate { raw: false }),
+        ),
+        ("bzip2", bzip2(&plain), CodecSpec::single(Codec::Bzip2)),
+        ("xz", xz(&plain), CodecSpec::single(Codec::Xz)),
+        ("zstd", zstd(&plain), CodecSpec::single(Codec::Zstd)),
+    ] {
+        // A partial index (no known length), so only the codec can notice.
+        let mut index = try_index(&compressed, codec).unwrap();
+        index.unpacked_len = None;
+        let cut = &compressed[..compressed.len() * 3 / 4];
+
+        let mut reader = StreamReader::new(&index, 0, plain.len() as u64).unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let result = loop {
+            match reader.step() {
+                EngineRequest::NeedInput | EngineRequest::SeekAndRead { .. } => {
+                    let pos = reader.compressed_position() as usize;
+                    if pos >= cut.len() {
+                        reader.signal_eof();
+                    } else {
+                        let end = (pos + 4096).min(cut.len());
+                        reader.provide_data(&cut[pos..end]);
+                    }
+                }
+                EngineRequest::OutputReady => while reader.read_output(&mut buf) > 0 {},
+                EngineRequest::Done => break Ok(()),
+                EngineRequest::Error(e) => break Err(e),
+            }
+        };
+        assert!(
+            matches!(result, Err(iluvatar::Error::TruncatedInput)),
+            "{name}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn lzma_range_coder_init_split_across_reads() {
+    // Each LZMA chunk starts its range coder with 5 bytes; a read boundary
+    // inside them must not stall the decoder.
+    let plain = mixed(3, 100_000);
+    let packed = raw_lzma2(&plain);
+    for first in 1..12 {
+        let codec = CodecSpec::single(Codec::Lzma2 {
+            dict_prop: LZMA2_1MIB,
+        });
+        let mut indexer = StreamIndexer::new(codec, FixedInterval::new(1 << 20), None).unwrap();
+        indexer.emit_output(true);
+        let mut offset = 0;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match indexer.step() {
+                EngineRequest::NeedInput | EngineRequest::SeekAndRead { .. } => {
+                    if offset >= packed.len() {
+                        indexer.signal_eof();
+                    } else {
+                        let len = if offset == 0 { first } else { 4096 };
+                        let end = (offset + len).min(packed.len());
+                        indexer.provide_data(&packed[offset..end]);
+                        offset = end;
+                    }
+                }
+                EngineRequest::OutputReady => loop {
+                    let n = indexer.read_output(&mut buf);
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                },
+                EngineRequest::Done => break,
+                EngineRequest::Error(e) => panic!("first read of {first} bytes: {e}"),
+            }
+        }
+        assert!(out == plain, "first read of {first} bytes");
+    }
+}
+
+#[test]
+fn uncompressed_range_past_the_end_without_known_length_ends_short() {
+    // Uncompressed data may end anywhere: without a known length, a range
+    // reaching past the end is cut short, not an error.
+    let plain = mixed(11, 10_000);
+    let mut index = try_index(&plain, CodecSpec::single(Codec::Copy)).unwrap();
+    index.unpacked_len = None;
+    let mut reader = StreamReader::new(&index, 9_000, 5_000).unwrap();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    loop {
+        match reader.step() {
+            EngineRequest::NeedInput | EngineRequest::SeekAndRead { .. } => {
+                let pos = reader.compressed_position() as usize;
+                if pos >= plain.len() {
+                    reader.signal_eof();
+                } else {
+                    reader.provide_data(&plain[pos..(pos + 4096).min(plain.len())]);
+                }
+            }
+            EngineRequest::OutputReady => loop {
+                let n = reader.read_output(&mut buf);
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            },
+            EngineRequest::Done => break,
+            EngineRequest::Error(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(out, &plain[9_000..]);
+}

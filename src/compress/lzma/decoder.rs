@@ -639,6 +639,7 @@ impl LzmaDecoder {
             *p = PROB_INIT_VAL;
         }
         self.rc_initialized = false;
+        self.range_decoder.reset_init();
         self.phase = DecodePhase::NewSymbol;
         self.decoded_size = 0;
         self.len_decode_state = None;
@@ -654,6 +655,7 @@ impl LzmaDecoder {
         self.state = 0;
         self.reps = [0; 4];
         self.rc_initialized = false;
+        self.range_decoder.reset_init();
         self.phase = DecodePhase::NewSymbol;
         self.decoded_size = 0;
         self.len_decode_state = None;
@@ -694,7 +696,7 @@ impl LzmaDecoder {
             let (status, consumed) = self.range_decoder.init(&input[in_pos..]);
             if status == RangeCoderStatus::NeedInput {
                 return LzmaDecodeResult {
-                    bytes_consumed: in_pos,
+                    bytes_consumed: in_pos + consumed,
                     bytes_produced: out_pos,
                     status: LzmaDecodeStatus::NeedInput,
                 };

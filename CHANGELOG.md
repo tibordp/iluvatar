@@ -22,13 +22,17 @@
   `entries()` returns every entry in archive order, and `list` returns
   archive order too, where it was arbitrary. Members sharing a path (a
   static library with two `foo.o`, a tar appended to with `tar -r`)
-  were collapsed to the last one; all are kept now, and `get`, `len` and
-  `ReadEngine::new` count and resolve them as described in the
-  `ArchiveIndex` docs (`get` still resolves to the last). The index
-  format version is bumped: rebuild saved indexes.
+  were collapsed to the last one; all are kept now. `len` counts every
+  member; `get` and `ReadEngine::new` still resolve a path to the last.
+  The index format version is bumped: rebuild saved indexes.
 - `iluvatar ls` lists in archive order, like `tar t`, instead of sorting
   by path.
-
+- The zstd decoder reports `DecompressStatus::StreamEnd` at the end of
+  its input between frames (it never did), and the `Copy` codec reports it
+  on empty input, as the `Decompressor` contract describes. Truncation
+  errors that were a generic `DecompressionError` ("truncated or corrupt
+  deflate stream", "encrypted stream ends mid-block", "truncated LZMA
+  stream") are now `Error::TruncatedInput`.
 - `ArchiveFormat` and `Error` are now `#[non_exhaustive]`, so future
   formats (and their error variants) can be added without a breaking
   release. Exhaustive matches on either need a wildcard arm.
@@ -42,13 +46,30 @@
   with the new `Error::TruncatedArchive` when the stream ends somewhere an
   archive cannot end. Tar may still end without its zero blocks, and ar
   without the pad byte after an odd-sized last member; cpio requires its
-  `TRAILER!!!` entry.
+  `TRAILER!!!` entry. After the error, `IndexingEngine::cancel` still
+  returns the entries indexed so far.
 - Reads now fail with `Error::TruncatedInput` instead of returning short
   data when the stream ends before the requested range: always for archive
   entries (`ReadEngine`), and for `StreamReader` ranges whenever the index
   knows the stream's length. `ReadEngine` also rejects an entry that runs
   past the end of the stream, which an index built by an earlier version
   from a truncated archive can contain.
+- Cut-short compressed streams were accepted as complete. bzip2, xz and
+  zstd decoded whatever arrived and stopped without complaint; gzip ended
+  cleanly inside its header and ignored a missing trailer; xz ignored a
+  missing index and footer. Every codec now fails with
+  `Error::TruncatedInput` when its input ends where the stream cannot,
+  and indexing an archive reports it as `Error::TruncatedArchive`. The
+  stream layer backs this up for any decoder that simply stops. An empty
+  file is still an empty gzip, bzip2, xz or zstd stream. Trailers are
+  required but their checksums are still not verified. Only the first
+  gzip member, bzip2 stream or xz stream is decoded, so an archive split
+  across several
+  now fails with `Error::TruncatedArchive` instead of being cut off
+  silently.
+- A raw LZMA or LZMA2 stream failed with "decompressor made no progress"
+  when a read ended inside the 5 bytes that start the range coder of a
+  chunk; those bytes are now buffered.
 
 ## 0.4.0 — 2026-09-23
 
