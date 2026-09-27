@@ -70,6 +70,14 @@
 - A raw LZMA or LZMA2 stream failed with "decompressor made no progress"
   when a read ended inside the 5 bytes that start the range coder of a
   chunk; those bytes are now buffered.
+- tar: a header after a single zero block skipped the usual processing,
+  so a PAX or GNU long-name header there surfaced as a bogus entry (and
+  its size limit went unchecked); old GNU headers (`ustar  \0`) had
+  their atime/ctime read as a path prefix; and `mode` kept the file-type
+  bits some writers store, where cpio and ar keep only permissions.
+- cpio: only the first header's magic was checked, and hard links were
+  matched on inode alone, so the same inode number on two devices joined
+  unrelated files. Links are now matched on device and inode.
 
 ## 0.4.0 — 2026-09-23
 

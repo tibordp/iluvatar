@@ -12,6 +12,14 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 /// huge allocation.
 const MAX_NAME_SIZE: usize = 1 << 16;
 
+/// Identifies a file across the archive: inode numbers are only unique
+/// per device, so hard links are matched on (dev major, dev minor, inode).
+type InodeKey = (u32, u32, u64);
+
+fn inode_key(hdr: &CpioHeader) -> InodeKey {
+    (hdr.devmajor, hdr.devminor, hdr.ino)
+}
+
 /// Internal parser state.
 enum CpioState {
     /// Reading the fixed-size header.
@@ -28,7 +36,7 @@ enum CpioState {
         entry: ArchiveEntry,
         remaining: usize,
         /// Inode and link count, for hardlink resolution at emission time.
-        ino: u64,
+        inode: InodeKey,
         nlink: u32,
     },
     /// Reading symlink target (stored as file data in cpio).
@@ -62,14 +70,14 @@ pub struct CpioParser {
     /// Detected sub-format (set after first header).
     sub_format: Option<CpioSubFormat>,
     /// Inode -> path of the data-bearing member, for hardlink resolution.
-    resolved_inodes: HashMap<u64, String>,
+    resolved_inodes: HashMap<InodeKey, String>,
     /// Zero-size hardlink members seen before their inode's data-bearing
     /// member; emitted (as HardLink) right after it. In newc archives the
     /// file data is stored with the LAST member of a hardlink set, so the
     /// earlier members must be deferred, and they come out after the data
     /// member rather than in archive order. BTreeMap so the flush at the
     /// trailer is deterministic (by inode).
-    deferred_links: BTreeMap<u64, Vec<ArchiveEntry>>,
+    deferred_links: BTreeMap<InodeKey, Vec<ArchiveEntry>>,
     /// Entries ready to be emitted on subsequent feed() calls.
     pending: VecDeque<ArchiveEntry>,
 }
@@ -93,7 +101,7 @@ impl CpioParser {
     fn apply_hardlink_policy(
         &mut self,
         mut entry: ArchiveEntry,
-        ino: u64,
+        inode: InodeKey,
         nlink: u32,
     ) -> Option<ArchiveEntry> {
         if entry.entry_type != EntryType::Regular || nlink <= 1 {
@@ -101,8 +109,8 @@ impl CpioParser {
         }
         if entry.size > 0 {
             // Data-bearing member: this is the canonical path for the inode.
-            self.resolved_inodes.insert(ino, entry.path.clone());
-            if let Some(deferred) = self.deferred_links.remove(&ino) {
+            self.resolved_inodes.insert(inode, entry.path.clone());
+            if let Some(deferred) = self.deferred_links.remove(&inode) {
                 for mut d in deferred {
                     d.entry_type = EntryType::HardLink;
                     d.link_target = Some(entry.path.clone());
@@ -110,14 +118,14 @@ impl CpioParser {
                 }
             }
             Some(entry)
-        } else if let Some(path) = self.resolved_inodes.get(&ino) {
+        } else if let Some(path) = self.resolved_inodes.get(&inode) {
             // Data member already seen (data-first layout).
             entry.entry_type = EntryType::HardLink;
             entry.link_target = Some(path.clone());
             Some(entry)
         } else {
             // Data member not seen yet (the usual newc layout): defer.
-            self.deferred_links.entry(ino).or_default().push(entry);
+            self.deferred_links.entry(inode).or_default().push(entry);
             None
         }
     }
@@ -189,6 +197,20 @@ impl CpioParser {
     }
 
     fn process_header(&mut self, consumed: usize) -> Result<(usize, ArchiveEvent)> {
+        // Every header must carry the archive's magic (newc and newc-CRC
+        // may mix); anything else means the parser lost its place.
+        let magic = &self.header_buf[0..6];
+        let magic_ok = match self.sub_format {
+            Some(CpioSubFormat::Odc) => magic == ODC_MAGIC,
+            _ => magic == NEWC_MAGIC || magic == NEWC_CRC_MAGIC,
+        };
+        if !magic_ok {
+            return Err(Error::InvalidCpioHeader(format!(
+                "bad magic {:?} at offset {}",
+                String::from_utf8_lossy(magic),
+                self.stream_pos - self.header_buf.len() as u64
+            )));
+        }
         let hdr = match self.sub_format {
             Some(CpioSubFormat::Odc) => header::parse_odc_header(&self.header_buf)?,
             _ => header::parse_newc_header(&self.header_buf)?,
@@ -285,7 +307,7 @@ impl CpioParser {
             self.state = CpioState::SkippingNamePad {
                 entry,
                 remaining: name_pad,
-                ino: hdr.ino,
+                inode: inode_key(&hdr),
                 nlink: hdr.nlink,
             };
             return Ok((take, ArchiveEvent::NeedData));
@@ -315,10 +337,13 @@ impl CpioParser {
         }
 
         // Padding done — update data_offset to current position
-        let (mut entry, ino, nlink) = match std::mem::replace(&mut self.state, CpioState::End) {
+        let (mut entry, inode, nlink) = match std::mem::replace(&mut self.state, CpioState::End) {
             CpioState::SkippingNamePad {
-                entry, ino, nlink, ..
-            } => (entry, ino, nlink),
+                entry,
+                inode,
+                nlink,
+                ..
+            } => (entry, inode, nlink),
             _ => unreachable!(),
         };
         entry.data_offset = self.stream_pos;
@@ -352,13 +377,13 @@ impl CpioParser {
             self.state = CpioState::SkippingData {
                 remaining: total_skip,
             };
-            match self.apply_hardlink_policy(entry, ino, nlink) {
+            match self.apply_hardlink_policy(entry, inode, nlink) {
                 Some(entry) => Ok((skip, ArchiveEvent::Entry(entry))),
                 None => Ok((skip, ArchiveEvent::NeedData)),
             }
         } else {
             self.state = CpioState::ReadingHeader;
-            match self.apply_hardlink_policy(entry, ino, nlink) {
+            match self.apply_hardlink_policy(entry, inode, nlink) {
                 Some(entry) => Ok((skip, ArchiveEvent::Entry(entry))),
                 None => Ok((skip, ArchiveEvent::NeedData)),
             }
@@ -395,13 +420,13 @@ impl CpioParser {
             self.state = CpioState::SkippingData {
                 remaining: total_skip,
             };
-            match self.apply_hardlink_policy(entry, hdr.ino, hdr.nlink) {
+            match self.apply_hardlink_policy(entry, inode_key(hdr), hdr.nlink) {
                 Some(entry) => Ok(ArchiveEvent::Entry(entry)),
                 None => Ok(ArchiveEvent::NeedData),
             }
         } else {
             self.state = CpioState::ReadingHeader;
-            match self.apply_hardlink_policy(entry, hdr.ino, hdr.nlink) {
+            match self.apply_hardlink_policy(entry, inode_key(hdr), hdr.nlink) {
                 Some(entry) => Ok(ArchiveEvent::Entry(entry)),
                 None => Ok(ArchiveEvent::NeedData),
             }
@@ -1084,5 +1109,47 @@ mod tests {
             Some(1 << 32), // 4 GiB "target"
         );
         assert!(parse_chunked(&archive, archive.len()).is_err());
+    }
+
+    #[test]
+    fn test_bad_magic_after_first_header_rejected() {
+        let mut archive = Vec::new();
+        write_newc_record(&mut archive, "a.txt", b"aaaa", 1, 0o100644, 1, None, None);
+        let second = archive.len();
+        write_newc_record(&mut archive, "b.txt", b"bbbb", 2, 0o100644, 1, None, None);
+        write_newc_trailer(&mut archive);
+        archive[second..second + 6].copy_from_slice(b"070799");
+        assert!(parse_chunked(&archive, archive.len()).is_err());
+        // Nor may a later header switch sub-format mid-archive.
+        archive[second..second + 6].copy_from_slice(b"070707");
+        assert!(parse_chunked(&archive, archive.len()).is_err());
+    }
+
+    #[test]
+    fn test_hardlinks_are_per_device() {
+        // Inode numbers are unique per device only: the same inode on two
+        // devices is two unrelated files.
+        let mut archive = Vec::new();
+        write_newc_record(
+            &mut archive,
+            "dev1/data",
+            b"hello",
+            7,
+            0o100644,
+            2,
+            None,
+            None,
+        );
+        let second = archive.len();
+        write_newc_record(&mut archive, "dev2/empty", b"", 7, 0o100644, 2, None, None);
+        // devminor of the second member (header offset 70..78).
+        archive[second + 70..second + 78].copy_from_slice(b"00000001");
+        write_newc_trailer(&mut archive);
+
+        let entries = parse_chunked(&archive, archive.len()).unwrap();
+        let empty = entries.iter().find(|e| e.path == "dev2/empty").unwrap();
+        assert_eq!(empty.entry_type, EntryType::Regular);
+        assert_eq!(empty.link_target, None);
+        assert_eq!(empty.size, 0);
     }
 }

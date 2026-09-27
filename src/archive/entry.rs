@@ -62,8 +62,7 @@ pub(crate) struct ArchiveEntry {
     pub size: u64,
     /// Type of entry.
     pub entry_type: EntryType,
-    /// Unix permissions. cpio and ar keep the lower 12 bits; tar passes its
-    /// mode field through as stored (usually, but not always, just those bits).
+    /// Unix permissions (lower 12 bits).
     pub mode: u32,
     /// Owner user ID.
     pub uid: u64,

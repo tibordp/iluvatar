@@ -111,11 +111,17 @@ pub fn parse_header(header: &[u8; BLOCK_SIZE], data_offset: u64) -> Result<TarEn
         ));
     }
 
-    // Check for ustar magic
+    // "ustar\0" is POSIX ustar; old GNU headers ("ustar  \0") share the
+    // user/group names but keep atime/ctime where ustar has `prefix`.
     let is_ustar = &header[257..262] == b"ustar";
+    let is_posix_ustar = &header[257..263] == b"ustar\0";
 
     let (full_path, uname, gname) = if is_ustar {
-        let prefix = parse_string(&header[345..500]);
+        let prefix = if is_posix_ustar {
+            parse_string(&header[345..500])
+        } else {
+            String::new()
+        };
         let uname = parse_string(&header[265..297]);
         let gname = parse_string(&header[297..329]);
 

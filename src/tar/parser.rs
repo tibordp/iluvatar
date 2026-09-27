@@ -137,6 +137,12 @@ impl TarParser {
             return Ok((available, TarEvent::NeedData));
         }
 
+        self.process_header(available)
+    }
+
+    /// Handle the complete, non-zero header block in `header_buf`.
+    /// `available` is what the caller consumed, passed through.
+    fn process_header(&mut self, available: usize) -> Result<(usize, TarEvent)> {
         let data_offset = self.stream_pos;
         let mut entry = header::parse_header(&self.header_buf, data_offset)?;
 
@@ -332,17 +338,9 @@ impl TarParser {
             self.state = ParserState::End;
             Ok((available, TarEvent::EndOfArchive))
         } else {
-            // Not actually end of archive — this was a valid header after a zero block
-            // (unusual but technically possible)
-            let data_offset = self.stream_pos;
-            let entry = header::parse_header(&self.header_buf, data_offset)?;
-            let padded = header::padded_size(entry.size);
-            if padded > 0 {
-                self.state = ParserState::SkippingData { remaining: padded };
-            } else {
-                self.state = ParserState::ReadingHeader;
-            }
-            Ok((available, TarEvent::Entry(entry)))
+            // A lone zero block was not the end after all: this is an
+            // ordinary header.
+            self.process_header(available)
         }
     }
 
@@ -808,5 +806,91 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "override.txt");
         assert_eq!(entries[0].size, 7);
+    }
+
+    /// A PAX `x` header's data block carrying `path=<path>`.
+    fn pax_path_block(path: &str) -> Vec<u8> {
+        let payload_len = "path".len() + 1 + path.len() + 1;
+        let mut total = payload_len + 2;
+        total = payload_len + 1 + total.to_string().len();
+        let mut pax = format!("{} path={}\n", total, path).into_bytes();
+        let mut out = build_header("meta", b'x', &octal_size(pax.len() as u64)).to_vec();
+        pax.resize(pax.len().div_ceil(512) * 512, 0);
+        out.extend_from_slice(&pax);
+        out
+    }
+
+    #[test]
+    fn test_extended_header_after_single_zero_block() {
+        // A lone zero block is not the end of the archive; the header after
+        // it gets the same treatment as any other, PAX included.
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&build_header("first.txt", b'0', &octal_size(0)));
+        archive.extend_from_slice(&[0u8; 512]);
+        archive.extend_from_slice(&pax_path_block("from/pax.txt"));
+        archive.extend_from_slice(&build_header("short.txt", b'0', &octal_size(3)));
+        archive.extend_from_slice(b"abc");
+        archive.extend_from_slice(&[0u8; 509]);
+        archive.extend_from_slice(&[0u8; 1024]);
+
+        let entries = parse_all(&archive).unwrap();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["first.txt", "from/pax.txt"]);
+        assert_eq!(entries[1].entry_type, TarEntryType::Regular);
+        assert_eq!(entries[1].size, 3);
+    }
+
+    #[test]
+    fn test_huge_metadata_after_single_zero_block_rejected() {
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&[0u8; 512]);
+        archive.extend_from_slice(&build_header("meta", b'x', &octal_size(1 << 32)));
+        assert!(parse_all(&archive).is_err());
+    }
+
+    #[test]
+    fn test_old_gnu_header_has_no_prefix() {
+        // Old GNU headers ("ustar  \0") keep atime/ctime where POSIX ustar
+        // has `prefix`; they must not be read as part of the path.
+        let mut header = build_header("file.txt", b'0', &octal_size(0));
+        header[257..265].copy_from_slice(b"ustar  \0");
+        header[345..357].copy_from_slice(b"14267657570\0"); // atime
+        header[357..369].copy_from_slice(b"14267657571\0"); // ctime
+        header[148..156].copy_from_slice(b"        ");
+        let checksum: u32 = header.iter().map(|&b| b as u32).sum();
+        header[148..156].copy_from_slice(format!("{:06o}\0 ", checksum).as_bytes());
+
+        let mut archive = header.to_vec();
+        archive.extend_from_slice(&[0u8; 1024]);
+        let entries = parse_all(&archive).unwrap();
+        assert_eq!(entries[0].path, "file.txt");
+    }
+
+    #[test]
+    fn test_ustar_prefix_joins_path() {
+        let mut header = build_header("file.txt", b'0', &octal_size(0));
+        header[345..348].copy_from_slice(b"dir");
+        header[148..156].copy_from_slice(b"        ");
+        let checksum: u32 = header.iter().map(|&b| b as u32).sum();
+        header[148..156].copy_from_slice(format!("{:06o}\0 ", checksum).as_bytes());
+
+        let mut archive = header.to_vec();
+        archive.extend_from_slice(&[0u8; 1024]);
+        assert_eq!(parse_all(&archive).unwrap()[0].path, "dir/file.txt");
+    }
+
+    #[test]
+    fn test_mode_keeps_permission_bits_only() {
+        // Some writers store the whole st_mode, file-type bits included.
+        let mut header = build_header("file.txt", b'0', &octal_size(0));
+        header[100..108].copy_from_slice(b"0100755\0");
+        header[148..156].copy_from_slice(b"        ");
+        let checksum: u32 = header.iter().map(|&b| b as u32).sum();
+        header[148..156].copy_from_slice(format!("{:06o}\0 ", checksum).as_bytes());
+
+        let mut archive = header.to_vec();
+        archive.extend_from_slice(&[0u8; 1024]);
+        let entry = parse_all(&archive).unwrap().remove(0);
+        assert_eq!(crate::archive::ArchiveEntry::from(entry).mode, 0o755);
     }
 }

@@ -116,7 +116,7 @@ impl From<TarEntry> for crate::archive::ArchiveEntry {
             path: e.path,
             size: e.size,
             entry_type: e.entry_type.into(),
-            mode: e.mode,
+            mode: e.mode & 0o7777, // some writers store the file-type bits too
             uid: e.uid,
             gid: e.gid,
             mtime: e.mtime,
