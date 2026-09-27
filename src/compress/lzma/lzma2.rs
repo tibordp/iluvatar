@@ -438,9 +438,7 @@ impl Lzma2Decoder {
                                     self.state = Lzma2State::Error;
                                 }
                             } else if result.bytes_consumed == 0 {
-                                // LZMA decoder needs more data than currently
-                                // available (e.g. range coder init needs 5 bytes
-                                // but only 1 is buffered). Return to caller so
+                                // Out of input mid-chunk. Return to caller so
                                 // more input can be provided.
                                 return Lzma2DecodeResult {
                                     bytes_consumed: in_pos,

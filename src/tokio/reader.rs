@@ -48,7 +48,8 @@ impl<R> Archive<R> {
         &self.index
     }
 
-    /// List all entries in the archive.
+    /// List all entries in archive order, including every member of a
+    /// duplicated path.
     pub fn list(&self) -> Vec<&IndexEntry> {
         self.index.list(None)
     }
@@ -58,7 +59,8 @@ impl<R> Archive<R> {
         self.index.list(Some(prefix))
     }
 
-    /// Get metadata for a specific file without reading its contents.
+    /// Get metadata for a specific file without reading its contents. If
+    /// several members share the path, this is the last one.
     pub fn entry(&self, path: &str) -> Option<&IndexEntry> {
         self.index.get(path)
     }
@@ -80,7 +82,9 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     /// Index a compressed archive from a forward-only async reader with a
     /// custom checkpoint strategy.
     ///
-    /// `file_size` is used for progress reporting; pass 0 if unknown.
+    /// `file_size` feeds progress reporting and size-based strategies
+    /// ([`Budget`](crate::Budget), [`BudgetRatio`](crate::BudgetRatio));
+    /// pass 0 if unknown.
     pub async fn from_reader_with_strategy<S: CheckpointStrategy>(
         reader: R,
         file_size: u64,
@@ -123,7 +127,9 @@ impl<R: AsyncRead + Unpin> Archive<R> {
 
     /// Build an index with a custom checkpoint strategy and progress reporting.
     ///
-    /// `file_size` is used for progress reporting; pass 0 if unknown.
+    /// `file_size` feeds progress reporting and size-based strategies
+    /// ([`Budget`](crate::Budget), [`BudgetRatio`](crate::BudgetRatio));
+    /// pass 0 if unknown.
     ///
     /// The callback receives an `IndexProgress` after each engine step.
     /// Return `false` from the callback to cancel indexing early and
@@ -416,9 +422,10 @@ enum PollState {
     Done,
 }
 
-/// Streaming async reader for a single file within an archive.
+/// Streaming async reader for a single file within an archive, or a range
+/// of a [`Stream`](super::Stream).
 ///
-/// Created by [`Archive::open`]. Implements [`AsyncRead`] so it can be
+/// Created by [`Archive::open`] and [`Stream::open`](super::Stream::open). Implements [`AsyncRead`] so it can be
 /// used with `tokio::io::copy`, `read_to_end`, etc.
 ///
 /// ```no_run

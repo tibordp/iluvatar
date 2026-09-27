@@ -40,13 +40,13 @@ pub struct CheckpointContext {
 /// ```
 /// use iluvatar::{CheckpointStrategy, CheckpointContext};
 ///
-/// /// Checkpoint every N entries instead of every N bytes.
-/// struct EveryNEntries { n: usize, count: usize }
+/// /// Checkpoint every 1 MiB of output, at most `max` times.
+/// struct Capped { max: usize }
 ///
-/// impl CheckpointStrategy for EveryNEntries {
+/// impl CheckpointStrategy for Capped {
 ///     fn should_checkpoint(&mut self, ctx: &CheckpointContext) -> bool {
-///         // Simple example: checkpoint every 1 MiB regardless
-///         ctx.uncompressed_pos - ctx.last_checkpoint_uncompressed_pos >= 1024 * 1024
+///         ctx.checkpoint_count <= self.max
+///             && ctx.uncompressed_pos - ctx.last_checkpoint_uncompressed_pos >= 1024 * 1024
 ///     }
 /// }
 /// ```

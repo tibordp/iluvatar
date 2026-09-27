@@ -28,13 +28,17 @@
 //!   predefined dictionary will fail during decompression (missing context)
 //!   rather than being cleanly rejected upfront.
 //!
-//! - **Window size limits**: Window size from the frame header is used for
-//!   the sliding window, but no upper bound is enforced. A malicious frame
-//!   could declare a very large window size causing high memory usage.
+//! - **Window size limits**: Window sizes above 128 MiB are clamped rather
+//!   than rejected, so a frame that references further back (e.g.
+//!   `--long=31`) fails mid-frame.
 //!
 //! - **Legacy frame formats**: Only the current zstd frame format (magic
 //!   `0xFD2FB528`) and skippable frames are supported. Legacy formats from
 //!   pre-1.0 zstd are not recognized.
+//!
+//! - **Trailing data**: Concatenated frames are decoded in turn, but four or
+//!   more bytes after a frame that start with neither frame magic end the
+//!   stream silently instead of failing.
 
 pub(crate) mod bits;
 pub(crate) mod block;
@@ -283,8 +287,8 @@ impl Decompressor for ZstdDecompressor {
                         self.buffer[pos + 3],
                     ]);
                     if magic != ZSTD_MAGIC {
-                        // Not a zstd frame, check if we got 0x00 bytes (padding)
-                        // or just declare end of stream
+                        // Not a zstd frame: take the rest as trailing data and
+                        // end the stream.
                         self.finished = true;
                         self.phase = DecoderPhase::Done;
                         break;

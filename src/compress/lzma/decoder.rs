@@ -2,7 +2,7 @@
 //!
 //! Implements the LZMA decoding algorithm: probability tables, literal/match/rep
 //! decoding, and the sliding window dictionary. This module handles a single
-//! LZMA stream (as used within an LZMA2 chunk).
+//! LZMA stream (raw LZMA1, or the payload of LZMA2 chunks).
 //!
 //! All state is serializable for checkpointing.
 
@@ -667,9 +667,8 @@ impl LzmaDecoder {
         self.window = SlidingWindow::new(self.dict_size);
     }
 
-    /// Decode from input into the internal window. Returns status.
-    ///
-    /// After calling this, use `drain_output()` to get decompressed bytes.
+    /// Decode from `input` into `output` (through the window). Returns
+    /// status and byte counts.
     pub fn decode(&mut self, input: &[u8], output: &mut [u8]) -> LzmaDecodeResult {
         let mut in_pos = 0;
         let mut out_pos = 0;

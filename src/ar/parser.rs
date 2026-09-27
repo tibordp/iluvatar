@@ -55,11 +55,14 @@ enum Member {
 ///
 /// Supports the common (GNU/SysV) variant with its `//` long-name table,
 /// the BSD variant with `#1/<len>` inline names, and Windows `.lib`
-/// archives, which follow the GNU layout. Symbol tables (`/`, `/SYM64/`,
-/// `__.SYMDEF`) are skipped. Every member is reported as a regular file.
+/// archives, which follow the GNU layout. Symbol tables and other special
+/// members (`/`, `/SYM64/`, `/<ECSYMBOLS>/`, `__.SYMDEF*`) are skipped.
+/// Every member is reported as a regular file. GNU thin archives
+/// (`!<thin>\n`) are rejected.
 ///
-/// ar has no end-of-archive marker; the archive simply ends with the
-/// stream.
+/// ar has no end-of-archive marker, so the parser never emits
+/// `EndOfArchive`: the archive ends with the stream, at a member boundary
+/// or just before the final pad byte.
 pub struct ArParser {
     state: ArState,
     /// Buffer for accumulating the global header or a member header.

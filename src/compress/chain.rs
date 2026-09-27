@@ -148,7 +148,7 @@ impl Decompressor for ChainDecompressor {
         _compressed_offset: u64,
         uncompressed_offset: u64,
     ) -> Result<Option<Checkpoint>> {
-        // A block format (deflate, bzip2) may resume a few bytes behind
+        // A block format (bzip2) may resume a few bytes behind
         // the count it was given. Stage 0 is fed from the seekable stream,
         // so the chain simply resumes there too; an inner stage is fed
         // from `pending`, which starts at the count, so it must be exact.

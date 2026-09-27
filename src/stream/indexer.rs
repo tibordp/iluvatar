@@ -300,7 +300,10 @@ impl<S: CheckpointStrategy> StreamIndexer<S> {
         self.state = State::Processing;
     }
 
-    /// The compressed stream has no more bytes.
+    /// The compressed stream has no more bytes. If it stopped short of its
+    /// end marker, stepping on fails with
+    /// [`Error::TruncatedInput`]; no bytes at
+    /// all is an empty stream.
     pub fn signal_eof(&mut self) {
         self.eof = true;
         self.state = State::Processing;
@@ -323,6 +326,7 @@ impl<S: CheckpointStrategy> StreamIndexer<S> {
         n
     }
 
+    /// A snapshot of progress so far.
     pub fn progress(&self) -> StreamProgress {
         StreamProgress {
             compressed_pos: self.compressed_pos,

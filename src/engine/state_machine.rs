@@ -93,9 +93,10 @@ impl IndexingEngine<FixedInterval> {
     /// Uses [`FixedInterval`] with a format-aware interval:
     /// 1 MiB for bzip2, 16 MiB for gzip, 64 MiB for zstd/xz.
     ///
-    /// `compression` - compression format of the archive
-    /// `archive_format` - archive container format, or `None` to auto-detect
-    /// `archive_size` - total size of the compressed archive (for index metadata)
+    /// - `compression`: compression format of the archive
+    /// - `archive_format`: archive container format, or `None` to auto-detect
+    /// - `archive_size`: size of the compressed archive, or 0 if unknown
+    ///   (for progress, size-based strategies and index metadata)
     pub fn new(
         compression: CompressionFormat,
         archive_format: Option<ArchiveFormat>,
@@ -113,10 +114,11 @@ impl IndexingEngine<FixedInterval> {
 impl<S: CheckpointStrategy> IndexingEngine<S> {
     /// Create a new indexing engine with a custom checkpoint strategy.
     ///
-    /// `compression` - compression format of the archive
-    /// `archive_format` - archive container format, or `None` to auto-detect
-    /// `strategy` - controls when decompressor checkpoints are created
-    /// `archive_size` - total size of the compressed archive (for index metadata)
+    /// - `compression`: compression format of the archive
+    /// - `archive_format`: archive container format, or `None` to auto-detect
+    /// - `strategy`: controls when decompressor checkpoints are created
+    /// - `archive_size`: size of the compressed archive, or 0 if unknown
+    ///   (for progress, size-based strategies and index metadata)
     pub fn with_strategy(
         compression: CompressionFormat,
         archive_format: Option<ArchiveFormat>,
@@ -149,6 +151,9 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
     }
 
     /// Drive the state machine forward. Returns what the engine needs next.
+    ///
+    /// An archive that ends early, or whose compressed stream does, fails
+    /// with [`Error::TruncatedArchive`](crate::Error::TruncatedArchive).
     pub fn step(&mut self) -> EngineRequest {
         loop {
             if self.done {
@@ -323,6 +328,11 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
     ///
     /// Like `finish()`, this consumes the engine. Unlike `finish()`,
     /// the returned index has `metadata.complete = false`.
+    ///
+    /// Also works after [`step()`](Self::step) returns an error, recovering
+    /// the index built up to the failure (an entry whose data was cut off
+    /// then fails to read with
+    /// [`Error::TruncatedInput`](crate::Error::TruncatedInput)).
     pub fn cancel(self) -> ArchiveIndex {
         self.index_builder.finish(self.indexer.finish(), false)
     }
@@ -420,7 +430,9 @@ impl ReadEngine {
     }
 
     /// Create a read engine for a byte range within one entry of `index`.
-    /// Clamped like [`new_range`](Self::new_range).
+    /// Clamped like [`new_range`](Self::new_range). Fails with
+    /// [`Error::TruncatedInput`](crate::Error::TruncatedInput) if the entry
+    /// reaches past the end of the indexed stream.
     pub fn for_entry_range(
         index: &ArchiveIndex,
         entry: &IndexEntry,

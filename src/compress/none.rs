@@ -2,7 +2,7 @@ use crate::compress::checkpoint::{Checkpoint, CheckpointState};
 use crate::compress::decompressor::{DecompressResult, DecompressStatus, Decompressor};
 use crate::error::Result;
 
-/// Passthrough "decompressor" for uncompressed tar archives.
+/// Passthrough "decompressor" for uncompressed data (`Codec::Copy`).
 pub struct NoneDecompressor {
     total_in: u64,
     total_out: u64,
@@ -26,6 +26,7 @@ impl Default for NoneDecompressor {
 impl Decompressor for NoneDecompressor {
     fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
         if input.is_empty() {
+            // Uncompressed data may end anywhere.
             return Ok(DecompressResult {
                 bytes_consumed: 0,
                 bytes_produced: 0,

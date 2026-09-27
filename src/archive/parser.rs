@@ -8,7 +8,8 @@ pub enum ArchiveEvent {
     Entry(ArchiveEntry),
     /// The parser needs more data to make progress.
     NeedData,
-    /// End of archive reached.
+    /// End-of-archive marker reached (tar zero blocks, cpio trailer). ar
+    /// has no marker and never emits this; see `ArchiveParser::end_of_stream`.
     EndOfArchive,
 }
 
@@ -16,9 +17,9 @@ pub enum ArchiveEvent {
 ///
 /// Implementations parse decompressed bytes and emit entries.
 /// The caller feeds decompressed data, the parser returns
-/// `(bytes_consumed, event)`. Metadata-only entries (PAX headers,
-/// GNU long names, cpio trailers) are consumed internally and
-/// never emitted as `ArchiveEvent::Entry`.
+/// `(bytes_consumed, event)`. Metadata-only members (PAX headers,
+/// GNU long names, cpio trailers, ar symbol and long-name tables) are
+/// consumed internally and never emitted as `ArchiveEvent::Entry`.
 #[allow(dead_code)]
 pub trait ArchiveParser: Send {
     /// Feed decompressed data to the parser.

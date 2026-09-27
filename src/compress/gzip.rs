@@ -22,6 +22,11 @@ const FCOMMENT: u8 = 16;
 /// At each deflate block boundary, the decompressor state is captured
 /// for checkpointing, enabling mid-stream resume without re-decompressing
 /// from the beginning.
+///
+/// Decodes only the first gzip member; later members (bgzip, `cat a.gz
+/// b.gz`) are ignored. The header CRC and the trailer's CRC32 and ISIZE are
+/// skipped, not verified. Input without the gzip magic is decoded as raw
+/// deflate.
 pub struct GzipDecompressor {
     inner: DecompressorOxide,
     /// 32 KiB wrapping dictionary/output buffer.
@@ -29,7 +34,7 @@ pub struct GzipDecompressor {
     /// Logical output position (keeps growing; wraps via % WINDOW_SIZE
     /// when passed to miniz_oxide).
     dict_pos: usize,
-    /// Whether the deflate stream has finished.
+    /// Whether the stream has finished (with gzip framing, its trailer too).
     finished: bool,
 
     // Staged output: decompressed bytes extracted from dict_buf but not
@@ -106,7 +111,8 @@ impl GzipDecompressor {
     }
 
     /// Try to parse the gzip header from header_buf.
-    /// Returns Ok(header_size) if complete, Err if need more data.
+    /// Returns Ok(header_size) if complete, Ok(0) if there is no gzip magic
+    /// (raw deflate), Err if need more data.
     fn try_parse_header(&self) -> std::result::Result<usize, ()> {
         let buf = &self.header_buf;
         if buf.len() < 10 {

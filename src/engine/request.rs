@@ -31,8 +31,9 @@ pub enum EngineRequest {
     /// The engine needs compressed data at a specific position.
     ///
     /// The caller should seek to `offset` in the compressed stream,
-    /// read up to `len` bytes, and call `provide_data()`. Only emitted
-    /// by [`ReadEngine`](crate::ReadEngine), never by
+    /// read up to `len` bytes, and call `provide_data()`. Emitted by
+    /// [`ReadEngine`](crate::ReadEngine), [`StreamReader`](crate::StreamReader)
+    /// and a resumed [`StreamIndexer`](crate::StreamIndexer), never by
     /// [`IndexingEngine`](crate::IndexingEngine).
     SeekAndRead {
         /// Byte offset to seek to in the compressed stream.
@@ -43,8 +44,9 @@ pub enum EngineRequest {
 
     /// The engine has decompressed output data ready.
     ///
-    /// The caller should call `read_output()` to consume it. Only emitted
-    /// by [`ReadEngine`](crate::ReadEngine).
+    /// The caller should call `read_output()` to consume it. Emitted by
+    /// [`ReadEngine`](crate::ReadEngine), [`StreamReader`](crate::StreamReader)
+    /// and a [`StreamIndexer`](crate::StreamIndexer) with `emit_output` on.
     OutputReady,
 
     /// The engine has completed the current operation.

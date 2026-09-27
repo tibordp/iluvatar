@@ -8,9 +8,10 @@ pub const DETECT_MIN_BYTES: usize = 6;
 
 /// Detect the compression format from the first few bytes of a stream.
 ///
-/// Returns `None` if the bytes don't match any known format and aren't
-/// long enough to be a tar header. Returns `Some(CompressionFormat::None)`
-/// if the data looks like it could be an uncompressed tar.
+/// Returns `None` if no magic matches and fewer than [`DETECT_MIN_BYTES`]
+/// bytes were given. Anything else unrecognized is assumed uncompressed
+/// (`Some(CompressionFormat::None)`); the archive format (tar, cpio or ar)
+/// is detected separately, after decompression.
 pub fn detect_format(header: &[u8]) -> Option<CompressionFormat> {
     if header.len() < 2 {
         return None;

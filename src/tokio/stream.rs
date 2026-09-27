@@ -20,14 +20,17 @@ pub struct Stream<R> {
 }
 
 impl<R> Stream<R> {
+    /// Wrap a reader with an index built earlier.
     pub fn from_parts(reader: R, index: StreamIndex) -> Self {
         Self { reader, index }
     }
 
+    /// Consume the stream, returning the reader and index.
     pub fn into_parts(self) -> (R, StreamIndex) {
         (self.reader, self.index)
     }
 
+    /// The checkpoint table.
     pub fn index(&self) -> &StreamIndex {
         &self.index
     }
@@ -64,7 +67,8 @@ impl<R: AsyncRead + AsyncSeek + Unpin> Stream<R> {
         Self::with_codec_and_strategy(reader, format.into(), strategy).await
     }
 
-    /// Index a stream whose codec the caller knows.
+    /// Index a stream whose codec the caller knows (raw LZMA, a filter
+    /// chain, an encrypted stream).
     pub async fn with_codec_and_strategy<S: CheckpointStrategy>(
         reader: R,
         codec: CodecSpec,

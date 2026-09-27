@@ -14,9 +14,11 @@
 //!   or minor corruption in otherwise structurally valid data will not be
 //!   detected.
 //!
-//! - **Index / stream footer validation**: The index and stream footer are
-//!   consumed but not parsed or verified. Backward Size mismatches,
-//!   incorrect record counts, and corrupted index data are not caught.
+//! - **Index / stream footer validation**: The index is walked only to find
+//!   its end, and only the footer's `YZ` magic is checked. Backward Size
+//!   mismatches, incorrect record counts, and corrupted index data are not
+//!   caught. Anything after the first stream's footer (stream padding,
+//!   concatenated streams) is ignored.
 //!
 //! - **Block header size fields**: Compressed Size and Uncompressed Size in
 //!   block headers are parsed but not enforced. A block that decompresses
@@ -39,9 +41,6 @@
 //! - **Stream concatenation / padding**: Only a single XZ stream is decoded.
 //!   Concatenated streams and stream padding (trailing null bytes) after
 //!   the first stream footer are ignored, not processed.
-//!
-//! - **Truncation detection**: EOF mid-stream is handled gracefully (the
-//!   engine sees no more input) but is not reported as a distinct error.
 //!
 //! See `tests/vectors/xz/` for the tukaani-project/xz test vectors and
 //! per-file notes on which are tested and which exercise these gaps.
@@ -140,7 +139,7 @@ enum XzPhase {
     Check { remaining: usize },
     /// Skipping block padding (0-3 bytes to 4-byte alignment).
     Padding { remaining: usize },
-    /// Skipping the XZ index (we don't verify it).
+    /// Skipping the index and stream footer (layout checked, contents not).
     Index,
     /// Stream complete.
     Done,
@@ -157,7 +156,7 @@ pub struct XzDecompressor {
     check_size: usize,
     /// Saved stream header (12 bytes).
     stream_header: [u8; 12],
-    /// Bytes consumed in the current block's LZMA2+check+padding region.
+    /// Bytes consumed in the current block's LZMA2 data and check.
     /// Used to compute padding alignment.
     block_data_bytes: u64,
     /// Block header size for the current block.
@@ -343,7 +342,7 @@ impl Decompressor for XzDecompressor {
                     }
                     let byte = self.buffer[pos];
                     if byte == 0x00 {
-                        // Index marker — stream is done
+                        // Index indicator: no more blocks
                         self.phase = XzPhase::Index;
                         pos += 1;
                         continue;
@@ -1177,6 +1176,10 @@ mod tests {
     //
     // DETECTED (tested below):
     //   bad-0-header_magic.xz    — wrong magic bytes → caught at StreamHeader
+    //   bad-0-empty-truncated.xz — last byte removed → TruncatedInput at EOF
+    //   bad-1-lzma2-9.xz        — LZMA2 data ends early → TruncatedInput
+    //   bad-1-lzma2-10.xz       — LZMA2 data runs past the block → TruncatedInput
+    //   bad-1-lzma2-11.xz       — 0x00 end marker missing → TruncatedInput
     //   bad-1-block_header-2.xz  — zero filter flags → caught in parse_block_header
     //   bad-1-lzma2-1.xz        — first chunk doesn't reset dict → caught by LZMA2 framing
     //   bad-1-lzma2-3.xz        — invalid LZMA props (lc=8) → caught by LZMA2 framing
@@ -1187,8 +1190,6 @@ mod tests {
     // NOT DETECTED (known limitations, not tested):
     //   bad-0-backward_size.xz   — wrong Backward Size in stream footer
     //                              [needs stream footer validation]
-    //   bad-0-empty-truncated.xz — truncated stream (last byte removed)
-    //                              [needs EOF-before-stream-end detection]
     //   bad-0-nonempty_index.xz  — index claims blocks exist but none were decoded
     //                              [needs index record count validation]
     //   bad-1-block_header-1.xz  — block header truncated mid-field
@@ -1205,12 +1206,6 @@ mod tests {
     //                              [needs EOPM rejection in LZMA2 context]
     //   bad-1-lzma2-8.xz        — LZMA chunk lacks required new properties
     //                              [needs stricter props requirement tracking]
-    //   bad-1-lzma2-9.xz        — LZMA2 truncated, output exceeds declared size
-    //                              [needs Uncompressed Size enforcement]
-    //   bad-1-lzma2-10.xz       — LZMA2 data extends past block boundary
-    //                              [needs Compressed Size enforcement]
-    //   bad-1-lzma2-11.xz       — sizes match but 0x00 end marker missing
-    //                              [needs explicit end-marker requirement]
 
     #[test]
     fn test_xzvec_bad_header_magic() {

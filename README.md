@@ -45,7 +45,7 @@ use iluvatar::{IndexingEngine, EngineRequest, CompressionFormat};
 let mut engine = IndexingEngine::new(
     CompressionFormat::Gzip,
     None,      // auto-detect archive format (tar, cpio or ar)
-    file_size, // used for progress reporting
+    file_size, // compressed size, for progress and metadata (0 = unknown)
 )?;
 
 loop {
@@ -59,6 +59,7 @@ loop {
             }
         }
         EngineRequest::Done => break,
+        // `engine.cancel()` still returns what was indexed before the error.
         EngineRequest::Error(e) => return Err(e),
         _ => {}
     }
@@ -126,7 +127,7 @@ and N partial decodes, even when the files are next to each other.
   pick the checkpoint interval (below) for how much decoding one read may
   cost.
 - **The whole archive, or many files:** visit them in archive order
-  (`IndexEntry::uncompressed_offset`; tar members sit back to back) with one
+  (the order of `ArchiveIndex::entries()`) with one
   `StreamReader` kept alive and moved along with `seek_forward`. That is
   one decoding pass. The [`StreamReader` docs](https://docs.rs/iluvatar/latest/iluvatar/struct.StreamReader.html#reading-many-files)
   have a complete extraction loop.
@@ -257,11 +258,15 @@ checkpoint between them rather than pointing at an earlier boundary.
   this — you have to decompress everything once to find out what's in the
   archive. Subsequent reads are fast.
 - **Index files can be large.** Gzip checkpoints store a 32 KiB window per
-  checkpoint; zstd and xz store the full decompressor state including
-  dictionary buffers, which can be several hundred KiB per checkpoint. The
+  checkpoint; zstd and xz store the decoder's window, up to the dictionary
+  or window size (8 MiB at xz -6, 64 MiB at xz -9) per checkpoint. The
   format-aware defaults (16–64 MiB intervals) keep this reasonable, but very
   large archives will still produce sizable indices. Use `Budget` or
   `BudgetRatio` strategies to cap index size.
+- **Only the first gzip member, bzip2 stream or xz stream is decoded.**
+  Concatenated ones (`bgzip`, pbzip2, `cat a.gz b.gz`) end at the first: a
+  bare stream stops there, and an archive split across them fails with
+  `Error::TruncatedArchive`. zstd decodes all its frames.
 - **Read-only.** This library cannot create or modify archives.
 - **Index format is not stable.** Stored indices include a version number and
   will be rejected if built by an incompatible version. Regenerate them when
@@ -275,14 +280,14 @@ All compression formats are enabled by default. Disable what you don't need:
 
 ```toml
 [dependencies]
-iluvatar = { version = "0.1", default-features = false, features = ["gzip"] }
+iluvatar = { version = "0.4", default-features = false, features = ["gzip"] }
 ```
 
 | Feature | Description |
 |---------|-------------|
 | `gzip` | gzip/DEFLATE support (requires `miniz_oxide`) |
 | `bz2` | bzip2 support (requires `bzip2` crate, C binding) |
-| `xz` | xz/LZMA2 support |
+| `xz` | xz, raw LZMA2 and raw LZMA1 support |
 | `zstandard` | zstd support |
 | `aes` | AES-256-CBC stage (requires `aes` crate) |
 | `tokio` | Async API via tokio |

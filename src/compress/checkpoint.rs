@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct Checkpoint {
     /// Byte offset in the compressed stream.
     pub compressed_offset: u64,
-    /// Bit offset within that byte (relevant for deflate/bzip2).
+    /// Bit offset within that byte (nonzero only for bzip2).
     pub bit_offset: u8,
     /// Byte offset in the uncompressed stream.
     pub uncompressed_offset: u64,
@@ -153,11 +153,7 @@ pub struct Bzip2CheckpointState {
     pub stream_header: Vec<u8>,
 }
 
-/// XZ checkpoint: blocks are independently decompressible.
-///
-/// Stores the XZ stream header so that on restore we can prepend it
-/// before the block data, allowing a fresh liblzma decoder to start
-/// at any block boundary.
+/// Unused; xz checkpoints use [`XzFullCheckpointState`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XzCheckpointState {
     /// Block index in the XZ stream.
@@ -167,7 +163,7 @@ pub struct XzCheckpointState {
     pub stream_header: Vec<u8>,
 }
 
-/// Zstd checkpoint: frames are independently decompressible.
+/// Unused; zstd checkpoints use [`ZstdFullCheckpointState`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZstdCheckpointState {
     /// Frame index in the zstd stream.
@@ -207,8 +203,7 @@ pub struct XzFullCheckpointState {
 
 /// Zstd checkpoint: full decompressor state for mid-stream resume.
 ///
-/// Unlike the frame-boundary-only `ZstdCheckpointState`, this captures the
-/// complete decoder state (FSE/Huffman tables, repeat offsets, window buffer,
+/// Captures the complete decoder state (FSE/Huffman tables, repeat offsets, window buffer,
 /// processing phase) so decompression can resume from any byte offset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZstdFullCheckpointState {

@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 
 /// An entry in the archive index, recording a file's metadata and position.
 ///
-/// Obtained from [`ArchiveIndex::get()`](crate::ArchiveIndex::get) or
-/// [`ArchiveIndex::list()`](crate::ArchiveIndex::list).
+/// Obtained from [`ArchiveIndex::get()`](crate::ArchiveIndex::get),
+/// [`get_all()`](crate::ArchiveIndex::get_all),
+/// [`entries()`](crate::ArchiveIndex::entries) or
+/// [`list()`](crate::ArchiveIndex::list).
 ///
 /// # Example
 ///

@@ -53,6 +53,13 @@ enum ParserState {
 ///
 /// Feed decompressed bytes in chunks. The parser processes them and
 /// emits events (entries found, need more data, end of archive).
+///
+/// Reads V7, ustar, GNU and PAX archives. GNU long names/links (`L`/`K`)
+/// and the PAX `path`, `linkpath` and `size` records override the next
+/// header; other PAX records and global (`g`) headers are ignored. GNU
+/// base-256 numeric fields are supported; GNU sparse (`S`) entries are
+/// rejected, and other typeflags surface as `EntryType::Other`. The two
+/// end-of-archive zero blocks may be missing.
 pub struct TarParser {
     state: ParserState,
     /// Buffer for accumulating a complete 512-byte header block.
@@ -180,7 +187,8 @@ impl TarParser {
             _ => {}
         }
 
-        // Apply pending PAX/GNU attributes
+        // Apply pending PAX/GNU attributes. GNU long names/links go last,
+        // so they win if an archive carries both.
         if let Some(path) = self.pax_path.take() {
             entry.path = path;
         }

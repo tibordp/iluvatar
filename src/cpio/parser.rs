@@ -47,8 +47,12 @@ enum CpioState {
 
 /// Incremental, sans-I/O cpio parser.
 ///
-/// Supports newc, newc-CRC, and odc sub-formats. The sub-format is
-/// auto-detected from the first header's magic bytes.
+/// Supports newc, newc-CRC (the CRC is not verified), and odc sub-formats,
+/// auto-detected from the first header's magic bytes; old binary cpio is
+/// rejected. Symlink targets are read from the member data and the entry is
+/// reported with size 0. A hard-link set is reported as one regular entry
+/// (the member carrying the data) plus `HardLink` entries pointing at it;
+/// see `deferred_links`. The archive must end with a `TRAILER!!!` member.
 pub struct CpioParser {
     state: CpioState,
     /// Buffer for accumulating a header.
@@ -60,9 +64,11 @@ pub struct CpioParser {
     /// Inode -> path of the data-bearing member, for hardlink resolution.
     resolved_inodes: HashMap<u64, String>,
     /// Zero-size hardlink members seen before their inode's data-bearing
-    /// member; emitted (as HardLink) once it arrives. In newc archives the
+    /// member; emitted (as HardLink) right after it. In newc archives the
     /// file data is stored with the LAST member of a hardlink set, so the
-    /// earlier members must be deferred. BTreeMap for deterministic order.
+    /// earlier members must be deferred, and they come out after the data
+    /// member rather than in archive order. BTreeMap so the flush at the
+    /// trailer is deterministic (by inode).
     deferred_links: BTreeMap<u64, Vec<ArchiveEntry>>,
     /// Entries ready to be emitted on subsequent feed() calls.
     pending: VecDeque<ArchiveEntry>,
@@ -238,9 +244,10 @@ impl CpioParser {
 
         // Check for end-of-archive trailer
         if filename == TRAILER_NAME {
-            // Flush hardlink members whose data-bearing member never arrived
-            // (nonstandard/malformed archives) so they are not lost; they
-            // stay as the zero-size regular entries the archive declared.
+            // Flush hardlink members whose inode never got a data-bearing
+            // member (a hard-linked empty file, or a malformed archive) so
+            // they are not lost; they stay as the zero-size regular entries
+            // the archive declared.
             let deferred = std::mem::take(&mut self.deferred_links);
             self.pending.extend(deferred.into_values().flatten());
             self.state = CpioState::End;
@@ -523,7 +530,7 @@ impl ArchiveParser for CpioParser {
         let problem = match &self.state {
             CpioState::End => return Ok(()),
             CpioState::ReadingHeader if self.header_buf.is_empty() => {
-                format!("stream ended before the {} entry", TRAILER_NAME)
+                format!("stream ended before the {} member", TRAILER_NAME)
             }
             CpioState::ReadingHeader | CpioState::ReadingFilename { .. } => {
                 "stream ended inside a header".to_string()
@@ -536,7 +543,7 @@ impl ArchiveParser for CpioParser {
             }
             CpioState::SkippingNamePad { .. }
             | CpioState::ReadingLinkTarget { .. }
-            | CpioState::SkippingDataPad { .. } => "stream ended inside an entry".to_string(),
+            | CpioState::SkippingDataPad { .. } => "stream ended inside a member".to_string(),
         };
         Err(Error::TruncatedArchive(problem))
     }

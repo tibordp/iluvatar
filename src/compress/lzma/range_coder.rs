@@ -50,9 +50,9 @@ impl RangeDecoder {
         }
     }
 
-    /// Initialize the range decoder from the first 5 bytes of LZMA data.
-    /// Returns how many bytes were consumed (up to 5), or NeedInput if
-    /// not enough bytes are available.
+    /// Initialize the range decoder from the first 5 bytes of LZMA data,
+    /// which may arrive split across calls. Returns how many bytes were
+    /// consumed, with `NeedInput` until all 5 have arrived.
     pub fn init(&mut self, input: &[u8]) -> (RangeCoderStatus, usize) {
         let have = self.init_len as usize;
         let take = (5 - have).min(input.len());

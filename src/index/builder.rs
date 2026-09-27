@@ -65,7 +65,7 @@ impl IndexBuilder {
 
     /// Clone the current state into a usable partial `ArchiveIndex`.
     ///
-    /// The engine continues to be usable for further indexing.
+    /// The builder stays usable.
     pub fn snapshot(&self, stream: StreamIndex) -> ArchiveIndex {
         assemble(
             self.entries.clone(),

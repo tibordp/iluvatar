@@ -93,7 +93,8 @@ impl<R> Archive<R> {
         &self.index
     }
 
-    /// List all entries in the archive.
+    /// List all entries in archive order, including every member of a
+    /// duplicated path.
     pub fn list(&self) -> Vec<&IndexEntry> {
         self.index.list(None)
     }
@@ -111,7 +112,8 @@ impl<R> Archive<R> {
         self.index.list(Some(prefix))
     }
 
-    /// Get metadata for a specific file without reading its contents.
+    /// Get metadata for a specific file without reading its contents. If
+    /// several members share the path, this is the last one.
     pub fn entry(&self, path: &str) -> Option<&IndexEntry> {
         self.index.get(path)
     }
@@ -149,7 +151,9 @@ impl<R: Read> Archive<R> {
     /// Index a compressed archive from a forward-only reader with a
     /// custom checkpoint strategy.
     ///
-    /// `file_size` is used for progress reporting; pass 0 if unknown.
+    /// `file_size` feeds progress reporting and size-based strategies
+    /// ([`Budget`](crate::Budget), [`BudgetRatio`](crate::BudgetRatio));
+    /// pass 0 if unknown.
     ///
     /// ```no_run
     /// # fn example() -> iluvatar::Result<()> {
@@ -202,7 +206,9 @@ impl<R: Read> Archive<R> {
 
     /// Build an index with a custom checkpoint strategy and progress reporting.
     ///
-    /// `file_size` is used for progress reporting; pass 0 if unknown.
+    /// `file_size` feeds progress reporting and size-based strategies
+    /// ([`Budget`](crate::Budget), [`BudgetRatio`](crate::BudgetRatio));
+    /// pass 0 if unknown.
     ///
     /// The callback receives an `IndexProgress` after each engine step.
     /// Return `false` from the callback to cancel indexing early and
@@ -513,9 +519,10 @@ fn drive_indexing<R: Read, S: CheckpointStrategy, F: FnMut(&IndexProgress) -> bo
 
 // ─── EntryReader ───
 
-/// Streaming reader for a single file within an archive.
+/// Streaming reader for a single file within an archive, or a range of a
+/// [`Stream`](super::Stream).
 ///
-/// Created by [`Archive::open`]. Implements [`Read`] so it can be
+/// Created by [`Archive::open`] and [`Stream::open`](super::Stream::open). Implements [`Read`] so it can be
 /// used with `read_to_end`, `BufReader`, `io::copy`, etc.
 ///
 /// ```no_run

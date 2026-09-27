@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 
 /// Format-agnostic entry type for any archive format (tar, cpio, ar).
 ///
-/// Format-specific metadata entries (PAX headers, GNU long names, cpio trailers)
-/// are handled internally by each parser and never surface here.
+/// Format-specific metadata members (PAX headers, GNU long names, cpio
+/// trailers, ar symbol and long-name tables) are handled internally by each
+/// parser and never surface here.
 ///
 /// # Example
 ///
@@ -32,7 +33,8 @@ pub enum EntryType {
     Fifo,
     /// A Unix domain socket (cpio supports this; tar typically does not).
     Socket,
-    /// Unknown or unrecognized type with the raw type byte.
+    /// Unknown or unrecognized type: the tar typeflag byte, or the cpio
+    /// file-type bits (`mode >> 12`).
     Other(u8),
 }
 
@@ -60,7 +62,8 @@ pub(crate) struct ArchiveEntry {
     pub size: u64,
     /// Type of entry.
     pub entry_type: EntryType,
-    /// Unix permissions (lower 12 bits).
+    /// Unix permissions. cpio and ar keep the lower 12 bits; tar passes its
+    /// mode field through as stored (usually, but not always, just those bits).
     pub mode: u32,
     /// Owner user ID.
     pub uid: u64,

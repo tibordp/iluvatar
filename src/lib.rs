@@ -104,7 +104,7 @@
 //!   compressed stream, container-agnostic
 //! - [`engine`] — Sans-I/O [`IndexingEngine`] and [`ReadEngine`] for tar/cpio/ar
 //! - [`compress`] — Codecs, filters, chains and format detection
-//! - [`archive`] — Archive format types and parsers (tar, cpio, ar)
+//! - [`archive`] — Archive format and entry types (tar, cpio, ar)
 //! - [`index`] — Index types and serialization
 
 pub(crate) mod ar;

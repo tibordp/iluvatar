@@ -9,6 +9,7 @@ pub struct StreamProgress {
     pub unpacked_pos: u64,
     /// Unpacked length, if known.
     pub unpacked_len: Option<u64>,
+    /// Checkpoints in the index so far.
     pub checkpoints: usize,
     /// Estimated bytes of checkpoint state so far.
     pub checkpoint_data_bytes: u64,

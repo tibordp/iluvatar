@@ -182,6 +182,11 @@ impl BitShifter {
 /// (`0x314159265359`) to detect block boundaries. On restore, reconstructs
 /// a valid bzip2 stream by prepending the stream header and bit-shifting
 /// the data to align the block at a byte boundary.
+///
+/// Decodes only the first bzip2 stream; later streams (e.g. pbzip2 output)
+/// are ignored. After a restore the combined stream CRC cannot match, so a
+/// libbzip2 error once output has been produced is taken as the end of the
+/// stream, which also hides corruption in later blocks.
 pub struct Bzip2Decompressor {
     inner: BzDecompress,
     total_in: u64,
@@ -392,8 +397,9 @@ impl Decompressor for Bzip2Decompressor {
     ) -> Result<Option<Checkpoint>> {
         // Blocks resume independently; `decompress` returns at each block
         // magic, so a boundary is "now" when output has not moved past it.
-        // The magic's byte lands inside the consumed input, so the boundary
-        // is at or a byte before the caller's compressed count.
+        // The consumed input ends with the magic's last byte, so the
+        // boundary (its first bit) is 6 or 7 bytes before the caller's
+        // compressed count.
         if let Some(ref boundary) = self.last_block_boundary {
             if boundary.uncompressed_offset != uncompressed_offset
                 || boundary.byte_offset > compressed_offset
@@ -473,7 +479,8 @@ impl Decompressor for Bzip2Decompressor {
 
 impl Bzip2Decompressor {
     /// Decompress in restore mode: prepend stream header, bit-shift input,
-    /// and suppress CRC validation error at end of stream.
+    /// and take any decoder error after output as the end of stream (the
+    /// combined CRC covers skipped blocks, so it never matches).
     fn decompress_restore(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
         // Phase 1: Feed the stream header to the fresh decoder
         if !self.restore_header.is_empty() {

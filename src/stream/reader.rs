@@ -58,7 +58,8 @@ enum State {
 ///         .into_iter()
 ///         .filter(|e| e.entry_type == EntryType::Regular)
 ///         .collect();
-///     // Tar members sit back to back in the unpacked stream.
+///     // `seek_forward` only moves forward. Archive order already is
+///     // offset order, except for cpio hard-link members.
 ///     entries.sort_by_key(|e| e.uncompressed_offset);
 ///
 ///     let mut live: Option<StreamReader> = None;
@@ -160,7 +161,8 @@ impl StreamReader {
     /// is known to exist, and a stream that ends before delivering all of
     /// it (a file truncated since it was indexed) is reported as
     /// [`Error::TruncatedInput`]. Without a known length, the end of the
-    /// stream simply ends the range.
+    /// stream simply ends the range; a compressed stream cut off before its
+    /// end marker is [`Error::TruncatedInput`] either way.
     pub fn new(index: &StreamIndex, offset: u64, len: u64) -> Result<Self> {
         let decompressor = index.codec.create()?;
         let (_, checkpoint) = index.best_checkpoint_for_offset(offset);
@@ -226,6 +228,7 @@ impl StreamReader {
     /// start before [`position`](Self::position). Output already decoded
     /// past the new offset is served from the buffer; the rest is decoded
     /// forward from where the decoder stands, with no checkpoint restore.
+    /// The range is cut to the stream's length as in [`new`](Self::new).
     ///
     /// A reader that hasn't been stepped yet (or was created for an empty
     /// range) is simply retargeted; `offset` must not be before the offset
@@ -374,7 +377,10 @@ impl StreamReader {
         }
     }
 
-    /// The compressed stream has no more bytes.
+    /// The compressed stream has no more bytes. If it stopped short of its
+    /// end marker, stepping on fails with
+    /// [`Error::TruncatedInput`]; no bytes at
+    /// all is an empty stream.
     pub fn signal_eof(&mut self) {
         self.eof = true;
     }

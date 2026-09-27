@@ -23,7 +23,8 @@ pub struct IndexMetadata {
     pub archive_format: ArchiveFormat,
     /// Size of the compressed archive in bytes.
     pub archive_size: u64,
-    /// Total uncompressed size.
+    /// Uncompressed bytes decoded while indexing: the whole stream, or
+    /// less when indexing stopped early or at the archive's end marker.
     pub uncompressed_size: u64,
     /// Whether this index covers the entire archive.
     /// A partial index can still be used to read any file that was

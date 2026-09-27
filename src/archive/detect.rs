@@ -30,7 +30,9 @@ pub fn detect_archive_format(data: &[u8]) -> Option<ArchiveFormat> {
         }
     }
     if data.len() >= 2 {
-        // cpio binary: magic 070707 octal = 0x71C7 little-endian or 0xC771 big-endian
+        // cpio binary: magic 070707 octal (0x71C7), in either byte order.
+        // Unsupported; claimed so the cpio parser rejects it rather than
+        // tar misreading it.
         let le = u16::from_le_bytes([data[0], data[1]]);
         let be = u16::from_be_bytes([data[0], data[1]]);
         if le == 0o070707 || be == 0o070707 {
@@ -42,7 +44,7 @@ pub fn detect_archive_format(data: &[u8]) -> Option<ArchiveFormat> {
         if &data[257..262] == b"ustar" {
             return Some(ArchiveFormat::Tar);
         }
-        // If we have enough data and no cpio or ustar magic,
+        // If we have enough data and no ar, cpio or ustar magic,
         // assume tar (V7 tar has no ustar magic).
         return Some(ArchiveFormat::Tar);
     }

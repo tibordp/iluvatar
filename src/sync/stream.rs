@@ -33,10 +33,12 @@ impl<R> Stream<R> {
         Self { reader, index }
     }
 
+    /// Consume the stream, returning the reader and index.
     pub fn into_parts(self) -> (R, StreamIndex) {
         (self.reader, self.index)
     }
 
+    /// The checkpoint table.
     pub fn index(&self) -> &StreamIndex {
         &self.index
     }
@@ -73,8 +75,7 @@ impl<R: Read + Seek> Stream<R> {
     }
 
     /// Index a stream whose codec the caller knows (raw LZMA, a filter
-    /// chain, an encrypted stream), with progress reporting: return
-    /// `false` from the callback to stop early and keep a partial index.
+    /// chain, an encrypted stream).
     pub fn with_codec_and_strategy<S: CheckpointStrategy>(
         reader: R,
         codec: CodecSpec,

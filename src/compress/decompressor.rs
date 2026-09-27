@@ -43,7 +43,9 @@ pub trait Decompressor: Send {
     ///
     /// `compressed_offset` and `uncompressed_offset` are the caller's counts
     /// of bytes fed in and taken out so far; the returned checkpoint carries
-    /// exactly those offsets. `None` means no checkpoint is possible right
+    /// those offsets, except that bzip2, whose blocks start mid-byte, puts
+    /// its compressed offset a few bytes back with a `bit_offset`. `None`
+    /// means no checkpoint is possible right
     /// now — formats that resume only at block boundaries (deflate, bzip2)
     /// answer `None` between boundaries, and formats that cannot resume at
     /// all always answer `None`. Callers ask again after later steps.

@@ -58,20 +58,24 @@ pub enum Error {
         got: u32,
     },
 
-    /// The archive has been modified since the index was built.
+    /// The archive has been modified since the index was built. Not
+    /// currently returned by iluvatar; reserved for callers' own checks.
     #[error("archive changed since index was built")]
     StaleIndex,
 
-    /// The compressed stream ended before the expected data was read.
+    /// The compressed stream ended early: cut off before its end marker,
+    /// or shorter than the index says. Indexing an archive reports this
+    /// as [`TruncatedArchive`](Self::TruncatedArchive) instead.
     #[error("truncated input")]
     TruncatedInput,
 
     /// The archive ended somewhere a well-formed archive cannot end, such
-    /// as inside a header or a member's data.
+    /// as inside a header or a member's data, or its compressed stream was
+    /// cut off.
     #[error("truncated archive: {0}")]
     TruncatedArchive(String),
 
-    /// An I/O error occurred (wraps [`std::io::Error`]).
+    /// An I/O error occurred (the [`std::io::Error`]'s message).
     #[error("I/O error: {0}")]
     Io(String),
 

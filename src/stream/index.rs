@@ -11,6 +11,7 @@ use crate::compress::codec::CodecSpec;
 /// extended with [`StreamIndexer::resume`](crate::StreamIndexer::resume).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamIndex {
+    /// Codec the stream is decoded with.
     pub codec: CodecSpec,
     /// Packed length, when the caller knows it.
     pub compressed_len: Option<u64>,
@@ -53,6 +54,7 @@ impl StreamIndex {
         (idx, &self.checkpoints[idx])
     }
 
+    /// The checkpoint furthest into the stream.
     pub fn last_checkpoint(&self) -> &Checkpoint {
         self.checkpoints
             .last()

@@ -1,6 +1,6 @@
 //! LZMA and LZMA2 decoder with full-state checkpointing.
 //!
-//! This module provides a sans-I/O LZMA2 decoder that implements the
+//! This module provides sans-I/O LZMA1 and LZMA2 decoders that implement the
 //! `Decompressor` trait. All internal state is serializable, allowing
 //! checkpoints at any byte offset in the decompressed stream.
 
