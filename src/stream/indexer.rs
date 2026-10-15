@@ -30,6 +30,12 @@ enum State {
 /// An indexer can stop early ([`stop_at`](Self::stop_at)) and a partial
 /// index can be extended later ([`resume`](Self::resume)) without
 /// re-decoding what an earlier pass covered.
+///
+/// Checkpoints can disappear as well as appear while indexing: a strategy
+/// may have the indexer thin them
+/// ([`CheckpointStrategy::should_thin`]), so a checkpoint's position in
+/// [`StreamIndex::checkpoints`] is only meaningful within one
+/// [`snapshot`](Self::snapshot).
 pub struct StreamIndexer<S: CheckpointStrategy> {
     decompressor: Box<dyn Decompressor>,
     index: StreamIndex,
@@ -266,8 +272,9 @@ impl<S: CheckpointStrategy> StreamIndexer<S> {
         }
     }
 
-    /// Lay a checkpoint at the current position if the codec can. `notify`
-    /// tells the strategy about it (a stop checkpoint is not its doing).
+    /// Lay a checkpoint at the current position if the codec can, then
+    /// thin while the strategy asks. `notify` tells the strategy about the
+    /// new checkpoint (a stop checkpoint is not its doing).
     fn try_checkpoint(&mut self, notify: bool) -> Result<()> {
         if self.unpacked_pos == self.last_checkpoint_pos
             && self.index.last_checkpoint().uncompressed_offset == self.unpacked_pos
@@ -288,6 +295,10 @@ impl<S: CheckpointStrategy> StreamIndexer<S> {
         if notify {
             let ctx = self.context();
             self.strategy.on_checkpoint_created(&ctx, size);
+        }
+        while self.strategy.should_thin(&self.context()) && self.index.thin() {
+            self.checkpoint_data_bytes = self.index.checkpoint_data_bytes();
+            self.last_checkpoint_pos = self.index.last_checkpoint().uncompressed_offset;
         }
         Ok(())
     }
@@ -348,5 +359,190 @@ impl<S: CheckpointStrategy> StreamIndexer<S> {
     /// reached, partial otherwise.
     pub fn finish(self) -> StreamIndex {
         self.index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compress::checkpoint::{Bzip2CheckpointState, Checkpoint, CheckpointState};
+    use crate::compress::codec::Codec;
+    use crate::compress::decompressor::DecompressResult;
+    use crate::engine::checkpoint_strategy::{Budget, ThinningBudget};
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// A stream of `early` packed bytes that unpack 2:1, then `late` packed
+    /// bytes that unpack 1024:1 (the empty tail of a disk image). Every
+    /// position can be checkpointed, at `CP_STATE` bytes of state.
+    struct RatioJump {
+        early: u64,
+        late: u64,
+        consumed: u64,
+    }
+
+    const CP_STATE: usize = 1000;
+
+    impl Decompressor for RatioJump {
+        fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
+            let (mut used, mut produced) = (0, 0);
+            while used < input.len() && self.consumed < self.early + self.late {
+                let ratio = if self.consumed < self.early { 2 } else { 1024 };
+                if produced + ratio > output.len() {
+                    break;
+                }
+                used += 1;
+                produced += ratio;
+                self.consumed += 1;
+            }
+            let status = if self.consumed == self.early + self.late {
+                DecompressStatus::StreamEnd
+            } else {
+                DecompressStatus::Continue
+            };
+            Ok(DecompressResult {
+                bytes_consumed: used,
+                bytes_produced: produced,
+                status,
+            })
+        }
+
+        fn checkpoint(&self, compressed: u64, uncompressed: u64) -> Result<Option<Checkpoint>> {
+            Ok(Some(Checkpoint {
+                compressed_offset: compressed,
+                bit_offset: 0,
+                uncompressed_offset: uncompressed,
+                state: CheckpointState::Bzip2(Bzip2CheckpointState {
+                    block_number: 0,
+                    stream_header: vec![0; CP_STATE],
+                }),
+            }))
+        }
+
+        fn restore(&mut self, _: &Checkpoint) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    fn index_ratio_jump<S: CheckpointStrategy>(early: u64, late: u64, strategy: S) -> StreamIndex {
+        let decompressor = RatioJump {
+            early,
+            late,
+            consumed: 0,
+        };
+        let index = StreamIndex::new(CodecSpec::single(Codec::Copy), Some(early + late));
+        let mut indexer = StreamIndexer::with_parts(
+            Box::new(decompressor),
+            index,
+            strategy,
+            State::NeedInput,
+            0,
+            0,
+        );
+        let chunk = vec![0u8; BUF_SIZE];
+        let mut fed = 0;
+        loop {
+            match indexer.step() {
+                EngineRequest::NeedInput if fed == early + late => indexer.signal_eof(),
+                EngineRequest::NeedInput => {
+                    let n = (early + late - fed).min(chunk.len() as u64);
+                    indexer.provide_data(&chunk[..n as usize]);
+                    fed += n;
+                }
+                EngineRequest::Done => break,
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(
+                indexer.checkpoint_data_bytes,
+                indexer.index.checkpoint_data_bytes()
+            );
+        }
+        indexer.finish()
+    }
+
+    /// The widest gap between consecutive checkpoints, or from the last
+    /// checkpoint to the end of the stream.
+    fn widest_gap(index: &StreamIndex) -> u64 {
+        let offsets: Vec<u64> = index
+            .checkpoints
+            .iter()
+            .map(|cp| cp.uncompressed_offset)
+            .chain(index.unpacked_len)
+            .collect();
+        offsets.windows(2).map(|w| w[1] - w[0]).max().unwrap()
+    }
+
+    #[test]
+    fn thinning_budget_covers_a_late_ratio_jump() {
+        // 32 MiB unpacked from the first 16 MiB packed, then 1 GiB from 1 MiB.
+        let (early, late) = (16 * MIB, MIB);
+        let budget = 64 * 1024;
+        let cp_size = (17 + CP_STATE + 8) as u64;
+
+        let index = index_ratio_jump(early, late, ThinningBudget::new(budget));
+        assert!(index.complete);
+        let len = index.unpacked_len.unwrap();
+        assert_eq!(len, 2 * early + 1024 * late);
+        assert_eq!(index.checkpoints[0].uncompressed_offset, 0);
+        assert!(index
+            .checkpoints
+            .windows(2)
+            .all(|w| w[0].uncompressed_offset < w[1].uncompressed_offset));
+        assert!(index.checkpoint_data_bytes() <= budget);
+        // Thinning leaves at least half the budget's worth of checkpoints,
+        // evenly spaced, so no gap exceeds twice the even spacing of that.
+        let even = len / (budget / (2 * cp_size));
+        assert!(
+            widest_gap(&index) <= 2 * even,
+            "widest gap {} over {} checkpoints",
+            widest_gap(&index),
+            index.checkpoints.len()
+        );
+
+        // `Budget` extrapolates the early ratio and spends everything on
+        // the first 34 MiB it expects, leaving the tail uncovered.
+        let index = index_ratio_jump(early, late, Budget::new(budget));
+        assert!(index.checkpoint_data_bytes() <= budget + cp_size);
+        assert!(widest_gap(&index) > len / 2);
+    }
+
+    #[test]
+    fn thinning_keeps_the_newest_and_the_first() {
+        let mut index = StreamIndex::new(CodecSpec::single(Codec::Copy), None);
+        for off in 1..=6 {
+            index.checkpoints.push(Checkpoint {
+                compressed_offset: off,
+                bit_offset: 0,
+                uncompressed_offset: off * 10,
+                state: CheckpointState::None,
+            });
+        }
+        let offsets = |index: &StreamIndex| -> Vec<u64> {
+            index
+                .checkpoints
+                .iter()
+                .map(|cp| cp.uncompressed_offset)
+                .collect()
+        };
+        assert!(index.thin());
+        assert_eq!(offsets(&index), [0, 20, 40, 60]);
+        assert!(index.thin());
+        assert_eq!(offsets(&index), [0, 40, 60]);
+        assert!(index.thin());
+        assert_eq!(offsets(&index), [0, 60]);
+        assert!(index.thin());
+        assert_eq!(offsets(&index), [0]);
+        assert!(!index.thin());
+    }
+
+    #[test]
+    fn budget_smaller_than_a_checkpoint_keeps_only_the_start() {
+        let index = index_ratio_jump(
+            MIB,
+            0,
+            ThinningBudget::new(100).with_min_interval(64 * 1024),
+        );
+        assert!(index.complete);
+        assert_eq!(index.checkpoints.len(), 1);
     }
 }

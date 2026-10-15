@@ -12,8 +12,8 @@
 use std::io::Write;
 
 use iluvatar::{
-    BcjArch, Codec, CodecSpec, EngineRequest, FixedInterval, StreamIndex, StreamIndexer,
-    StreamReader,
+    BcjArch, CheckpointStrategy, Codec, CodecSpec, EngineRequest, FixedInterval, StreamIndex,
+    StreamIndexer, StreamReader, ThinningBudget,
 };
 
 // ─── Data and encoders ───
@@ -193,8 +193,8 @@ fn index_stream(
 }
 
 /// Feed `compressed` from `offset` on, honouring seeks.
-fn drive_indexer(
-    indexer: &mut StreamIndexer<FixedInterval>,
+fn drive_indexer<S: CheckpointStrategy>(
+    indexer: &mut StreamIndexer<S>,
     compressed: &[u8],
     chunk: usize,
     mut offset: usize,
@@ -562,6 +562,65 @@ fn resume_in_several_increments() {
     }
     check_random_access(&index, &compressed, &plain);
     check_checkpoints_resume(&index, &compressed, &plain);
+}
+
+#[test]
+fn thinning_budget_spreads_over_a_zero_tail_and_resumes() {
+    let mut plain = mixed(9, 2_000_000);
+    plain.resize(40_000_000, 0);
+    let compressed = zstd(&plain);
+    let codec = CodecSpec::single(Codec::Zstd);
+    let budget = 24_000_000;
+    let strategy = || ThinningBudget::new(budget).with_min_interval(100_000);
+    let offsets = |index: &StreamIndex| -> Vec<u64> {
+        index
+            .checkpoints
+            .iter()
+            .map(|cp| cp.uncompressed_offset)
+            .chain(index.unpacked_len)
+            .collect()
+    };
+    let widest_gap = |index: &StreamIndex| {
+        offsets(index)
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .max()
+            .unwrap()
+    };
+
+    let mut indexer =
+        StreamIndexer::new(codec.clone(), strategy(), Some(compressed.len() as u64)).unwrap();
+    drive_indexer(&mut indexer, &compressed, 4096, 0);
+    let one_pass = indexer.finish();
+    assert!(one_pass.checkpoint_data_bytes() <= budget);
+    assert!(one_pass.checkpoints.len() > 4);
+    let largest = one_pass
+        .checkpoints
+        .iter()
+        .map(|cp| cp.estimated_size() as u64)
+        .max()
+        .unwrap();
+    let even = plain.len() as u64 / (budget / (2 * largest));
+    assert!(widest_gap(&one_pass) <= 2 * even);
+    check_random_access(&one_pass, &compressed, &plain);
+    assert_eq!(
+        read_range(&one_pass, &compressed, 39_000_000, 1000),
+        &plain[39_000_000..39_001_000]
+    );
+
+    // Stopped halfway and resumed with a fresh strategy, the index keeps
+    // the spacing the first pass thinned to instead of thinning it again.
+    let mut indexer = StreamIndexer::new(codec, strategy(), Some(compressed.len() as u64)).unwrap();
+    indexer.stop_at(20_000_000);
+    drive_indexer(&mut indexer, &compressed, 4096, 0);
+    let partial = indexer.finish();
+    let mut indexer = StreamIndexer::resume(partial, strategy()).unwrap();
+    drive_indexer(&mut indexer, &compressed, 4096, 0);
+    let full = indexer.finish();
+    assert!(full.complete);
+    assert!(full.checkpoint_data_bytes() <= budget);
+    assert!(widest_gap(&full) <= widest_gap(&one_pass) * 5 / 4);
+    check_random_access(&full, &compressed, &plain);
 }
 
 // ─── Live readers ───

@@ -39,7 +39,7 @@
 //!
 //! ```no_run
 //! use iluvatar::sync::Archive;
-//! use iluvatar::{FixedInterval, Budget, BudgetRatio};
+//! use iluvatar::{FixedInterval, Budget, BudgetRatio, ThinningBudget};
 //! use std::fs::File;
 //!
 //! // Fixed interval: checkpoint every 8 MiB
@@ -52,6 +52,13 @@
 //! let archive = Archive::with_strategy(
 //!     File::open("data.tar.zst")?,
 //!     Budget::new(10 * 1024 * 1024),
+//! )?;
+//!
+//! // ThinningBudget: at most ~10 MiB, spread over the whole stream even
+//! // when its length can't be predicted from the ratio so far
+//! let archive = Archive::with_strategy(
+//!     File::open("disk.img.zst")?,
+//!     ThinningBudget::new(10 * 1024 * 1024),
 //! )?;
 //! # Ok::<(), iluvatar::Error>(())
 //! ```
@@ -129,7 +136,7 @@ pub use compress::decompressor::{DecompressResult, DecompressStatus, Decompresso
 pub use compress::CompressionFormat;
 pub use engine::checkpoint_strategy::{
     default_interval_for_format, Budget, BudgetRatio, CheckpointContext, CheckpointStrategy,
-    FixedInterval,
+    FixedInterval, ThinningBudget,
 };
 pub use engine::progress::IndexProgress;
 pub use engine::request::EngineRequest;

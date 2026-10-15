@@ -161,6 +161,161 @@ impl ZstdDecompressor {
         }
     }
 
+    /// Decode blocks from the buffered input until it runs dry or at least
+    /// `out_len` bytes are staged, dropping what was consumed. Whether any
+    /// input was.
+    fn decode_buffered(&mut self, out_len: usize) -> Result<bool> {
+        let mut pos = 0;
+
+        loop {
+            match self.phase.clone() {
+                DecoderPhase::FrameHeader => {
+                    if pos + 4 > self.buffer.len() {
+                        // Need more data
+                        break;
+                    }
+
+                    // Check for skippable frame
+                    if let Some(skip_size) = check_skippable_frame(&self.buffer[pos..]) {
+                        if pos + skip_size > self.buffer.len() {
+                            // Need more data for the skip
+                            break;
+                        }
+                        pos += skip_size;
+                        continue;
+                    }
+
+                    // Check magic
+                    let magic = u32::from_le_bytes([
+                        self.buffer[pos],
+                        self.buffer[pos + 1],
+                        self.buffer[pos + 2],
+                        self.buffer[pos + 3],
+                    ]);
+                    if magic != ZSTD_MAGIC {
+                        return Err(Error::DecompressionError(format!(
+                            "zstd: unknown frame magic 0x{:08X}",
+                            magic
+                        )));
+                    }
+
+                    // Try to parse frame header (need at least 5 bytes)
+                    let available = &self.buffer[pos..];
+                    match parse_frame_header(available).map_err(|e| {
+                        Error::DecompressionError(format!("zstd frame header: {}", e))
+                    })? {
+                        Some(header) => {
+                            self.window_size = header.window_size.max(1024);
+                            // Clear block state for new frame
+                            self.block_state = BlockDecoderState::new();
+                            pos += header.header_size;
+                            self.frame_header = Some(header);
+                            self.phase = DecoderPhase::BlockHeader;
+                        }
+                        // Need more data
+                        None => break,
+                    }
+                }
+                DecoderPhase::BlockHeader => {
+                    // Enough decoded for the caller: the rest of the buffer
+                    // waits, so output never runs more than a block ahead
+                    // of what the caller can take.
+                    if self.staged_len() >= out_len || pos + 3 > self.buffer.len() {
+                        break;
+                    }
+
+                    let header = parse_block_header(&self.buffer[pos..])
+                        .map_err(|e| Error::DecompressionError(format!("block header: {}", e)))?;
+                    pos += 3;
+
+                    let compressed_size = block_compressed_size(&header);
+
+                    self.phase = DecoderPhase::BlockData {
+                        header_last: header.is_last,
+                        block_type_raw: header.block_type as u8,
+                        block_size: header.block_size,
+                        compressed_size,
+                    };
+                }
+                DecoderPhase::BlockData {
+                    header_last,
+                    block_type_raw,
+                    block_size,
+                    compressed_size,
+                } => {
+                    if pos + compressed_size > self.buffer.len() {
+                        break;
+                    }
+
+                    let block_type = match block_type_raw {
+                        0 => BlockType::Raw,
+                        1 => BlockType::Rle,
+                        2 => BlockType::Compressed,
+                        _ => return Err(Error::DecompressionError("invalid block type".into())),
+                    };
+
+                    let block_header = block::BlockHeader {
+                        is_last: header_last,
+                        block_type,
+                        block_size,
+                    };
+
+                    let block_data = &self.buffer[pos..pos + compressed_size];
+                    let block_start = self.history.len();
+                    let max_back = block_start.min(self.window_size);
+
+                    decompress_block(
+                        &block_header,
+                        block_data,
+                        &mut self.block_state,
+                        &mut self.history,
+                        max_back,
+                    )
+                    .map_err(|e| Error::DecompressionError(format!("block decompress: {}", e)))?;
+
+                    pos += compressed_size;
+
+                    // The block's output (history[block_start..]) is now
+                    // pending delivery; trim delivered history (amortized).
+                    self.trim_history();
+
+                    if header_last {
+                        // Frame's last block
+                        let has_checksum = self
+                            .frame_header
+                            .as_ref()
+                            .map(|h| h.checksum_flag)
+                            .unwrap_or(false);
+                        self.phase = DecoderPhase::FrameChecksum { has_checksum };
+                    } else {
+                        self.phase = DecoderPhase::BlockHeader;
+                    }
+                }
+                DecoderPhase::FrameChecksum { has_checksum } => {
+                    if has_checksum {
+                        if pos + 4 > self.buffer.len() {
+                            break;
+                        }
+                        // Skip the checksum (we don't verify it)
+                        pos += 4;
+                    }
+                    self.frame_header = None;
+                    // Ready for next frame
+                    self.phase = DecoderPhase::FrameHeader;
+                }
+                DecoderPhase::Done => {
+                    self.finished = true;
+                    break;
+                }
+            }
+        }
+
+        if pos > 0 {
+            self.buffer.drain(..pos);
+        }
+        Ok(pos > 0)
+    }
+
     /// Get the serializable state for checkpointing.
     fn get_checkpoint_state(&self) -> ZstdFullCheckpointState {
         // Both the window and the undelivered output are suffixes of the
@@ -254,171 +409,25 @@ impl Decompressor for ZstdDecompressor {
             });
         }
 
-        // Append any new input to our internal buffer for accumulation.
-        if !input.is_empty() {
+        // Decode what is buffered before taking more input, and take input
+        // only when that leaves nothing to hand out: compressed bytes then
+        // never pile up behind output the caller has yet to take.
+        let out_len = output.len();
+        let mut progressed = self.decode_buffered(out_len)?;
+        let mut consumed = 0;
+        if self.staged_len() == 0 && !self.finished && !input.is_empty() {
             self.buffer.extend_from_slice(input);
+            consumed = input.len();
+            progressed |= self.decode_buffered(out_len)?;
         }
-        let mut pos = 0;
-
-        loop {
-            match self.phase.clone() {
-                DecoderPhase::FrameHeader => {
-                    if pos + 4 > self.buffer.len() {
-                        // Need more data
-                        break;
-                    }
-
-                    // Check for skippable frame
-                    if let Some(skip_size) = check_skippable_frame(&self.buffer[pos..]) {
-                        if pos + skip_size > self.buffer.len() {
-                            // Need more data for the skip
-                            break;
-                        }
-                        pos += skip_size;
-                        continue;
-                    }
-
-                    // Check magic
-                    let magic = u32::from_le_bytes([
-                        self.buffer[pos],
-                        self.buffer[pos + 1],
-                        self.buffer[pos + 2],
-                        self.buffer[pos + 3],
-                    ]);
-                    if magic != ZSTD_MAGIC {
-                        return Err(Error::DecompressionError(format!(
-                            "zstd: unknown frame magic 0x{:08X}",
-                            magic
-                        )));
-                    }
-
-                    // Try to parse frame header (need at least 5 bytes)
-                    let available = &self.buffer[pos..];
-                    match parse_frame_header(available).map_err(|e| {
-                        Error::DecompressionError(format!("zstd frame header: {}", e))
-                    })? {
-                        Some(header) => {
-                            self.window_size = header.window_size.max(1024);
-                            // Clear block state for new frame
-                            self.block_state = BlockDecoderState::new();
-                            pos += header.header_size;
-                            self.frame_header = Some(header);
-                            self.phase = DecoderPhase::BlockHeader;
-                        }
-                        // Need more data
-                        None => break,
-                    }
-                }
-                DecoderPhase::BlockHeader => {
-                    if pos + 3 > self.buffer.len() {
-                        break;
-                    }
-
-                    let header = parse_block_header(&self.buffer[pos..])
-                        .map_err(|e| Error::DecompressionError(format!("block header: {}", e)))?;
-                    pos += 3;
-
-                    let compressed_size = block_compressed_size(&header);
-
-                    self.phase = DecoderPhase::BlockData {
-                        header_last: header.is_last,
-                        block_type_raw: header.block_type as u8,
-                        block_size: header.block_size,
-                        compressed_size,
-                    };
-                }
-                DecoderPhase::BlockData {
-                    header_last,
-                    block_type_raw,
-                    block_size,
-                    compressed_size,
-                } => {
-                    if pos + compressed_size > self.buffer.len() {
-                        break;
-                    }
-
-                    let block_type = match block_type_raw {
-                        0 => BlockType::Raw,
-                        1 => BlockType::Rle,
-                        2 => BlockType::Compressed,
-                        _ => return Err(Error::DecompressionError("invalid block type".into())),
-                    };
-
-                    let block_header = block::BlockHeader {
-                        is_last: header_last,
-                        block_type,
-                        block_size,
-                    };
-
-                    let block_data = &self.buffer[pos..pos + compressed_size];
-                    let block_start = self.history.len();
-                    let max_back = block_start.min(self.window_size);
-
-                    decompress_block(
-                        &block_header,
-                        block_data,
-                        &mut self.block_state,
-                        &mut self.history,
-                        max_back,
-                    )
-                    .map_err(|e| Error::DecompressionError(format!("block decompress: {}", e)))?;
-
-                    pos += compressed_size;
-
-                    // The block's output (history[block_start..]) is now
-                    // pending delivery; trim delivered history (amortized).
-                    self.trim_history();
-
-                    if header_last {
-                        // Frame's last block
-                        let has_checksum = self
-                            .frame_header
-                            .as_ref()
-                            .map(|h| h.checksum_flag)
-                            .unwrap_or(false);
-                        self.phase = DecoderPhase::FrameChecksum { has_checksum };
-                    } else {
-                        self.phase = DecoderPhase::BlockHeader;
-                    }
-
-                    // Continue processing more blocks from the buffer
-                    // to keep the buffer bounded (don't break here).
-                }
-                DecoderPhase::FrameChecksum { has_checksum } => {
-                    if has_checksum {
-                        if pos + 4 > self.buffer.len() {
-                            break;
-                        }
-                        // Skip the checksum (we don't verify it)
-                        pos += 4;
-                    }
-                    self.frame_header = None;
-                    // Ready for next frame
-                    self.phase = DecoderPhase::FrameHeader;
-                }
-                DecoderPhase::Done => {
-                    self.finished = true;
-                    break;
-                }
-            }
-        }
-
-        // We always buffer all input, so all input bytes are consumed.
-        let bytes_consumed_from_input = input.len();
-
-        // Remove consumed data from buffer
-        if pos > 0 {
-            self.buffer.drain(..pos);
-        }
-
-        self.total_in += bytes_consumed_from_input as u64;
+        self.total_in += consumed as u64;
 
         // Deliver staged output
         let produced = self.drain_staged(output);
         self.total_out += produced as u64;
 
         // End of the compressed stream with a partial frame buffered.
-        if input.is_empty() && pos == 0 && produced == 0 && !self.finished {
+        if input.is_empty() && !progressed && produced == 0 && !self.finished {
             return Err(Error::TruncatedInput);
         }
 
@@ -429,7 +438,7 @@ impl Decompressor for ZstdDecompressor {
         };
 
         Ok(DecompressResult {
-            bytes_consumed: bytes_consumed_from_input,
+            bytes_consumed: consumed,
             bytes_produced: produced,
             status,
         })
@@ -601,6 +610,45 @@ mod tests {
         let compressed = compress_zstd_multiframe(&original, 2000);
         let output = full_decompress(&compressed, 4096);
         assert_eq!(output, original);
+    }
+
+    /// A long zero run unpacks thousands of times over: decoding stays a
+    /// block ahead of the caller, input waits its turn in the caller's
+    /// hands, and a checkpoint carries no more than that block.
+    #[test]
+    fn test_highly_compressible_input_stays_bounded() {
+        const LEN: usize = 64 << 20;
+        const OUT: usize = 64 << 10;
+        const BLOCK: usize = 128 << 10;
+        let compressed = compress_zstd(&vec![0u8; LEN]);
+        let mut dec = ZstdDecompressor::new();
+        let mut out = vec![0u8; OUT];
+        const SLICE: usize = 256;
+        let mut input = &compressed[..];
+        let mut total = 0;
+        loop {
+            let r = dec
+                .decompress(&input[..input.len().min(SLICE)], &mut out)
+                .unwrap();
+            input = &input[r.bytes_consumed..];
+            assert!(dec.buffer.len() <= SLICE + BLOCK);
+            assert!(out[..r.bytes_produced].iter().all(|&b| b == 0));
+            total += r.bytes_produced;
+            assert!(
+                dec.staged_len() <= OUT + BLOCK,
+                "staged {}",
+                dec.staged_len()
+            );
+            assert!(dec.history.len() <= 2 * dec.window_size + OUT + 2 * BLOCK);
+            let CheckpointState::Zstd(cp) = dec.checkpoint(0, 0).unwrap().unwrap().state else {
+                unreachable!()
+            };
+            assert!(cp.staged_output.len() <= OUT + BLOCK);
+            if r.status == DecompressStatus::StreamEnd {
+                break;
+            }
+        }
+        assert_eq!(total, LEN);
     }
 
     #[test]

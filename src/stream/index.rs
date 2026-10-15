@@ -61,6 +61,28 @@ impl StreamIndex {
             .expect("a stream index always holds the start checkpoint")
     }
 
+    /// Drop every other checkpoint between the offset-0 one and the last,
+    /// keeping both; with nothing between them, drop the last. Returns
+    /// whether anything was dropped.
+    pub(crate) fn thin(&mut self) -> bool {
+        let n = self.checkpoints.len();
+        match n {
+            0 | 1 => return false,
+            2 => {
+                self.checkpoints.pop();
+            }
+            _ => {
+                let mut i = 0;
+                self.checkpoints.retain(|_| {
+                    let keep = i % 2 == 0 || i == n - 1;
+                    i += 1;
+                    keep
+                });
+            }
+        }
+        true
+    }
+
     /// Estimated bytes of checkpoint state.
     pub fn checkpoint_data_bytes(&self) -> u64 {
         self.checkpoints

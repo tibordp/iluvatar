@@ -23,7 +23,9 @@ pub struct CheckpointContext {
 ///
 /// The engine calls [`should_checkpoint`](CheckpointStrategy::should_checkpoint)
 /// after each decompression step that produces output. Returning `true`
-/// causes the engine to snapshot the decompressor state.
+/// causes the engine to snapshot the decompressor state. After every
+/// checkpoint it asks [`should_thin`](CheckpointStrategy::should_thin)
+/// whether to drop every other one.
 ///
 /// Used as a type parameter on [`IndexingEngine`](crate::IndexingEngine),
 /// so strategies are monomorphized — no dynamic dispatch overhead on the
@@ -34,6 +36,8 @@ pub struct CheckpointContext {
 /// - [`FixedInterval`] — checkpoint every N bytes of uncompressed output
 /// - [`Budget`] — keep total checkpoint data under a byte limit
 /// - [`BudgetRatio`] — keep checkpoint data under a fraction of archive size
+/// - [`ThinningBudget`] — keep checkpoint data under a byte limit, spread
+///   over the whole stream however long it turns out to be
 ///
 /// # Implementing a custom strategy
 ///
@@ -59,6 +63,19 @@ pub trait CheckpointStrategy {
     /// Adaptive strategies use this to refine their estimates. The default
     /// implementation is a no-op.
     fn on_checkpoint_created(&mut self, _ctx: &CheckpointContext, _data_size: usize) {}
+
+    /// Called after every checkpoint the indexer lays, including the one it
+    /// lays on its own when stopping at [`stop_at`](crate::StreamIndexer::stop_at).
+    /// Returning `true` makes the indexer drop every other checkpoint
+    /// between the offset-0 one and the newest, which it keeps; it then
+    /// asks again with the reduced totals, until this returns `false` or
+    /// only the offset-0 checkpoint is left (a newest checkpoint is dropped
+    /// only when it is the sole one besides offset 0).
+    ///
+    /// The default implementation never thins.
+    fn should_thin(&mut self, _ctx: &CheckpointContext) -> bool {
+        false
+    }
 }
 
 /// Checkpoint at fixed intervals of uncompressed data.
@@ -104,6 +121,12 @@ impl CheckpointStrategy for FixedInterval {
 ///
 /// Requires a known archive size for adaptation; with unknown size it still
 /// works but uses a conservative fixed interval.
+///
+/// The remaining unpacked length is extrapolated from the compression ratio
+/// so far, and checkpointing stops once the budget is spent. A stream whose
+/// ratio climbs late (a disk image with an empty tail) spends it early and
+/// leaves the tail without checkpoints; [`ThinningBudget`] predicts nothing
+/// and covers the whole stream.
 ///
 /// # Example
 ///
@@ -244,6 +267,93 @@ impl CheckpointStrategy for BudgetRatio {
     }
 }
 
+/// Hard cap on total checkpoint data, spread evenly over a stream of any length.
+///
+/// Checkpoints are laid every `interval` bytes of uncompressed output,
+/// starting at the minimum interval. Whenever a checkpoint takes the total
+/// over the budget, the indexer drops every other checkpoint and the
+/// interval doubles, so the index covers everything decoded so far at
+/// whatever spacing fits. Nothing is estimated from the compression ratio
+/// or the archive size, so a stream whose ratio changes partway (a disk
+/// image with a long empty tail) is covered as evenly as any other.
+///
+/// The spacing settles where checkpoints of the observed size fill between
+/// half the budget and all of it, and consecutive checkpoints are never
+/// much more than one interval apart; a codec that can only checkpoint at
+/// some positions (deflate, at block boundaries) stretches that by the
+/// wait for one. The total exceeds the budget only between laying a
+/// checkpoint and thinning, by that one checkpoint.
+///
+/// A [`StreamIndexer::resume`](crate::StreamIndexer::resume)d index starts
+/// at the power-of-two multiple of the minimum interval nearest its
+/// checkpoints' mean spacing, so it keeps the spacing an earlier pass
+/// thinned to.
+///
+/// # Example
+///
+/// ```
+/// use iluvatar::ThinningBudget;
+///
+/// // At most 256 MiB of checkpoint data, never closer than 64 MiB apart
+/// let strategy = ThinningBudget::new(256 * 1024 * 1024)
+///     .with_min_interval(64 * 1024 * 1024);
+/// ```
+pub struct ThinningBudget {
+    budget: u64,
+    interval: u64,
+    started: bool,
+}
+
+impl ThinningBudget {
+    /// Create a thinning strategy with the given maximum total checkpoint
+    /// data size and a minimum interval of 1 MiB.
+    pub fn new(budget: u64) -> Self {
+        Self {
+            budget,
+            interval: 1024 * 1024,
+            started: false,
+        }
+    }
+
+    /// Set the minimum (and starting) interval between checkpoints.
+    pub fn with_min_interval(mut self, min_interval: u64) -> Self {
+        // Doubling has to grow it.
+        self.interval = min_interval.max(1);
+        self
+    }
+
+    /// The current interval between checkpoints.
+    pub fn interval(&self) -> u64 {
+        self.interval
+    }
+
+    fn start(&mut self, ctx: &CheckpointContext) {
+        if std::mem::replace(&mut self.started, true) || ctx.checkpoint_count < 2 {
+            return;
+        }
+        let mean = ctx.last_checkpoint_uncompressed_pos as f64 / (ctx.checkpoint_count - 1) as f64;
+        while (self.interval as f64) * std::f64::consts::SQRT_2 < mean {
+            self.interval = self.interval.saturating_mul(2);
+        }
+    }
+}
+
+impl CheckpointStrategy for ThinningBudget {
+    fn should_checkpoint(&mut self, ctx: &CheckpointContext) -> bool {
+        self.start(ctx);
+        ctx.uncompressed_pos - ctx.last_checkpoint_uncompressed_pos >= self.interval
+    }
+
+    fn should_thin(&mut self, ctx: &CheckpointContext) -> bool {
+        self.start(ctx);
+        if ctx.total_checkpoint_data_bytes <= self.budget {
+            return false;
+        }
+        self.interval = self.interval.saturating_mul(2);
+        true
+    }
+}
+
 /// Returns a sensible default checkpoint interval for the given compression format.
 ///
 /// Checkpoint state sizes vary dramatically by format, so the default interval
@@ -361,6 +471,35 @@ mod tests {
         // archive_size = 1MB, so budget = 100KB
         // Should checkpoint at default 1MB interval initially
         assert!(s.should_checkpoint(&make_ctx(1_100_000, 500_000, 0, 1, 0, 1_000_000)));
+    }
+
+    #[test]
+    fn test_thinning_budget_doubles_when_over() {
+        let mut s = ThinningBudget::new(1000).with_min_interval(100);
+        assert!(!s.should_checkpoint(&make_ctx(99, 50, 0, 1, 17, 0)));
+        assert!(s.should_checkpoint(&make_ctx(100, 50, 0, 1, 17, 0)));
+        assert!(!s.should_thin(&make_ctx(100, 50, 100, 2, 1000, 0)));
+        assert_eq!(s.interval(), 100);
+        assert!(s.should_thin(&make_ctx(200, 50, 200, 3, 1001, 0)));
+        assert_eq!(s.interval(), 200);
+        assert!(!s.should_checkpoint(&make_ctx(399, 60, 200, 2, 500, 0)));
+        assert!(s.should_checkpoint(&make_ctx(400, 60, 200, 2, 500, 0)));
+    }
+
+    #[test]
+    fn test_thinning_budget_resumes_at_existing_spacing() {
+        // 9 checkpoints over 8 × 1000: mean spacing 1000, nearest 125·2^k.
+        let mut s = ThinningBudget::new(1 << 20).with_min_interval(125);
+        assert!(!s.should_checkpoint(&make_ctx(8100, 4000, 8000, 9, 900, 0)));
+        assert_eq!(s.interval(), 1000);
+        // A slightly uneven tail rounds to the same power of two.
+        let mut s = ThinningBudget::new(1 << 20).with_min_interval(125);
+        s.should_checkpoint(&make_ctx(7700, 4000, 7600, 9, 900, 0));
+        assert_eq!(s.interval(), 1000);
+        // A fresh index keeps the minimum.
+        let mut s = ThinningBudget::new(1 << 20).with_min_interval(125);
+        s.should_checkpoint(&make_ctx(10, 5, 0, 1, 17, 0));
+        assert_eq!(s.interval(), 125);
     }
 
     #[test]

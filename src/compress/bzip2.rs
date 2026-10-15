@@ -528,6 +528,17 @@ impl Bzip2Decompressor {
 
         // Phase 2: Bit-shift input and feed to decoder
 
+        // Decode the shifted bytes held from earlier calls before shifting
+        // in more, so they never pile up while the output is what holds the
+        // decoder back.
+        if !self.shift_buffer.is_empty() {
+            let held = std::mem::take(&mut self.shift_buffer);
+            let result = self.feed_restore(held, 0, output)?;
+            if result.bytes_produced > 0 || result.status == DecompressStatus::StreamEnd {
+                return Ok(result);
+            }
+        }
+
         // Build the feed buffer: any leftover shifted bytes + newly shifted bytes
         let mut feed = std::mem::take(&mut self.shift_buffer);
         if let Some(ref mut shifter) = self.bit_shifter {
@@ -547,6 +558,17 @@ impl Bzip2Decompressor {
             });
         }
 
+        self.feed_restore(feed, input.len(), output)
+    }
+
+    /// Feed shifted bytes to the decoder, holding back what it doesn't take;
+    /// `consumed` is the caller's input they account for.
+    fn feed_restore(
+        &mut self,
+        feed: Vec<u8>,
+        consumed: usize,
+        output: &mut [u8],
+    ) -> Result<DecompressResult> {
         let before_in = self.inner.total_in();
         let before_out = self.inner.total_out();
 
@@ -565,10 +587,6 @@ impl Bzip2Decompressor {
             self.shift_buffer = feed[consumed_d..].to_vec();
         }
 
-        // We always consume all input bytes (the shifter processed them).
-        // Unconsumed shifted bytes are buffered for the next call.
-        let original_consumed = input.len();
-
         match result {
             Ok(status) => {
                 let status = match status {
@@ -580,7 +598,7 @@ impl Bzip2Decompressor {
                     bzip2::Status::StreamEnd => DecompressStatus::StreamEnd,
                 };
                 Ok(DecompressResult {
-                    bytes_consumed: original_consumed,
+                    bytes_consumed: consumed,
                     bytes_produced: produced,
                     status,
                 })
@@ -592,7 +610,7 @@ impl Bzip2Decompressor {
                 // Anything before it is corrupt data.
                 if self.restore_scanner.eos_found {
                     Ok(DecompressResult {
-                        bytes_consumed: original_consumed,
+                        bytes_consumed: consumed,
                         bytes_produced: produced,
                         status: DecompressStatus::StreamEnd,
                     })
@@ -990,6 +1008,54 @@ mod tests {
             restored_output, expected_tail,
             "restored output doesn't match expected tail"
         );
+    }
+
+    /// Restored mid-stream into long zero runs: the shifted bytes held
+    /// between calls stay a read's worth while the output is what holds
+    /// the decoder back.
+    #[test]
+    fn test_restore_holds_no_more_than_a_read() {
+        const LEN: usize = 64 << 20;
+        const SLICE: usize = 16;
+        let compressed = compress_bz2_small_blocks(&vec![0u8; LEN]);
+
+        let mut dec = Bzip2Decompressor::new();
+        let mut out = vec![0u8; 1 << 20];
+        let (mut offset, mut produced) = (0, 0u64);
+        let cp = loop {
+            let input = &compressed[offset..(offset + SLICE).min(compressed.len())];
+            let r = dec.decompress(input, &mut out).unwrap();
+            offset += r.bytes_consumed;
+            produced += r.bytes_produced as u64;
+            if let Some(cp) = dec.checkpoint(offset as u64, produced).unwrap() {
+                if cp.compressed_offset > 0 {
+                    break cp;
+                }
+            }
+            assert_ne!(r.status, DecompressStatus::StreamEnd, "no block boundary");
+        };
+
+        let mut dec = Bzip2Decompressor::new();
+        dec.restore(&cp).unwrap();
+        let mut out = vec![0u8; 4096];
+        let mut offset = cp.compressed_offset as usize;
+        let mut total = cp.uncompressed_offset;
+        loop {
+            let input = &compressed[offset..(offset + SLICE).min(compressed.len())];
+            let r = dec.decompress(input, &mut out).unwrap();
+            offset += r.bytes_consumed;
+            assert!(out[..r.bytes_produced].iter().all(|&b| b == 0));
+            total += r.bytes_produced as u64;
+            assert!(
+                dec.shift_buffer.len() <= 2 * SLICE,
+                "held {}",
+                dec.shift_buffer.len()
+            );
+            if r.status == DecompressStatus::StreamEnd {
+                break;
+            }
+        }
+        assert_eq!(total, LEN as u64);
     }
 
     #[test]

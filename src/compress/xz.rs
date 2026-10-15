@@ -198,126 +198,9 @@ impl XzDecompressor {
         }
     }
 
-    /// Drain staged output to the caller's output buffer.
-    fn drain_staged(&mut self, output: &mut [u8]) -> usize {
-        let available = self.staged_output.len() - self.staged_pos;
-        let to_copy = available.min(output.len());
-        if to_copy > 0 {
-            output[..to_copy]
-                .copy_from_slice(&self.staged_output[self.staged_pos..self.staged_pos + to_copy]);
-            self.staged_pos += to_copy;
-            if self.staged_pos >= self.staged_output.len() {
-                self.staged_output.clear();
-                self.staged_pos = 0;
-            }
-        }
-        to_copy
-    }
-
-    /// Parse a block header to extract the LZMA2 dictionary size property byte.
-    fn parse_block_header(header_data: &[u8]) -> std::result::Result<u8, String> {
-        if header_data.len() < 6 {
-            return Err("block header too short".into());
-        }
-
-        let flags = header_data[1];
-        let num_filters = (flags & 0x03) + 1;
-        if num_filters != 1 {
-            return Err(format!("unsupported filter count: {}", num_filters));
-        }
-
-        let mut pos = 2;
-
-        // Skip optional compressed size
-        if flags & 0x40 != 0 {
-            if let Some((_, len)) = decode_vli(&header_data[pos..]) {
-                pos += len;
-            } else {
-                return Err("bad compressed size VLI".into());
-            }
-        }
-
-        // Skip optional uncompressed size
-        if flags & 0x80 != 0 {
-            if let Some((_, len)) = decode_vli(&header_data[pos..]) {
-                pos += len;
-            } else {
-                return Err("bad uncompressed size VLI".into());
-            }
-        }
-
-        // Parse filter: expect LZMA2 (filter ID 0x21)
-        if pos >= header_data.len() {
-            return Err("block header truncated at filter".into());
-        }
-        let (filter_id, id_len) = decode_vli(&header_data[pos..]).ok_or("bad filter ID VLI")?;
-        pos += id_len;
-
-        if filter_id != 0x21 {
-            return Err(format!(
-                "unsupported filter ID: 0x{:x} (expected LZMA2 0x21)",
-                filter_id
-            ));
-        }
-
-        // Properties size (should be 1 for LZMA2)
-        let (props_size, ps_len) = decode_vli(&header_data[pos..]).ok_or("bad props size VLI")?;
-        pos += ps_len;
-
-        if props_size != 1 {
-            return Err(format!("unexpected LZMA2 props size: {}", props_size));
-        }
-
-        if pos >= header_data.len() {
-            return Err("block header truncated at LZMA2 props".into());
-        }
-
-        Ok(header_data[pos])
-    }
-}
-
-impl Decompressor for XzDecompressor {
-    fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
-        // Drain staged output first
-        if self.staged_pos < self.staged_output.len() {
-            let produced = self.drain_staged(output);
-            self.total_out += produced as u64;
-            return Ok(DecompressResult {
-                bytes_consumed: 0,
-                bytes_produced: produced,
-                status: if self.finished && self.staged_pos >= self.staged_output.len() {
-                    DecompressStatus::StreamEnd
-                } else {
-                    DecompressStatus::Continue
-                },
-            });
-        }
-
-        if self.finished {
-            return Ok(DecompressResult {
-                bytes_consumed: 0,
-                bytes_produced: 0,
-                status: DecompressStatus::StreamEnd,
-            });
-        }
-
-        if input.is_empty() && self.buffer.is_empty() && self.lzma2.is_none() {
-            // End of the compressed stream before its footer. Only an empty
-            // file ends cleanly here.
-            if self.total_in > 0 || !matches!(self.phase, XzPhase::StreamHeader) {
-                return Err(Error::TruncatedInput);
-            }
-            self.finished = true;
-            return Ok(DecompressResult {
-                bytes_consumed: 0,
-                bytes_produced: 0,
-                status: DecompressStatus::StreamEnd,
-            });
-        }
-
-        if !input.is_empty() {
-            self.buffer.extend_from_slice(input);
-        }
+    /// Decode from the buffered input until it runs dry or a chunk of
+    /// output is staged, dropping what was consumed. Whether any input was.
+    fn decode_buffered(&mut self) -> Result<bool> {
         let mut pos = 0;
 
         loop {
@@ -469,19 +352,146 @@ impl Decompressor for XzDecompressor {
             }
         }
 
-        let bytes_consumed_from_input = input.len();
-
         if pos > 0 {
             self.buffer.drain(..pos);
         }
+        Ok(pos > 0)
+    }
 
-        self.total_in += bytes_consumed_from_input as u64;
+    /// Drain staged output to the caller's output buffer.
+    fn drain_staged(&mut self, output: &mut [u8]) -> usize {
+        let available = self.staged_output.len() - self.staged_pos;
+        let to_copy = available.min(output.len());
+        if to_copy > 0 {
+            output[..to_copy]
+                .copy_from_slice(&self.staged_output[self.staged_pos..self.staged_pos + to_copy]);
+            self.staged_pos += to_copy;
+            if self.staged_pos >= self.staged_output.len() {
+                self.staged_output.clear();
+                self.staged_pos = 0;
+            }
+        }
+        to_copy
+    }
+
+    /// Parse a block header to extract the LZMA2 dictionary size property byte.
+    fn parse_block_header(header_data: &[u8]) -> std::result::Result<u8, String> {
+        if header_data.len() < 6 {
+            return Err("block header too short".into());
+        }
+
+        let flags = header_data[1];
+        let num_filters = (flags & 0x03) + 1;
+        if num_filters != 1 {
+            return Err(format!("unsupported filter count: {}", num_filters));
+        }
+
+        let mut pos = 2;
+
+        // Skip optional compressed size
+        if flags & 0x40 != 0 {
+            if let Some((_, len)) = decode_vli(&header_data[pos..]) {
+                pos += len;
+            } else {
+                return Err("bad compressed size VLI".into());
+            }
+        }
+
+        // Skip optional uncompressed size
+        if flags & 0x80 != 0 {
+            if let Some((_, len)) = decode_vli(&header_data[pos..]) {
+                pos += len;
+            } else {
+                return Err("bad uncompressed size VLI".into());
+            }
+        }
+
+        // Parse filter: expect LZMA2 (filter ID 0x21)
+        if pos >= header_data.len() {
+            return Err("block header truncated at filter".into());
+        }
+        let (filter_id, id_len) = decode_vli(&header_data[pos..]).ok_or("bad filter ID VLI")?;
+        pos += id_len;
+
+        if filter_id != 0x21 {
+            return Err(format!(
+                "unsupported filter ID: 0x{:x} (expected LZMA2 0x21)",
+                filter_id
+            ));
+        }
+
+        // Properties size (should be 1 for LZMA2)
+        let (props_size, ps_len) = decode_vli(&header_data[pos..]).ok_or("bad props size VLI")?;
+        pos += ps_len;
+
+        if props_size != 1 {
+            return Err(format!("unexpected LZMA2 props size: {}", props_size));
+        }
+
+        if pos >= header_data.len() {
+            return Err("block header truncated at LZMA2 props".into());
+        }
+
+        Ok(header_data[pos])
+    }
+}
+
+impl Decompressor for XzDecompressor {
+    fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<DecompressResult> {
+        // Drain staged output first
+        if self.staged_pos < self.staged_output.len() {
+            let produced = self.drain_staged(output);
+            self.total_out += produced as u64;
+            return Ok(DecompressResult {
+                bytes_consumed: 0,
+                bytes_produced: produced,
+                status: if self.finished && self.staged_pos >= self.staged_output.len() {
+                    DecompressStatus::StreamEnd
+                } else {
+                    DecompressStatus::Continue
+                },
+            });
+        }
+
+        if self.finished {
+            return Ok(DecompressResult {
+                bytes_consumed: 0,
+                bytes_produced: 0,
+                status: DecompressStatus::StreamEnd,
+            });
+        }
+
+        if input.is_empty() && self.buffer.is_empty() && self.lzma2.is_none() {
+            // End of the compressed stream before its footer. Only an empty
+            // file ends cleanly here.
+            if self.total_in > 0 || !matches!(self.phase, XzPhase::StreamHeader) {
+                return Err(Error::TruncatedInput);
+            }
+            self.finished = true;
+            return Ok(DecompressResult {
+                bytes_consumed: 0,
+                bytes_produced: 0,
+                status: DecompressStatus::StreamEnd,
+            });
+        }
+
+        // Decode what is buffered before taking more input, and take input
+        // only when that leaves nothing to hand out: compressed bytes then
+        // never pile up behind output the caller has yet to take.
+        let mut progressed = self.decode_buffered()?;
+        let mut consumed = 0;
+        if self.staged_pos >= self.staged_output.len() && !self.finished && !input.is_empty() {
+            self.buffer.extend_from_slice(input);
+            consumed = input.len();
+            progressed |= self.decode_buffered()?;
+        }
+        self.total_in += consumed as u64;
 
         let produced = self.drain_staged(output);
         self.total_out += produced as u64;
 
         // End of the compressed stream with an incomplete stream buffered.
-        if input.is_empty() && pos == 0 && produced == 0 && !self.finished {
+        if input.is_empty() && !progressed && produced == 0 && !self.finished {
             return Err(Error::TruncatedInput);
         }
 
@@ -492,7 +502,7 @@ impl Decompressor for XzDecompressor {
         };
 
         Ok(DecompressResult {
-            bytes_consumed: bytes_consumed_from_input,
+            bytes_consumed: consumed,
             bytes_produced: produced,
             status,
         })
@@ -672,6 +682,43 @@ mod tests {
         let mut encoder = XzEncoder::new_stream(Vec::new(), stream);
         encoder.write_all(data).unwrap();
         encoder.finish().unwrap()
+    }
+
+    /// A long zero run unpacks thousands of times over: compressed input
+    /// waits in the caller's hands rather than piling up in the decoder,
+    /// whose checkpoints copy what it holds.
+    #[test]
+    fn test_highly_compressible_input_stays_bounded() {
+        const LEN: usize = 16 << 20;
+        const OUT: usize = 64 << 10;
+        const SLICE: usize = 256;
+        const CHUNK: usize = 256 << 10;
+        let compressed = compress_xz(&vec![0u8; LEN]);
+        let mut dec = XzDecompressor::new();
+        let mut out = vec![0u8; OUT];
+        let mut input = &compressed[..];
+        let mut total = 0;
+        loop {
+            let r = dec
+                .decompress(&input[..input.len().min(SLICE)], &mut out)
+                .unwrap();
+            input = &input[r.bytes_consumed..];
+            assert!(out[..r.bytes_produced].iter().all(|&b| b == 0));
+            total += r.bytes_produced;
+            let CheckpointState::Xz(cp) = dec.checkpoint(0, 0).unwrap().unwrap().state else {
+                unreachable!()
+            };
+            assert!(
+                cp.buffer.len() <= SLICE + 1024,
+                "buffer {}",
+                cp.buffer.len()
+            );
+            assert!(cp.staged_output.len() <= CHUNK);
+            if r.status == DecompressStatus::StreamEnd {
+                break;
+            }
+        }
+        assert_eq!(total, LEN);
     }
 
     #[test]

@@ -160,12 +160,17 @@ index size. Checkpoint size depends on the format: a bzip2 checkpoint is a
 few bytes and a gzip one about 32 KiB, but an xz or zstd checkpoint carries
 the decoder's whole window, up to the dictionary or window size (8 MiB at
 xz -6, 64 MiB at xz -9), so a dense interval grows those indexes quickly.
-`Budget` and `BudgetRatio` cap the total instead. You can override the
-default with a custom strategy:
+`Budget` and `BudgetRatio` cap the total instead, spreading it over the
+unpacked length they extrapolate from the compression ratio so far; when
+the ratio climbs late (a disk image with an empty tail), they run out
+before the end. `ThinningBudget` caps the total without predicting
+anything: past the cap it drops every other checkpoint and doubles its
+interval, so the whole stream stays covered at whatever spacing fits. You
+can override the default with a custom strategy:
 
 ```rust
 use iluvatar::sync::Archive;
-use iluvatar::{FixedInterval, Budget, BudgetRatio};
+use iluvatar::{FixedInterval, Budget, BudgetRatio, ThinningBudget};
 use std::fs::File;
 
 // Fixed interval: checkpoint every 8 MiB of decompressed data
@@ -179,6 +184,10 @@ let archive = Archive::with_strategy(file, Budget::new(10 * 1024 * 1024))?;
 // BudgetRatio: keep the index under ~5% of the archive size
 let file = File::open("data.tar.xz")?;
 let archive = Archive::with_strategy(file, BudgetRatio::new(0.05))?;
+
+// ThinningBudget: at most 256 MiB, evenly spread however long the stream is
+let file = File::open("disk.img.zst")?;
+let archive = Archive::with_strategy(file, ThinningBudget::new(256 * 1024 * 1024))?;
 # Ok::<(), iluvatar::Error>(())
 ```
 
@@ -261,8 +270,8 @@ checkpoint between them rather than pointing at an earlier boundary.
   checkpoint; zstd and xz store the decoder's window, up to the dictionary
   or window size (8 MiB at xz -6, 64 MiB at xz -9) per checkpoint. The
   format-aware defaults (16–64 MiB intervals) keep this reasonable, but very
-  large archives will still produce sizable indices. Use `Budget` or
-  `BudgetRatio` strategies to cap index size.
+  large archives will still produce sizable indices. Use `Budget`,
+  `BudgetRatio` or `ThinningBudget` strategies to cap index size.
 - **Only the first gzip member, bzip2 stream or xz stream is decoded.**
   Concatenated ones (`bgzip`, pbzip2, `cat a.gz b.gz`) end at the first: a
   bare stream stops there, and an archive split across them fails with

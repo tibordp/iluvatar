@@ -430,6 +430,17 @@ impl Decompressor for GzipDecompressor {
             }
 
             GzipHeaderState::Decompressing if !self.replay.is_empty() => {
+                // Inflate the held bytes before taking more, so they never
+                // pile up while the output is what holds inflate back.
+                let held = self.inflate_replay(0, true, output)?;
+                if held.bytes_produced > 0
+                    || !matches!(self.header_state, GzipHeaderState::Decompressing)
+                {
+                    return Ok(held);
+                }
+                if self.replay.is_empty() {
+                    return self.inflate_to_output(input, !input.is_empty(), output);
+                }
                 self.replay.extend_from_slice(input);
                 self.inflate_replay(input.len(), !input.is_empty(), output)
             }
@@ -892,5 +903,33 @@ mod tests {
             }
             assert!(all == plain, "first read of {first} bytes");
         }
+    }
+
+    /// Raw deflate of a long zero run: the bytes held for the raw fallback
+    /// are inflated before more are taken, so they stay a read's worth
+    /// while the output is what holds inflate back.
+    #[test]
+    fn test_raw_fallback_holds_no_more_than_a_read() {
+        const SLICE: usize = 256;
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &vec![0u8; 16 << 20]).unwrap();
+        let raw = enc.finish().unwrap();
+
+        let mut dec = GzipDecompressor::new();
+        let mut out = vec![0u8; 8192];
+        let mut pos = 0;
+        let mut total = 0;
+        loop {
+            let input = &raw[pos..(pos + SLICE).min(raw.len())];
+            let r = dec.decompress(input, &mut out).unwrap();
+            pos += r.bytes_consumed;
+            total += r.bytes_produced;
+            assert!(dec.replay.len() <= 2 * SLICE, "replay {}", dec.replay.len());
+            if r.status == DecompressStatus::StreamEnd {
+                break;
+            }
+        }
+        assert_eq!(total, 16 << 20);
     }
 }

@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`ThinningBudget` caps checkpoint data and still covers the whole
+  stream.** It lays checkpoints at a fixed interval; whenever one takes
+  the total past the budget, the indexer drops every other checkpoint
+  (never the offset-0 one or the newest) and the interval doubles.
+  `Budget` extrapolates the stream's length from the compression ratio so
+  far and stops once its budget is spent, so a disk image whose empty
+  tail compresses to almost nothing got no checkpoints past the first
+  tenth. A resumed index keeps the spacing an earlier pass thinned to.
+- `CheckpointStrategy::should_thin`, asked after every checkpoint, lets a
+  strategy have the indexer drop every other checkpoint. It defaults to
+  `false`, so existing strategies are unaffected.
+
+### Fixed
+
+- **Highly compressible streams no longer exhaust memory.** The zstd
+  decoder decoded every block of its input before handing any output
+  back, so a long zero run (the empty tail of a disk image) could stage
+  gigabytes per call, and each checkpoint laid while draining copied the
+  rest; indexing a 1 TB image needed hundreds of gigabytes. It now
+  decodes no more than a block past what the caller's buffer takes. The
+  zstd and xz decoders, gzip's raw deflate fallback and bzip2 restored
+  from a checkpoint held every input they were given while the output
+  held decoding back, so compressed bytes piled up (and xz checkpoints
+  copied them); they now report input they haven't room for as
+  unconsumed, as the `Decompressor` contract allows.
+
 ## 0.5.0 — 2026-09-27
 
 ### Added
