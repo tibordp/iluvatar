@@ -289,7 +289,7 @@ All compression formats are enabled by default. Disable what you don't need:
 
 ```toml
 [dependencies]
-iluvatar = { version = "0.6", default-features = false, features = ["gzip"] }
+iluvatar = { version = "0.7", default-features = false, features = ["gzip"] }
 ```
 
 | Feature | Description |
