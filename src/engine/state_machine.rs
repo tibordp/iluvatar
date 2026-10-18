@@ -319,7 +319,16 @@ impl<S: CheckpointStrategy> IndexingEngine<S> {
     /// any file that has been indexed. Its `metadata.complete` field
     /// will be `false`.
     ///
-    /// The engine continues to be usable for further indexing.
+    /// The engine continues to be usable for further indexing, and the
+    /// snapshot stays valid while it does.
+    ///
+    /// The snapshot shares checkpoint state with the engine, so taking one
+    /// costs O(checkpoints + entries), not O(checkpoint data). A snapshot
+    /// kept alive also keeps alive any checkpoints the engine thins out
+    /// later: the strategy's budget and
+    /// [`IndexProgress::checkpoint_data_bytes`](crate::IndexProgress) count
+    /// only the engine's current set, so each held snapshot can keep up to
+    /// another budget's worth of memory alive until it is dropped.
     pub fn snapshot_index(&self) -> ArchiveIndex {
         self.index_builder.snapshot(self.indexer.snapshot())
     }

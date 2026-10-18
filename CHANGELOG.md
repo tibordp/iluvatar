@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Index snapshots no longer copy checkpoint data.**
+  `StreamIndex::checkpoints` is now `Vec<Arc<Checkpoint>>` (and
+  `ArchiveIndex::checkpoints()` returns `&[Arc<Checkpoint>]`), so
+  `IndexingEngine::snapshot_index` and `StreamIndexer::snapshot` cost
+  O(checkpoints + entries) instead of copying every window and decoder
+  state, and a snapshot the host keeps shares checkpoint memory with the
+  engine. Reads restore from the shared checkpoint without copying it.
+  The budget strategies still count only the engine's own checkpoints: a
+  held snapshot keeps alive checkpoints the engine has since thinned out,
+  until it is dropped. Breaking: the field's type changed, and
+  `checkpoint_for`, `best_checkpoint_for_offset` and
+  `StreamIndex::last_checkpoint` now return `&Arc<Checkpoint>` (which
+  derefs to `&Checkpoint`), so callers can keep the shared checkpoint
+  without copying it. The serialized index format is unchanged, and
+  indexes written by 0.6 load as before.
+
 ## 0.6.0 — 2026-10-15
 
 ### Added

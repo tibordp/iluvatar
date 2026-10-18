@@ -5,6 +5,7 @@ use crate::index::entry::IndexEntry;
 use crate::stream::StreamIndex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Current index format version.
 pub(crate) const INDEX_VERSION: u32 = 6;
@@ -137,8 +138,9 @@ impl ArchiveIndex {
         &self.entries
     }
 
-    /// Decompressor checkpoints, sorted by uncompressed offset.
-    pub fn checkpoints(&self) -> &[Checkpoint] {
+    /// Decompressor checkpoints, sorted by uncompressed offset. Shared
+    /// with the indexing engine and other snapshots of the same index.
+    pub fn checkpoints(&self) -> &[Arc<Checkpoint>] {
         &self.stream.checkpoints
     }
 
@@ -194,7 +196,7 @@ impl ArchiveIndex {
     /// Find the checkpoint to use for reading a given entry.
     ///
     /// Returns the nearest checkpoint at or before the entry's data offset.
-    pub fn checkpoint_for(&self, entry: &IndexEntry) -> &Checkpoint {
+    pub fn checkpoint_for(&self, entry: &IndexEntry) -> &Arc<Checkpoint> {
         &self.stream.checkpoints[entry.checkpoint_index]
     }
 
@@ -204,7 +206,10 @@ impl ArchiveIndex {
     /// `uncompressed_offset` that is `<=` the target. This enables
     /// efficient range reads within large files by picking a checkpoint
     /// close to the target byte rather than one before the file's start.
-    pub fn best_checkpoint_for_offset(&self, uncompressed_offset: u64) -> (usize, &Checkpoint) {
+    pub fn best_checkpoint_for_offset(
+        &self,
+        uncompressed_offset: u64,
+    ) -> (usize, &Arc<Checkpoint>) {
         self.stream.best_checkpoint_for_offset(uncompressed_offset)
     }
 

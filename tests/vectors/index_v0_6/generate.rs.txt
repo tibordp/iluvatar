@@ -1,0 +1,37 @@
+use std::io::Write;
+use iluvatar::{CompressionFormat, EngineRequest, IndexingEngine};
+
+fn main() {
+    let out = std::path::PathBuf::from(std::env::args().nth(1).unwrap());
+    let mut builder = tar::Builder::new(Vec::new());
+    for i in 0..6u64 {
+        let mut rng = i + 1;
+        let data: Vec<u8> = if i % 2 == 0 {
+            (0..40_000).map(|_| { rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1); (rng >> 33) as u8 }).collect()
+        } else {
+            (0..8_000).map(|j| b"lorem ipsum dolor\n"[(j + i as usize) % 18]).collect()
+        };
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64); h.set_mode(0o644); h.set_mtime(1700000000); h.set_cksum();
+        builder.append_data(&mut h, format!("f{i}.bin"), &data[..]).unwrap();
+    }
+    let tar = builder.into_inner().unwrap();
+    let gz = { let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()); e.write_all(&tar).unwrap(); e.finish().unwrap() };
+    let zst = { let mut e = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap(); e.window_log(10).unwrap(); e.write_all(&tar).unwrap(); e.finish().unwrap() };
+    for (name, fmt, data) in [("archive.tar.gz", CompressionFormat::Gzip, gz), ("archive.tar.zst", CompressionFormat::Zstd, zst)] {
+        let mut engine = IndexingEngine::with_strategy(fmt, None, iluvatar::FixedInterval::new(16 * 1024), data.len() as u64).unwrap();
+        let mut off = 0;
+        loop {
+            match engine.step() {
+                EngineRequest::NeedInput => if off >= data.len() { engine.signal_eof() } else { let e = (off + 4096).min(data.len()); engine.provide_data(&data[off..e]); off = e; },
+                EngineRequest::Done => break,
+                EngineRequest::Error(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        let index = engine.finish();
+        println!("{name}: {} checkpoints, {} entries", index.checkpoints().len(), index.len());
+        std::fs::write(out.join(name), &data).unwrap();
+        std::fs::write(out.join(format!("{name}.idx")), index.to_bytes().unwrap()).unwrap();
+    }
+}

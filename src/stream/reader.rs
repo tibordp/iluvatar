@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::compress::checkpoint::Checkpoint;
 use crate::compress::decompressor::{DecompressStatus, Decompressor};
 use crate::engine::request::EngineRequest;
@@ -114,7 +116,8 @@ enum State {
 /// [`StreamIndex::best_checkpoint_for_offset`]: crate::StreamIndex::best_checkpoint_for_offset
 pub struct StreamReader {
     decompressor: Box<dyn Decompressor>,
-    checkpoint: Checkpoint,
+    /// Shared with the index; restoring reads it in place.
+    checkpoint: Arc<Checkpoint>,
     target_offset: u64,
     target_len: u64,
     state: State,
@@ -165,11 +168,10 @@ impl StreamReader {
     /// end marker is [`Error::TruncatedInput`] either way.
     pub fn new(index: &StreamIndex, offset: u64, len: u64) -> Result<Self> {
         let decompressor = index.codec.create()?;
-        let (_, checkpoint) = index.best_checkpoint_for_offset(offset);
+        let checkpoint = Arc::clone(index.best_checkpoint_for_offset(offset).1);
         let len = clamp_len(index.unpacked_len, offset, len);
         Ok(Self {
             decompressor,
-            checkpoint: checkpoint.clone(),
             target_offset: offset,
             target_len: len,
             state: if len == 0 {
@@ -185,6 +187,7 @@ impl StreamReader {
             input_buf: Vec::new(),
             input_pos: 0,
             compressed_pos: checkpoint.compressed_offset,
+            checkpoint,
             unpacked_pos: 0,
             eof: false,
             stream_ended: false,

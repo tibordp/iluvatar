@@ -102,6 +102,7 @@ mod tests {
     use crate::index::entry::IndexEntry;
     use crate::index::store::IndexMetadata;
     use crate::stream::StreamIndex;
+    use std::sync::Arc;
 
     fn make_test_index() -> ArchiveIndex {
         let entries = vec![IndexEntry {
@@ -128,7 +129,7 @@ mod tests {
             },
             {
                 let mut stream = StreamIndex::new(CompressionFormat::Gzip.into(), Some(5000));
-                stream.checkpoints.push(Checkpoint {
+                stream.checkpoints.push(Arc::new(Checkpoint {
                     compressed_offset: 2500,
                     bit_offset: 0,
                     uncompressed_offset: 5000,
@@ -137,7 +138,7 @@ mod tests {
                         block_state: None,
                         header_size: 10,
                     }),
-                });
+                }));
                 stream
             },
             entries,

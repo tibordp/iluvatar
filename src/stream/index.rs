@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::compress::checkpoint::{Checkpoint, CheckpointState};
@@ -19,7 +21,12 @@ pub struct StreamIndex {
     /// by the container up front.
     pub unpacked_len: Option<u64>,
     /// Sorted by unpacked offset.
-    pub checkpoints: Vec<Checkpoint>,
+    ///
+    /// Each checkpoint sits behind an [`Arc`], so cloning the index (as
+    /// [`StreamIndexer::snapshot`](crate::StreamIndexer::snapshot) does)
+    /// shares the checkpoint state rather than copying it. The `Arc` is
+    /// transparent to serialization.
+    pub checkpoints: Vec<Arc<Checkpoint>>,
     /// Unpacked position the indexer has decoded up to.
     pub indexed_to: u64,
     /// Whether the indexer reached the end of the stream.
@@ -33,12 +40,12 @@ impl StreamIndex {
             codec,
             compressed_len,
             unpacked_len: None,
-            checkpoints: vec![Checkpoint {
+            checkpoints: vec![Arc::new(Checkpoint {
                 compressed_offset: 0,
                 bit_offset: 0,
                 uncompressed_offset: 0,
                 state: CheckpointState::None,
-            }],
+            })],
             indexed_to: 0,
             complete: false,
         }
@@ -46,7 +53,7 @@ impl StreamIndex {
 
     /// The checkpoint with the largest unpacked offset at or before
     /// `unpacked_offset`, and its index.
-    pub fn best_checkpoint_for_offset(&self, unpacked_offset: u64) -> (usize, &Checkpoint) {
+    pub fn best_checkpoint_for_offset(&self, unpacked_offset: u64) -> (usize, &Arc<Checkpoint>) {
         let idx = self
             .checkpoints
             .partition_point(|cp| cp.uncompressed_offset <= unpacked_offset)
@@ -55,7 +62,7 @@ impl StreamIndex {
     }
 
     /// The checkpoint furthest into the stream.
-    pub fn last_checkpoint(&self) -> &Checkpoint {
+    pub fn last_checkpoint(&self) -> &Arc<Checkpoint> {
         self.checkpoints
             .last()
             .expect("a stream index always holds the start checkpoint")
@@ -83,7 +90,11 @@ impl StreamIndex {
         true
     }
 
-    /// Estimated bytes of checkpoint state.
+    /// Estimated bytes of checkpoint state held by this index.
+    ///
+    /// Counts this index's own checkpoints. Clones of the index share them,
+    /// so the memory actually held can be larger: a clone keeps alive
+    /// checkpoints the original has since thinned out.
     pub fn checkpoint_data_bytes(&self) -> u64 {
         self.checkpoints
             .iter()

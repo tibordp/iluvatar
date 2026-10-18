@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::compress::codec::CodecSpec;
 use crate::compress::decompressor::{DecompressStatus, Decompressor};
 use crate::engine::checkpoint_strategy::{CheckpointContext, CheckpointStrategy};
@@ -290,7 +292,7 @@ impl<S: CheckpointStrategy> StreamIndexer<S> {
         };
         let size = cp.estimated_size();
         self.checkpoint_data_bytes += size as u64;
-        self.index.checkpoints.push(cp);
+        self.index.checkpoints.push(Arc::new(cp));
         self.last_checkpoint_pos = self.unpacked_pos;
         if notify {
             let ctx = self.context();
@@ -351,6 +353,15 @@ impl<S: CheckpointStrategy> StreamIndexer<S> {
     }
 
     /// The index as it stands; the indexer stays usable.
+    ///
+    /// Cheap: the snapshot shares checkpoint state with the indexer (see
+    /// [`StreamIndex::checkpoints`]), so its cost is proportional to the
+    /// number of checkpoints, not their size. A snapshot that is kept
+    /// alive keeps its checkpoints alive too, including ones the indexer
+    /// thins out afterwards; the strategy's budget
+    /// ([`ThinningBudget`](crate::ThinningBudget), [`Budget`](crate::Budget))
+    /// counts only the indexer's own set, so memory held by such
+    /// checkpoints is on top of it until the snapshot is dropped.
     pub fn snapshot(&self) -> StreamIndex {
         self.index.clone()
     }
@@ -510,12 +521,12 @@ mod tests {
     fn thinning_keeps_the_newest_and_the_first() {
         let mut index = StreamIndex::new(CodecSpec::single(Codec::Copy), None);
         for off in 1..=6 {
-            index.checkpoints.push(Checkpoint {
+            index.checkpoints.push(Arc::new(Checkpoint {
                 compressed_offset: off,
                 bit_offset: 0,
                 uncompressed_offset: off * 10,
                 state: CheckpointState::None,
-            });
+            }));
         }
         let offsets = |index: &StreamIndex| -> Vec<u64> {
             index

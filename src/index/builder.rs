@@ -123,6 +123,7 @@ mod tests {
     use super::*;
     use crate::archive::EntryType;
     use crate::compress::checkpoint::{Checkpoint, CheckpointState};
+    use std::sync::Arc;
 
     fn make_entry(path: &str, size: u64, data_offset: u64) -> ArchiveEntry {
         ArchiveEntry {
@@ -141,12 +142,12 @@ mod tests {
     fn stream(checkpoints: &[(u64, u64)], indexed_to: u64) -> StreamIndex {
         let mut s = StreamIndex::new(CompressionFormat::Gzip.into(), Some(1000));
         for &(c, u) in &checkpoints[1..] {
-            s.checkpoints.push(Checkpoint {
+            s.checkpoints.push(Arc::new(Checkpoint {
                 compressed_offset: c,
                 bit_offset: 0,
                 uncompressed_offset: u,
                 state: CheckpointState::None,
-            });
+            }));
         }
         s.indexed_to = indexed_to;
         s
